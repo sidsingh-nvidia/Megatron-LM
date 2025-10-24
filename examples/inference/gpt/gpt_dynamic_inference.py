@@ -6,12 +6,10 @@ import math
 import os
 import pickle
 import sys
-import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
-from tqdm import tqdm
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -36,16 +34,12 @@ from megatron.core.utils import get_attr_wrapped_model
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
-from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import load_checkpoint
-from model_provider import model_provider
-from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
-
-from megatron.core.utils import configure_nvtx_profiling
-
+import io
 import json
 
+import torch
+
+import megatron
 from examples.inference.gpt.utils import (
     Request,
     add_common_inference_args,
@@ -53,19 +47,18 @@ from examples.inference.gpt.utils import (
     build_requests,
     get_curr_time,
 )
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-
-import torch
-import io
-import megatron
+from model_provider import model_provider
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -80,10 +73,17 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Load checkpoint with `strict=False`.",
     )
     group.add_argument(
-        "--termination-id", type=int, default=None,
-        help="Termination ID that overrides `tokenizer.eod`."
+        "--termination-id",
+        type=int,
+        default=None,
+        help="Termination ID that overrides `tokenizer.eod`.",
     )
-    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
+    group.add_argument(
+        '--inference-repeat-n',
+        type=int,
+        default=1,
+        help="Repeat inference iterations N times for benchmarking.",
+    )
 
     return parser
 
@@ -101,10 +101,7 @@ def get_model() -> MegatronModule:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 
     # Build model.
-    model = _get_model(
-        partial(model_provider, model_builder),
-        wrap_with_ddp=False
-    )
+    model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
 
     # Load checkpoint.
     assert args.load is not None
@@ -126,6 +123,16 @@ def get_model() -> MegatronModule:
     return model
 
 
+def get_mamba_metadata_from_model(model):
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+    return None, None, None
+
+
 def get_inference_context(
     requests: List[Request],
     sampling_params: SamplingParams,
@@ -139,7 +146,7 @@ def get_inference_context(
     args = get_args()
     # Max sequence length.
     if calculate_max_sequence_length_from_requests:
-        max_gen_length = sampling_params.num_tokens_to_generate    
+        max_gen_length = sampling_params.num_tokens_to_generate
         max_context_length = max(len(r.prompt_tokens) for r in requests)
         max_sequence_length = max_context_length + max_gen_length
     else:
@@ -248,7 +255,7 @@ def run_inference(
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     if args.cuda_graph_impl == "local":
-        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+        cuda_graph_request_count_map = {r: 0 for r in engine.context.cuda_graph_request_counts}
     else:
         cuda_graph_request_count_map = None
 
@@ -260,9 +267,7 @@ def run_inference(
         nonlocal num_requests_added
         _request = requests[num_requests_added]
         engine.add_request(
-            num_requests_added,
-            _request.prompt_text,
-            sampling_params.num_tokens_to_generate,
+            num_requests_added, _request.prompt_text, sampling_params.num_tokens_to_generate
         )
         _request.time_start = get_curr_time()
         _request.state = "started"
@@ -280,10 +285,9 @@ def run_inference(
                 _add_request()
         else:
             # Add deterministic number of requests (generally used for debugging).
-            for i in range(min(
-                args.incoming_requests_per_step,
-                num_requests_total - num_requests_added,
-            )):
+            for i in range(
+                min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
+            ):
                 _add_request()
         add_times.append(get_curr_time() - add_start)
 
@@ -291,7 +295,7 @@ def run_inference(
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         result = engine.step_modern(sampling_params, verbose=True)
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
-        is_decode_only = engine.is_decode_only 
+        is_decode_only = engine.is_decode_only
         step_id += 1
 
         # Record cuda_graph_request_count.
@@ -331,11 +335,11 @@ def run_inference(
             break
 
     return {
-        "step_times" : step_times,
-        "add_times" : add_times,
-        "output_times" : output_times,
-        "total_output_tokens" : total_output_tokens,
-        "cuda_graph_request_count_map" : cuda_graph_request_count_map,
+        "step_times": step_times,
+        "add_times": add_times,
+        "output_times": output_times,
+        "total_output_tokens": total_output_tokens,
+        "cuda_graph_request_count_map": cuda_graph_request_count_map,
     }
 
 
@@ -351,7 +355,7 @@ def main():
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
-    
+
     configure_nvtx_profiling(True)
 
     args = get_args()
@@ -371,14 +375,9 @@ def main():
 
     model = get_model()
 
-    # Layer type list for hybrid models
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
+    (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
+        get_mamba_metadata_from_model(model)
+    )
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer)
@@ -397,9 +396,10 @@ def main():
         for request_idx, request in enumerate(requests):
             if len(request.prompt_tokens) > context.max_tokens:
                 invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-        assert not invalid_prompt_length_map, (
-            "request idxs with prompts longer than context.max_tokens: "
-            ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+        assert (
+            not invalid_prompt_length_map
+        ), "request idxs with prompts longer than context.max_tokens: " ", ".join(
+            f"{k}({v})" for k, v in invalid_prompt_length_map.items()
         )
 
     # Inference engine.
@@ -435,13 +435,12 @@ def main():
 
     # Validate all requests finished.
     for request in requests:
-        assert request.state == "finished", (
-            f"request.state == '{request.state}' != 'finished'."
-        )
+        assert request.state == "finished", f"request.state == '{request.state}' != 'finished'."
 
     # Print unique prompts + outputs.
 
     if torch.distributed.get_rank() == 0:
+
         def escape_str(s):
             return s.replace("\n", "\\n")
 
@@ -457,7 +456,9 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(
+                f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}"
+            )
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -471,12 +472,16 @@ def main():
                     o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
                     o_len = len(requests[output_request_idxs[0]].output_tokens)
                     escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
+                    print(
+                        f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}"
+                    )
                 else:
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                    print(
+                        f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}"
+                    )
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -490,8 +495,8 @@ def main():
                         "generated_text": req.output_text,
                         "generated_tokens": req.output_tokens,
                         "latency": req.time_end - req.time_start,
-                        "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
-                        "step_count" : engine.step_count,
+                        "cuda_graph_request_count_map": result["cuda_graph_request_count_map"],
+                        "step_count": engine.step_count,
                     }
                     if sampling_params.return_log_probs:
                         response_logprobs = req.log_probs
@@ -531,11 +536,7 @@ def main():
     #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
-    capture_str = (
-        f"{engine.capture_stats['time']:.2f} sec"
-        if engine.capture_stats else
-        "--"
-    )
+    capture_str = f"{engine.capture_stats['time']:.2f} sec" if engine.capture_stats else "--"
     print(
         f"{setup_prefix} … "
         f"capture {capture_str} … "
