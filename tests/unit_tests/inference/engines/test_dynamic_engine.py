@@ -32,7 +32,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
@@ -108,6 +111,8 @@ class DynamicEngineTestConfig:
     # to avoid the overhead of building the graphs, which is not
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
+
+    fp8: bool = False
 
     def __post_init__(self):
 
@@ -297,11 +302,16 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
             )
+            if test_config.fp8:
+                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            else:
+                layer_spec = get_gpt_layer_local_spec()
+
 
             # GPT model.
             model = GPTModel(
                 config=transformer_config,
-                transformer_layer_spec=get_gpt_layer_local_spec(),
+                transformer_layer_spec=layer_spec,
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -339,7 +349,7 @@ class TestDynamicInferenceEngine:
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 cuda_graph_scope=test_config.cuda_graph_scope,
             )
-
+        
             # Mamba model.
             model = MambaModel(
                 config=transformer_config,
@@ -354,7 +364,7 @@ class TestDynamicInferenceEngine:
             ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
-
+        
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
 
@@ -385,6 +395,7 @@ class TestDynamicInferenceEngine:
             params_dtype=transformer_config.params_dtype,
             fp8=transformer_config.fp8,
             padded_vocab_size=test_config.vocab_size,
+            fp8="hybrid" if test_config.fp8 else None,
         )
 
         # Inference context.
@@ -999,6 +1010,25 @@ class TestDynamicInferenceEngine:
             expert_model_parallel_size=ep_size,
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
+        fp8_available, reason_for_no_fp8 = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason_for_no_fp8)
+
+        self._run_test(
+            min_prompt_length=19,
+            max_prompt_length=19,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            materialize_only_last_token_logits=True,
+            fp8=True,
         )
 
     @pytest.mark.internal
