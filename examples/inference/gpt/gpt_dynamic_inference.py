@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import json
@@ -6,12 +6,11 @@ import math
 import os
 import pickle
 import sys
-import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -28,21 +27,20 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
-from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import load_checkpoint
-
-from megatron.core.utils import configure_nvtx_profiling
-from model_provider import model_provider
-from gpt_builders import gpt_builder
-
+import io
 import json
 
+import torch
+
+import megatron
 from examples.inference.gpt.utils import (
     Request,
     add_common_inference_args,
@@ -50,20 +48,18 @@ from examples.inference.gpt.utils import (
     build_requests,
     get_curr_time,
 )
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
-
-import torch
-import io
-import megatron
+from model_provider import model_provider
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -78,10 +74,17 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Load checkpoint with `strict=False`.",
     )
     group.add_argument(
-        "--termination-id", type=int, default=None,
-        help="Termination ID that overrides `tokenizer.eod`."
+        "--termination-id",
+        type=int,
+        default=None,
+        help="Termination ID that overrides `tokenizer.eod`.",
     )
-    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
+    group.add_argument(
+        '--inference-repeat-n',
+        type=int,
+        default=1,
+        help="Repeat inference iterations N times for benchmarking.",
+    )
 
     return parser
 
@@ -91,11 +94,15 @@ def get_model() -> MegatronModule:
 
     args = get_args()
 
+    if args.model_provider == "gpt":
+        model_builder = gpt_builder
+    elif args.model_provider == "mamba":
+        model_builder = mamba_builder
+    else:
+        raise ValueError(f"Invalid model provider {args.model_provider}")
+
     # Build model.
-    model = _get_model(
-        partial(model_provider, gpt_builder),
-        wrap_with_ddp=False
-    )
+    model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
 
     # Load checkpoint.
     assert args.load is not None
@@ -117,14 +124,32 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(requests: List[Request], sampling_params: SamplingParams, 
-                          calculate_max_sequence_length_from_requests: bool =True):
+def get_mamba_metadata_from_model(model):
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    pp_layer_offset = getattr(decoder, "pp_layer_offset", 0)
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+    return None, None, None
+
+
+def get_inference_context(
+    requests: List[Request],
+    sampling_params: Optional[SamplingParams] = None,
+    calculate_max_sequence_length_from_requests: bool = True,
+    pp_layer_offset: int = 0,
+    layer_type_list: Optional[List[str]] = None,
+    mamba_conv_states_shape: Optional[Tuple[int]] = None,
+    mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
     # Max sequence length.
     if calculate_max_sequence_length_from_requests:
-        max_gen_length = sampling_params.num_tokens_to_generate    
+        max_gen_length = sampling_params.num_tokens_to_generate
         max_context_length = max(len(r.prompt_tokens) for r in requests)
         max_sequence_length = max_context_length + max_gen_length
     else:
@@ -151,7 +176,12 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pp_layer_offset=pp_layer_offset,
         materialize_only_last_token_logits=not args.return_log_probs,
+        layer_type_list=layer_type_list,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
@@ -199,18 +229,27 @@ def get_inference_controller(
 
 
 def run_inference(
-    requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
+    requests: List[Request],
+    engine: DynamicInferenceEngine,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
         requests (List[Request]): Requests that are to be added and processed.
-        sampling_params (SamplingParams): Sampling params for the logits.
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
+        sampling_params (SamplingParams): Deprecated as of megatron-core 0.16.
 
     Return:
         A dictionary of step times with `prefill` and `decode` keys.
     """
+
+    if sampling_params is not None and torch.distributed.get_rank() == 0:
+        warnings.warn(
+            "The `sampling_params` argument is deprecated. "
+            "Sampling parameters are specified per request.",
+            DeprecationWarning,
+        )
 
     args = get_args()
 
@@ -230,7 +269,7 @@ def run_inference(
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     if args.cuda_graph_impl == "local":
-        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+        cuda_graph_request_count_map = {r: 0 for r in engine.context.cuda_graph_request_counts}
     else:
         cuda_graph_request_count_map = None
 
@@ -244,7 +283,7 @@ def run_inference(
         engine.add_request(
             num_requests_added,
             _request.prompt_text,
-            sampling_params.num_tokens_to_generate,
+            _request.sampling_params,
         )
         _request.time_start = get_curr_time()
         _request.state = "started"
@@ -262,18 +301,17 @@ def run_inference(
                 _add_request()
         else:
             # Add deterministic number of requests (generally used for debugging).
-            for i in range(min(
-                args.incoming_requests_per_step,
-                num_requests_total - num_requests_added,
-            )):
+            for i in range(
+                min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
+            ):
                 _add_request()
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
-        result = engine.step_modern(sampling_params, verbose=True)
+        result = engine.step_modern(verbose=True)
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
-        is_decode_only = engine.is_decode_only 
+        is_decode_only = engine.is_decode_only
         step_id += 1
 
         # Record cuda_graph_request_count.
@@ -301,7 +339,7 @@ def run_inference(
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
                 request.request_id = finished_request.request_id
-                if sampling_params.return_log_probs:
+                if finished_request.sampling_params.return_log_probs:
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
@@ -313,11 +351,11 @@ def run_inference(
             break
 
     return {
-        "step_times" : step_times,
-        "add_times" : add_times,
-        "output_times" : output_times,
-        "total_output_tokens" : total_output_tokens,
-        "cuda_graph_request_count_map" : cuda_graph_request_count_map,
+        "step_times": step_times,
+        "add_times": add_times,
+        "output_times": output_times,
+        "total_output_tokens": total_output_tokens,
+        "cuda_graph_request_count_map": cuda_graph_request_count_map,
     }
 
 
@@ -333,7 +371,7 @@ def main():
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
-    
+
     configure_nvtx_profiling(True)
 
     args = get_args()
@@ -349,29 +387,42 @@ def main():
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
     )
 
-    # Requests, context, conroller.
     model = get_model()
-    requests = build_requests(args, tokenizer)
-    context = get_inference_context(requests, sampling_params)
+
+    (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
+        get_mamba_metadata_from_model(model)
+    )
+
+    # Requests, context, controller.
+    requests = build_requests(args, tokenizer, sampling_params)
+    context = get_inference_context(
+        requests,
+        sampling_params,
+        layer_type_list=layer_type_list,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
+    )
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.
-    invalid_prompt_length_map = {}
-    for request_idx, request in enumerate(requests):
-        if len(request.prompt_tokens) > context.max_tokens:
-            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-    assert not invalid_prompt_length_map, (
-        "request idxs with prompts longer than context.max_tokens: "
-        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
-    )
+    if args.disable_chunked_prefill:
+        invalid_prompt_length_map = {}
+        for request_idx, request in enumerate(requests):
+            if len(request.prompt_tokens) > context.max_tokens:
+                invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+        assert (
+            not invalid_prompt_length_map
+        ), "request idxs with prompts longer than context.max_tokens: " ", ".join(
+            f"{k}({v})" for k, v in invalid_prompt_length_map.items()
+        )
 
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
         context,
-        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.cuda_graph_impl == "local",
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
@@ -387,7 +438,7 @@ def main():
     throughputs = []
     for _ in range(args.inference_repeat_n):
         t = get_curr_time()
-        result = run_inference(requests, sampling_params, engine)
+        result = run_inference(requests, engine)
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
@@ -400,11 +451,10 @@ def main():
 
     # Validate all requests finished.
     for request in requests:
-        assert request.state == "finished", (
-            f"request.state == '{request.state}' != 'finished'."
-        )
+        assert request.state == "finished", f"request.state == '{request.state}' != 'finished'."
 
     # Print unique prompts + outputs.
+
     if torch.distributed.get_rank() == 0:
 
         def escape_str(s):
@@ -422,7 +472,9 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(
+                f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}"
+            )
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -436,12 +488,16 @@ def main():
                     o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
                     o_len = len(requests[output_request_idxs[0]].output_tokens)
                     escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
+                    print(
+                        f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}"
+                    )
                 else:
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                    print(
+                        f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}"
+                    )
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -455,10 +511,10 @@ def main():
                         "generated_text": req.output_text,
                         "generated_tokens": req.output_tokens,
                         "latency": req.time_end - req.time_start,
-                        "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
-                        "step_count" : engine.step_count,
+                        "cuda_graph_request_count_map": result["cuda_graph_request_count_map"],
+                        "step_count": engine.step_count,
                     }
-                    if sampling_params.return_log_probs:
+                    if req.sampling_params.return_log_probs:
                         response_logprobs = req.log_probs
                         result_dict["logprobs"] = response_logprobs
                     json_results[req.request_id] = result_dict
@@ -496,11 +552,7 @@ def main():
     #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
-    capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
-        if engine.capture_stats else
-        "--"
-    )
+    capture_str = f"{engine.capture_stats['time']:.2f} sec" if engine.capture_stats else "--"
     print(
         f"{setup_prefix} … "
         f"capture {capture_str} … "
