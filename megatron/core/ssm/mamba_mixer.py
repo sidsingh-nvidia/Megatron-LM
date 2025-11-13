@@ -487,7 +487,9 @@ class MambaMixer(MegatronModule):
             zxBCdt_chunked_prefill = zxBCdt[
                 active_token_count - chunked_prefill_request_token_count : active_token_count
             ]
-            batch_index_chunked_prefill = batch_indices[context.chunked_prefill_request_id]
+            # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
+            pos = torch.where(context.request_ids == context.chunked_prefill_request_id)[0][0]
+            batch_index_chunked_prefill = batch_indices[pos]
 
             y_prefill_chunked = self.ssm_prefill(
                 zxBCdt_chunked_prefill,

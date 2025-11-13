@@ -18,7 +18,6 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
         mamba_stack_spec = import_module(args.spec)
     else:
         raise ValueError("You must provide a valid Mamba layer spec via --spec")
-
     model = MambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,

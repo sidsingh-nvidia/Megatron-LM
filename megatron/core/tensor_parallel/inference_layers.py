@@ -88,7 +88,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # true for other layers.
         self.skip_norm_and_all_gather = False
 
-
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         # make x 2D but restore original shape at the end

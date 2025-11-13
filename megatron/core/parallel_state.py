@@ -1938,10 +1938,10 @@ def _set_global_symmetric_memory_buffer():
     assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
 
     _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
-        size_in_mb=128, #todo: set from an argument? 
+        size_in_mb=1024, #todo: set from an argument? 
         process_group=get_tensor_model_parallel_group()
     )
-    print(f"Initialized global symmetric memory buffer of size 512 MB")
+    print(f"Initialized global symmetric memory buffer of size 1024 MB")
 
 
 def get_global_memory_buffer():
