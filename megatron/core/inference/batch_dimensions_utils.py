@@ -410,6 +410,9 @@ class CUDAGraphBatchDimensionBuilder:
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable
 
+        if not cuda_graph_batch_dimensions_list:
+            return None
+
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
             real_batch_dim, decode_only_cuda_graphs)
 
