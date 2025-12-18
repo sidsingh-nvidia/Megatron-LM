@@ -1,10 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from unittest.mock import MagicMock
+
 import torch
+
+from megatron.core.utils import null_decorator
 
 from .barrier import symm_mem_sync
 from .multimem_asm import add_v8_bf16_from_u32, asm_rsqrt, ld_128, st_128
 from .utils import sync_threads
+
+from unittest.mock import MagicMock
 
 try:
     import triton
