@@ -25,7 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding, toggle_nvshmem_usage_in_moe_inference
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -519,16 +519,25 @@ class TextGenerationController:
         # for prefill turn off symmetric kernels
         symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
+        
+        is_inference_optimized = inference_wrapper_config.transformer_impl == "inference_optimized"
         # Turning on/off MoE padding for cuda-graphs
         moe_pad_experts_for_cuda_graph_inference = (
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
+            assert not is_inference_optimized
             if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
                 set_decode_expert_padding(unwrapped_model, False)
+        if is_inference_optimized:
+            # Toggle nvshmem usage in MoE layers
+            toggle_nvshmem_usage_in_moe_inference(
+                unwrapped_model,
+                set_to=context.using_cuda_graph_this_step()
+            )
 
         # initialize symmetric memory if needed
         if model_config.transformer_impl == "inference_optimized":

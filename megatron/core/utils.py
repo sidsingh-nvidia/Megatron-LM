@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
+import torch.distributed as dist
 
 try:
     import torch.distributed._symmetric_memory as symm_mem
@@ -668,7 +669,8 @@ class GlobalSymmetricMemoryBuffer:
         else:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
             try:
-                symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                symm_mem.set_backend("NVSHMEM")
+                #symm_mem.enable_symm_mem_for_group(process_group.group_name)
                 self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
                 self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
             except RuntimeError as e:

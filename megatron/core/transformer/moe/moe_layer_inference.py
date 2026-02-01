@@ -52,8 +52,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
-from .token_dispatcher_inference import InferenceAlltoAllTokenDispatcher
-
+from .token_dispatcher_inference import InferenceAlltoAllTokenDispatcher, SymmetricMoEWorkspace
+import logging
 
 class InferenceMoELayer(MoELayer):
     """
@@ -67,7 +67,7 @@ class InferenceMoELayer(MoELayer):
     
     Checkpoints trained with MoELayer can be loaded directly.
     """
-
+    _symmetric_workspace: Optional[SymmetricMoEWorkspace] = None
     def __init__(
         self,
         config: TransformerConfig,
@@ -90,6 +90,7 @@ class InferenceMoELayer(MoELayer):
             layer_number=layer_number,
             pg_collection=pg_collection,
         )
+        
         
         self.token_dispatcher = InferenceAlltoAllTokenDispatcher(
             self.num_local_experts,
@@ -127,6 +128,19 @@ class InferenceMoELayer(MoELayer):
                 self.num_local_experts, -1
             ).T.ravel()
 
+    def _maybe_initialize_symmetric_workspace(self, config: TransformerConfig):
+        """Initialize symmetric memory workspace if not already done."""
+        if InferenceMoELayer._symmetric_workspace is None:
+            InferenceMoELayer._symmetric_workspace = SymmetricMoEWorkspace(
+                max_tokens_per_rank=512, 
+                hidden_size=config.hidden_size, 
+                num_experts=config.num_moe_experts, 
+                ep_group=self.token_dispatcher.ep_group, 
+                dtype=torch.bfloat16
+            )
+            logging.info("Initialized symmetric memory workspace for InferenceMoELayer.")
+        self.token_dispatcher.symmetric_workspace = InferenceMoELayer._symmetric_workspace    
+        
     # ==================== Simplified Forward Pass ====================
     def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
@@ -144,6 +158,11 @@ class InferenceMoELayer(MoELayer):
         Returns:
             Tuple of (output, None) for compatibility with MoELayer interface
         """
+        assert not self.token_dispatcher.drop_and_pad, "Drop-and-pad is not supported in InferenceMoELayer."
+        
+        self._maybe_initialize_symmetric_workspace(self.config)
+
+
         # Store original shape for restoration
         hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_shape[-1])

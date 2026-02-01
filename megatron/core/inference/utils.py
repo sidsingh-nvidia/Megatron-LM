@@ -131,6 +131,15 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_expert_capacity_factor = capacity_factor
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
+def toggle_nvshmem_usage_in_moe_inference(model, set_to: bool = True):
+    print(f"toggling nvshmem usage = {set_to} in inference moe layers")
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    for moe_layer in moe_layer_cache:
+        dispatcher = moe_layer.token_dispatcher
+        dispatcher.set_nvshmem_usage(set_to)
 
 def tensor_swap(x, src_idxs, dst_idxs):
     """
