@@ -26,7 +26,7 @@ class SymmetricMoEWorkspace:
     """
     def __init__(
         self, 
-        max_tokens_per_rank: int, 
+        max_tokens_per_rank: int, # this should be set to cuda_graph_max_token_count * topk / tp_size (regular tp, not expert)
         hidden_size: int, 
         num_experts: int, 
         ep_group: dist.ProcessGroup, 
@@ -87,15 +87,6 @@ class SymmetricMoEWorkspace:
             (2, self.nsplits), dtype=torch.int64, device=self.device
         )
 
-    def get_tokens_per_expert(self):
-        """Returns the [num_experts] GPU tensor of token counts after dispatch."""
-        return self.dispatch_metadata[0]
-
-    def get_grouped_mm_offsets(self):
-        """Returns the prefix-sum offsets required for GroupedMLP."""
-        # result[i] = end index of expert i's tokens in dispatch_out
-        return self.get_tokens_per_expert().cumsum(0).to(torch.int32)
-
     def set_input_splits(self, input_splits: torch.Tensor):
         """Registers the input_splits tensor for the dispatch collective."""
         self.in_splits.copy_(input_splits)
@@ -148,6 +139,7 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
 
             num_local_tokens_per_expert = routing_map.sum(dim=0).long()
             if self.ep_size > 1:
+                #print(f"rank - {dist.get_rank()} | {num_local_tokens_per_expert}")
                 self.symmetric_workspace.set_input_splits(num_local_tokens_per_expert.view(-1))
                 logging.info("Initialized symmetric workspace input_splits on GPU.")
             self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
@@ -243,10 +235,8 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             # )
 
             workspace = self.symmetric_workspace
-            workspace = self.symmetric_workspace
-            # print(workspace.in_splits.shape) 
-            # print(workspace.in_splits)
-            # exit()
+
+            # all to all on tokens
             torch.ops.symm_mem.all_to_all_vdev_2d(
                 workspace.dispatch_inp, 
                 workspace.dispatch_out, 
@@ -256,13 +246,20 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                 major_align=1, #Todo: tune alignment to 8/16 later.
             )
 
-            logging.info("Completed AlltoAll dispatch collective using symmetric memory.")
-            if dist.get_rank() == 0:
-                print(workspace.dispatch_metadata[0])
-                print(workspace.dispatch_metadata[1])
-            exit()
+            # all to all on probs
+            torch.ops.symm_mem.all_to_all_vdev_2d(
+                workspace.dispatch_inp_probs, 
+                workspace.dispatch_out_probs, 
+                workspace.in_splits, 
+                workspace.dispatch_metadata, 
+                self.ep_group.group_name, 
+                major_align=1, #Todo: tune alignment to 8/16 later.
+            )
 
-            return global_input_tokens, global_probs
+            logging.info("Completed AlltoAll dispatch collective using symmetric memory for token activations and probs.")
+            self.tokens_per_expert = workspace.dispatch_metadata[0].view(self.num_local_experts, self.ep_size).sum(dim=1)
+            logging.info(f"rank: {dist.get_rank()} tokens per expert: {self.tokens_per_expert}")
+            return workspace.dispatch_out, self.tokens_per_expert, workspace.dispatch_out_probs
         else: 
             return super().token_dispatch(
                 permutated_local_input_tokens, permuted_probs
