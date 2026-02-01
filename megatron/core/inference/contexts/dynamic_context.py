@@ -1321,6 +1321,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
         )
+
         self._using_cuda_graph_this_step = best_graph is not None
 
         if self.using_cuda_graph_this_step():

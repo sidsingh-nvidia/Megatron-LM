@@ -131,12 +131,19 @@ class InferenceMoELayer(MoELayer):
     def _maybe_initialize_symmetric_workspace(self, config: TransformerConfig):
         """Initialize symmetric memory workspace if not already done."""
         if InferenceMoELayer._symmetric_workspace is None:
+            if self.config.moe_router_dtype == 'fp32':
+                router_dtype = torch.float32
+            elif self.config.moe_router_dtype == 'fp64':
+                router_dtype = torch.float64
+            else:
+                router_dtype = torch.bfloat16
             InferenceMoELayer._symmetric_workspace = SymmetricMoEWorkspace(
-                max_tokens_per_rank=512, 
+                max_tokens_per_rank=512 * config.moe_router_topk, 
                 hidden_size=config.hidden_size, 
-                num_experts=config.num_moe_experts, 
+                num_experts=config.num_moe_experts,
                 ep_group=self.token_dispatcher.ep_group, 
-                dtype=torch.bfloat16
+                token_activations_dtype=torch.bfloat16,
+                probs_dtype=router_dtype
             )
             logging.info("Initialized symmetric memory workspace for InferenceMoELayer.")
         self.token_dispatcher.symmetric_workspace = InferenceMoELayer._symmetric_workspace    
@@ -159,7 +166,7 @@ class InferenceMoELayer(MoELayer):
             Tuple of (output, None) for compatibility with MoELayer interface
         """
         assert not self.token_dispatcher.drop_and_pad, "Drop-and-pad is not supported in InferenceMoELayer."
-        
+
         self._maybe_initialize_symmetric_workspace(self.config)
 
 

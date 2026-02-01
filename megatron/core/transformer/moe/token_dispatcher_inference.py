@@ -30,7 +30,8 @@ class SymmetricMoEWorkspace:
         hidden_size: int, 
         num_experts: int, 
         ep_group: dist.ProcessGroup, 
-        dtype: torch.dtype = torch.bfloat16
+        token_activations_dtype=torch.bfloat16,
+        probs_dtype=torch.bfloat16,
     ):
         self.device = torch.cuda.current_device()
         self.num_experts = num_experts
@@ -38,6 +39,7 @@ class SymmetricMoEWorkspace:
         self.ep_size = dist.get_world_size(group=ep_group)
         self.rank = dist.get_rank(group=ep_group)
         symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
+        symm_mem.enable_symm_mem_for_group(ep_group.group_name)
         
         # nsplits is total experts across the EP group because 
         # the collective takes per-expert input splits.
@@ -46,14 +48,20 @@ class SymmetricMoEWorkspace:
         # 1. Dispatch (Shuffle) Buffers
         # The Rank-Major buffer we fill before the All-to-All
         self.dispatch_inp = symm_mem.empty(
-            (max_tokens_per_rank, hidden_size), dtype=dtype, device=self.device
+            (max_tokens_per_rank, hidden_size), dtype=token_activations_dtype, device=self.device
+        )
+        self.dispatch_inp_probs = symm_mem.empty(
+            (max_tokens_per_rank,), dtype=probs_dtype, device=self.device
         )
         
         # The Expert-Major buffer populated by the All-to-All
         # Worst case: one rank receives all tokens from all peers
         self.max_out_tokens = max_tokens_per_rank * self.ep_size 
         self.dispatch_out = symm_mem.empty(
-            (self.max_out_tokens, hidden_size), dtype=dtype, device=self.device
+            (self.max_out_tokens, hidden_size), dtype=token_activations_dtype, device=self.device
+        )
+        self.dispatch_out_probs = symm_mem.empty(
+            (self.max_out_tokens,), dtype=probs_dtype, device=self.device
         )
 
         # 2. Metadata Buffers
@@ -71,7 +79,7 @@ class SymmetricMoEWorkspace:
         # 3. Combine (Un-shuffle) Buffers
         # Where tokens land after being pulled back to their original ranks
         self.combine_out = symm_mem.empty(
-            (max_tokens_per_rank, hidden_size), dtype=dtype, device=self.device
+            (max_tokens_per_rank, hidden_size), dtype=token_activations_dtype, device=self.device
         )
         
         # Metadata populated during the reverse (combine) operation
@@ -179,8 +187,13 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
                     fused=True,
                     drop_and_pad=False,
                 )
-            logging.info("permuted tokens")
-            exit()
+            logging.info("Completed nvshmem dispatch_preprocess permutation step.")
+            print(hidden_states.shape, permutated_local_input_tokens.shape, self.num_out_tokens)
+            # copy to symmetric memory buffer
+            num_tokens = permutated_local_input_tokens.size(0)
+            self.symmetric_workspace.dispatch_inp[:num_tokens, :].copy_(permutated_local_input_tokens)
+            self.symmetric_workspace.dispatch_inp_probs[:num_tokens].copy_(permuted_probs)
+            logging.info("Copied permuted tokens and probs to symmetric memory buffers.")
             return permutated_local_input_tokens, permuted_probs
         else:
             return super().dispatch_preprocess(
@@ -209,24 +222,52 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         # global_probs = all_to_all(
         #     self.ep_group, permuted_probs, self.output_splits, self.input_splits
         # )
-        inp = self.symmetric_workspace.dispatch_inp
-        out = self.symmetric_workspace.dispatch_out
-        in_splits = self.symmetric_workspace.in_splits
-        out_splits_offsets = self.symmetric_workspace.dispatch_metadata
-        group_name = self.ep_group.group_name
-        align = 1
 
-        torch.ops.symm_mem.all_to_all_vdev_2d(
-            inp, out, in_splits, out_splits_offsets, group_name, major_align=align
-        )
+        if self.use_nvshmem:
+            num_tokens = permutated_local_input_tokens.size(0)
+            # All to allv on token activations 
 
-        logging.info("Completed AlltoAll dispatch collective using symmetric memory.")
-        if dist.get_rank() == 0:
-            print(out_splits_offsets[0])
-            print(out_splits_offsets[1])
-        exit()
+            
+            # inp = self.symmetric_workspace.dispatch_inp
+            # out = self.symmetric_workspace.dispatch_out
+            # in_splits = self.symmetric_workspace.in_splits
+            # out_splits_offsets = self.symmetric_workspace.dispatch_metadata
+            # group_name = self.ep_group.group_name
+            # align = 1
 
-        return global_input_tokens, global_probs
+            #      self.dispatch_inp = symm_mem.empty(
+            #     (max_tokens_per_rank, hidden_size), dtype=token_activations_dtype, device=self.device
+            # )
+            # self.dispatch_inp_probs = symm_mem.empty(
+            #     (max_tokens_per_rank,), dtype=probs_dtype, device=self.device
+            # )
+
+            workspace = self.symmetric_workspace
+            workspace = self.symmetric_workspace
+            # print(workspace.in_splits.shape) 
+            # print(workspace.in_splits)
+            # exit()
+            torch.ops.symm_mem.all_to_all_vdev_2d(
+                workspace.dispatch_inp, 
+                workspace.dispatch_out, 
+                workspace.in_splits, 
+                workspace.dispatch_metadata, 
+                self.ep_group.group_name, 
+                major_align=1, #Todo: tune alignment to 8/16 later.
+            )
+
+            logging.info("Completed AlltoAll dispatch collective using symmetric memory.")
+            if dist.get_rank() == 0:
+                print(workspace.dispatch_metadata[0])
+                print(workspace.dispatch_metadata[1])
+            exit()
+
+            return global_input_tokens, global_probs
+        else: 
+            return super().token_dispatch(
+                permutated_local_input_tokens, permuted_probs
+            )
+
 
     def _maybe_dtoh_and_synchronize(
         self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
