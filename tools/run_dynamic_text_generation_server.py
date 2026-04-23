@@ -13,6 +13,10 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 from megatron.core.utils import trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
+<<<<<<< HEAD
+=======
+from megatron.training import get_args
+>>>>>>> main
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
@@ -76,7 +80,7 @@ async def run_text_generation_server(
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        args = parse_and_validate_args(
+        parse_and_validate_args(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
