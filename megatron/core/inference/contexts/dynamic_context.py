@@ -605,6 +605,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
+        # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        self._nvls_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
@@ -656,19 +662,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
-            if self._nccl_ep_dispatcher:
-                NCCLAllGatherDispatcher.allocate_buffers()
-            else:
-                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
-                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-                NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
-                    // tp_size,
-                    topk=model_config.moe_router_topk,
-                    hidden_size=moe_hidden_size,
-                    ep_group=self.expert_model_parallel_group,
-                )
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher.allocate_buffers()
+        elif self._nvls_dispatcher:
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
+                // tp_size,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_group=self.expert_model_parallel_group,
+            )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -684,6 +689,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.initialize_all_tensors()
+
+        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
+        # so it can mask out CUDA-graph padding tokens during routing. The
+        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
+        # dispatcher requires equal token counts across ranks already.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(
+                self.gpu_view.real_token_count
+            )
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
@@ -993,6 +1008,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
+        # Scalar: real (unpadded) token count for the current step. Refreshed
+        # in transfer_bookkeeping_to_gpu(); read on GPU via
+        # `gpu_view.real_token_count` (MoE routing masks padding tokens).
+        _real_token_count_bytes = 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
         _mha_query_lengths_bytes = self.max_requests * 4
@@ -1028,6 +1047,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
             + 7 * _req_4byte_bytes
+            + _real_token_count_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
             + _mha_kv_seq_lengths_bytes
@@ -1121,6 +1141,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
         _off += _req_4byte_bytes
+
+        # Scalar staging slot for the real (unpadded) token count. Refreshed
+        # from `self.batch_dimensions.token_count` in transfer_bookkeeping_to_gpu()
+        # and read on GPU via `gpu_view.real_token_count`.
+        self._staging_real_token_count = self._cpu_bookkeeping_buf[
+            _off : _off + _real_token_count_bytes
+        ].view(torch.int32)
+        _off += _real_token_count_bytes
 
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
@@ -2331,7 +2359,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # text-generation controller still calls `transfer_bookkeeping_to_gpu`
         # explicitly; that second call is a cheap idempotent re-copy.
         if transfer_bookkeeping_to_gpu:
-            self.transfer_bookkeeping_to_gpu()
+            self.transfer_bookkeeping_to_gpu(
+                no_real_work=(
+                    construct_graph_dimensions is not None
+                    or is_expert_parallel_dummy_cuda_graph_step
+                )
+            )
 
     def _clear_async_reserved_kv_blocks(self) -> None:
         """Clear the request-to-reserved-block map after CPU reconciliation."""
@@ -2565,6 +2598,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         include_token_to_input_ids: bool = True,
         refresh_request_staging: bool = True,
         record_done_event: bool = False,
+        no_real_work: bool = False,
     ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
@@ -2577,6 +2611,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        Args:
+            no_real_work: True on steps where this rank produces no real
+                output — CUDA-graph capture (warmup) or a dummy
+                expert-parallel step. Publishes ``real_token_count=0`` to
+                the MoE routing mask so every token is masked out before
+                dispatch. ``initialize_attention_state`` sets this; external
+                callers leave it False.
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2615,6 +2657,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._staging_request_in_prefill_status[n_active:padded_active] = 0
                 self._staging_request_query_lengths[n_active:padded_active] = 0
                 self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+
+        # Real (unpadded) token count for this step. CUDA-graph replay pads
+        # the token dim to a captured size; MoE routing reads this on GPU and
+        # rewrites padding rows' routing entries to -1 so they don't go to
+        # any expert. Set to 0 on CUDA-graph capture / dummy EP steps so
+        # every row gets masked out.
+        self._staging_real_token_count[0] = (
+            0 if no_real_work else self.batch_dimensions.token_count
+        )
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
