@@ -810,6 +810,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
+        # EP=1 fallback: the inference dispatcher skips _valid_tokens_tensor
+        # allocation when EP==1, but the fused-MoE kernels still require a tensor
+        # pointer. Lazily allocate a 1-element tensor here and refresh it per call.
+        self._fallback_valid_tokens: Optional[torch.Tensor] = None
+
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
         assert (
@@ -946,6 +951,23 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _get_valid_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the per-step valid-tokens tensor, with EP=1 fallback.
+
+        When EP>1 the inference dispatcher owns _valid_tokens_tensor and updates
+        it each step. When EP=1 the dispatcher skips buffer allocation, so we
+        lazily allocate a 1-element tensor and refresh it from hidden_states.
+        """
+        valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens()
+        if valid_tokens is not None:
+            return valid_tokens
+        if self._fallback_valid_tokens is None:
+            self._fallback_valid_tokens = torch.zeros(
+                1, dtype=torch.int32, device=hidden_states.device
+            )
+        self._fallback_valid_tokens.fill_(hidden_states.shape[0])
+        return self._fallback_valid_tokens
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -957,7 +979,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
-            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            valid_tokens=self._get_valid_tokens(hidden_states),
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
@@ -975,7 +997,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
-            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            valid_tokens=self._get_valid_tokens(hidden_states),
             routing_map=routing_map,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
