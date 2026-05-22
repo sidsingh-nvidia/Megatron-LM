@@ -37,7 +37,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -731,7 +731,10 @@ class TextGenerationController:
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        h2d_done_event = context.transfer_bookkeeping_to_gpu(record_done_event=is_dummy_forward)
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(
+            record_done_event=is_dummy_forward,
+            no_real_work=(construct_graph_dimensions is not None or is_dummy_forward),
+        )
         if is_dummy_forward:
             self._dummy_context_h2d_done_event = h2d_done_event
         range_pop()
@@ -1935,7 +1938,7 @@ class TextGenerationController:
             return self._async_step_barrier_reason
         if not self._enable_cuda_graph:
             return "requires local cuda graphs"
-        if CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope:
+        if self.model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
             return "requires full-iteration inference cuda graphs"
         if self.model_is_pipeline_parallel:
             return "pipeline parallel is unsupported"
