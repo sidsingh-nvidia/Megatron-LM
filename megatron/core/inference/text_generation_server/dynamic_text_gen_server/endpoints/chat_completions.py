@@ -585,6 +585,11 @@ try:
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
 
+            # When ignore_eos is set, disable EOS-based termination by using a
+            # sentinel termination id that no real token matches, so generation
+            # runs to num_tokens_to_generate. Mirrors the completions endpoint.
+            ignore_eos = bool(req.get("ignore_eos", False))
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -594,6 +599,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
