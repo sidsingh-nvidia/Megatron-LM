@@ -874,11 +874,7 @@ class TestDynamicContext:
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
             sampled_tokens, None, num_speculative_tokens=0
         )
-        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [
-            100,
-            101,
-            102,
-        ]
+        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [100, 101, 102]
 
         dynamic_context.publish_async_prepared_decode_plan()
 

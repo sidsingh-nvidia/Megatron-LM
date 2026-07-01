@@ -2584,10 +2584,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _release_deferred_async_mamba_slots(self) -> None:
         """Return deferred Mamba slots to the free pool after async forward retirement."""
-        if (
-            not self.is_hybrid_model
-            or self._async_deferred_mamba_slots_to_free.numel() == 0
-        ):
+        if not self.is_hybrid_model or self._async_deferred_mamba_slots_to_free.numel() == 0:
             return
         slots = self._async_deferred_mamba_slots_to_free
         self._async_deferred_mamba_slot_release_count += int(slots.numel())
@@ -2601,9 +2598,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_hybrid_model:
             return
         if self._async_forward_in_flight:
-            mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[
-                request_indexes
-            ]
+            mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[request_indexes]
             self._append_deferred_async_mamba_slots(mamba_indices_to_free)
             self.mamba_metadata.request_to_mamba_state_idx[request_indexes] = -1
             self.mamba_metadata.request_to_mamba_state_bank[request_indexes] = 0
@@ -2727,7 +2722,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if planned_active_request_count <= 0 or planned_active_source_idxs.numel() == 0:
             return None
 
-        request_to_kv_block_ids_view = self.request_to_kv_block_ids[planned_active_source_idxs].clone()
+        request_to_kv_block_ids_view = self.request_to_kv_block_ids[
+            planned_active_source_idxs
+        ].clone()
         reserved_request_ids = torch.empty((0,), dtype=self.request_ids.dtype, device='cpu')
         reserved_block_ids = torch.empty((0,), dtype=torch.int32, device='cpu')
         reserved_block_columns = torch.empty((0,), dtype=torch.int32, device='cpu')
@@ -2816,9 +2813,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Release resources held only for a prepared async launch that will not run."""
         count = self._async_reserved_kv_block_count
         if count > 0:
-            self.kv_block_allocator.release_memory_blocks(
-                self._async_reserved_kv_block_ids[:count]
-            )
+            self.kv_block_allocator.release_memory_blocks(self._async_reserved_kv_block_ids[:count])
             self._clear_async_reserved_kv_blocks()
         self.clear_async_prepared_decode_plan()
 
@@ -2908,10 +2903,9 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> bool:
         """Record how sampled/paused tokens should fill the planned input rows."""
         source_request_idxs = plan.source_request_idxs.to(dtype=torch.long)
-        if (
-            (source_request_idxs < 0).any()
-            or (source_request_idxs >= previous_total_request_count).any()
-        ):
+        if (source_request_idxs < 0).any() or (
+            source_request_idxs >= previous_total_request_count
+        ).any():
             return False
 
         request_count = plan.active_request_count
@@ -2946,9 +2940,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if paused_source_count > 0:
             if self.paused_tokens is None:
                 return False
-            self._async_prepared_paused_source_rows[:paused_source_count].copy_(
-                paused_source_rows
-            )
+            self._async_prepared_paused_source_rows[:paused_source_count].copy_(paused_source_rows)
             self._async_prepared_paused_dest_rows[:paused_source_count].copy_(paused_dest_rows)
             self._async_prepared_paused_dest_rows_cuda[:paused_source_count].copy_(
                 self._async_prepared_paused_dest_rows[:paused_source_count], non_blocking=True
@@ -2987,9 +2979,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     : request_count * tokens_per_request
                 ].view(request_count, tokens_per_request)
                 token_ids[:, 0].copy_(sampled_tokens_cuda[:request_count])
-                token_ids[:, 1:].copy_(
-                    sampled_mtp_tokens_cuda[:, :request_count].transpose(0, 1)
-                )
+                token_ids[:, 1:].copy_(sampled_mtp_tokens_cuda[:, :request_count].transpose(0, 1))
             return True
 
         if tokens_per_request == 1:
@@ -3011,16 +3001,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             return True
 
         assert sampled_mtp_tokens_cuda is not None
-        token_ids = self.gpu_view.token_to_input_ids[
-            : request_count * tokens_per_request
-        ].view(request_count, tokens_per_request)
+        token_ids = self.gpu_view.token_to_input_ids[: request_count * tokens_per_request].view(
+            request_count, tokens_per_request
+        )
         sample_count = self._async_prepared_sample_source_count
         if sample_count > 0:
             src_rows = self._async_prepared_sample_source_rows_cuda[:sample_count]
             dst_rows = self._async_prepared_sample_dest_rows_cuda[:sample_count]
-            token_ids[:, 0].index_copy_(
-                0, dst_rows, sampled_tokens_cuda.index_select(0, src_rows)
-            )
+            token_ids[:, 0].index_copy_(0, dst_rows, sampled_tokens_cuda.index_select(0, src_rows))
             token_ids[:, 1:].index_copy_(
                 0, dst_rows, sampled_mtp_tokens_cuda.index_select(1, src_rows).transpose(0, 1)
             )
@@ -3046,9 +3034,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self, request_ids: Tensor, block_columns: Tensor
     ) -> Tensor:
         """Return reserved blocks for resumed requests, or -1 where none is reserved."""
-        reserved_block_ids = torch.full(
-            (request_ids.numel(),), -1, dtype=torch.int32, device='cpu'
-        )
+        reserved_block_ids = torch.full((request_ids.numel(),), -1, dtype=torch.int32, device='cpu')
         count = self._async_reserved_kv_block_count
         if count == 0 or request_ids.numel() == 0:
             return reserved_block_ids
@@ -3111,9 +3097,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def _async_decode_plan_preserves_sampling_layout(
-        self, plan: AsyncDecodeLifecyclePlan
-    ) -> bool:
+    def _async_decode_plan_preserves_sampling_layout(self, plan: AsyncDecodeLifecyclePlan) -> bool:
         """Return whether a dry next-step plan is safe before sampling mutates CPU state."""
         current_active_request_count = self.total_request_count - self.paused_request_count
         if plan.active_request_count != current_active_request_count:

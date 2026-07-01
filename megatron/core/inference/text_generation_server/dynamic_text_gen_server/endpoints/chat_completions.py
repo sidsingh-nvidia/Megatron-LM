@@ -317,7 +317,6 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,

@@ -1667,9 +1667,9 @@ class TextGenerationController:
             value = getattr(context, field, None)
             if value is None:
                 continue
-            layout[f"planned_{field}"] = value[:token_count].view(
-                request_count, tokens_per_request
-            ).clone()
+            layout[f"planned_{field}"] = (
+                value[:token_count].view(request_count, tokens_per_request).clone()
+            )
         if getattr(context, "is_hybrid_model", False):
             for source, target in (
                 ("_cpu_mamba_batch_indices_decode", "planned_mamba_read_indices"),
@@ -1775,9 +1775,7 @@ class TextGenerationController:
             planned = getattr(pending_view, f"planned_{field}")
             if planned is None:
                 continue
-            current = getattr(context, field)[:token_count].view(
-                request_count, tokens_per_request
-            )
+            current = getattr(context, field)[:token_count].view(request_count, tokens_per_request)
             planned_in_current_order = planned.index_select(0, row_indices)
             if not torch.equal(current, planned_in_current_order):
                 return False
@@ -1785,9 +1783,7 @@ class TextGenerationController:
         if getattr(context, "is_hybrid_model", False):
             active_slice = slice(context.paused_request_count, context.total_request_count)
             if pending_view.planned_mamba_read_indices is not None:
-                current_read_indices = context._mamba_flat_indices(active_slice)[
-                    :request_count
-                ]
+                current_read_indices = context._mamba_flat_indices(active_slice)[:request_count]
                 planned_read_indices = pending_view.planned_mamba_read_indices.index_select(
                     0, row_indices
                 )
@@ -1833,9 +1829,7 @@ class TextGenerationController:
                 planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
             )
             return (
-                current_view
-                if self._pending_forward_layout_matches_current(current_view)
-                else None
+                current_view if self._pending_forward_layout_matches_current(current_view) else None
             )
         if pending_request_ids.numel() < current_request_ids.numel():
             return None
@@ -1871,9 +1865,7 @@ class TextGenerationController:
             planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
             planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
         )
-        return (
-            current_view if self._pending_forward_layout_matches_current(current_view) else None
-        )
+        return current_view if self._pending_forward_layout_matches_current(current_view) else None
 
     def _pending_forward_graph_shape_matches_current(
         self, pending_view: _AsyncPendingForwardView
@@ -3196,9 +3188,7 @@ class TextGenerationController:
                 if self._async_prepare_deferred_until_after_sampling:
                     async_next_prepared = self._try_prepare_async_decode_after_sampling()
                     if async_next_prepared:
-                        self._copy_sampled_decode_tokens_to_next_input_ids(
-                            active_request_count
-                        )
+                        self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
 
             log_probs = None
             top_n_logprobs = None

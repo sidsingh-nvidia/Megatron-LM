@@ -1584,10 +1584,7 @@ class DynamicInferenceEngine(AbstractEngine):
         can_partially_add_chunk = (
             self.enable_chunked_prefill
             and self.context.active_token_count < self.context.max_tokens
-            and (
-                request_can_be_added
-                or self.context.chunked_prefill_request_id == req.request_id
-            )
+            and (request_can_be_added or self.context.chunked_prefill_request_id == req.request_id)
         )
         can_fully_add = kv_cache_available and request_can_be_added and request_tokens_can_be_added
         can_chunk_add = kv_cache_available and can_partially_add_chunk
