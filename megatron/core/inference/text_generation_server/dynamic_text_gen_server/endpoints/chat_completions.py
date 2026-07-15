@@ -572,9 +572,19 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(_get_non_none(req, "temperature", 1.0))
-            top_p = float(_get_non_none(req, "top_p", 1.0))
-            top_k = int(_get_non_none(req, "top_k", 0))
+            # Fall back to the model's generation_config defaults when the request
+            # omits a sampling param. The config is a plain dict yanked off the
+            # tokenizer wrapper via its delegating `generation_config` property
+            # (HF models attach it from generation_config.json; others -> None).
+            # This is the same access pattern the controller uses for eos ids.
+            gen_cfg = getattr(tokenizer, "generation_config", None) or {}
+            default_temperature = float(gen_cfg.get("temperature", 1.0))
+            default_top_p = float(gen_cfg.get("top_p", 1.0))
+            default_top_k = int(gen_cfg.get("top_k", 0))
+
+            temperature = float(_get_non_none(req, "temperature", default_temperature))
+            top_p = float(_get_non_none(req, "top_p", default_top_p))
+            top_k = int(_get_non_none(req, "top_k", default_top_k))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
