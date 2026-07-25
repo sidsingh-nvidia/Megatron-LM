@@ -16,6 +16,20 @@ try:
 
     bp = Blueprint('completions_api', __name__)
 
+    try:
+        from .metrics import (
+            IN_FLIGHT,
+            OUTPUT_TOKENS,
+            OUTPUT_TPS,
+            PROMPT_TOKENS,
+            REQUEST_DURATION,
+            REQUESTS_TOTAL,
+        )
+
+        _HAS_METRICS = True
+    except ImportError:
+        _HAS_METRICS = False
+
     @bp.route('/completions', methods=['POST'])
     @bp.route('/v1/completions', methods=['POST'])
     async def completions():
@@ -131,10 +145,19 @@ try:
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
+        _t_engine = time.monotonic()
+        if _HAS_METRICS:
+            IN_FLIGHT.inc()
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
+            if _HAS_METRICS:
+                IN_FLIGHT.dec()
+                REQUESTS_TOTAL.labels(status="error").inc()
             return f"Error during inference: {e}", 500
+        _engine_duration = time.monotonic() - _t_engine
+        if _HAS_METRICS:
+            IN_FLIGHT.dec()
 
         if current_app.config['verbose']:
             logging.info(
@@ -164,6 +187,8 @@ try:
             error_detail = "; ".join(failed_errors)
             status = 400 if has_nontransient_error else 500
             logger.error(f"Inference request(s) failed: {error_detail}")
+            if _HAS_METRICS:
+                REQUESTS_TOTAL.labels(status="error").inc()
             return f"Inference request(s) failed: {error_detail}", status
 
         # --- 5. Format Response (matching old_completions.py) ---
@@ -280,6 +305,15 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+
+        if _HAS_METRICS:
+            OUTPUT_TOKENS.inc(total_completion_tokens)
+            PROMPT_TOKENS.inc(prompt_token_count)
+            REQUEST_DURATION.observe(_engine_duration)
+            if _engine_duration > 0:
+                OUTPUT_TPS.observe(total_completion_tokens / _engine_duration)
+            REQUESTS_TOTAL.labels(status="success").inc()
+
         return jsonify(
             {
                 "id": str(uuid.uuid4()),

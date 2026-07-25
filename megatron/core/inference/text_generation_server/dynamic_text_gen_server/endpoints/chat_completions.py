@@ -394,6 +394,20 @@ try:
 
     bp = Blueprint('chat_completions_api', __name__)
 
+    try:
+        from .metrics import (
+            IN_FLIGHT,
+            OUTPUT_TOKENS,
+            OUTPUT_TPS,
+            PROMPT_TOKENS,
+            REQUEST_DURATION,
+            REQUESTS_TOTAL,
+        )
+
+        _HAS_METRICS = True
+    except ImportError:
+        _HAS_METRICS = False
+
     def apply_parsers(
         message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
     ):
@@ -613,11 +627,20 @@ try:
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
+        _t_engine = time.monotonic()
+        if _HAS_METRICS:
+            IN_FLIGHT.inc()
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
+            if _HAS_METRICS:
+                IN_FLIGHT.dec()
+                REQUESTS_TOTAL.labels(status="error").inc()
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
+        _engine_duration = time.monotonic() - _t_engine
+        if _HAS_METRICS:
+            IN_FLIGHT.dec()
 
         if current_app.config['verbose']:
             logging.info(
@@ -647,6 +670,8 @@ try:
             error_detail = "; ".join(failed_errors)
             status = 400 if has_nontransient_error else 500
             logger.error(f"Inference request(s) failed: {error_detail}")
+            if _HAS_METRICS:
+                REQUESTS_TOTAL.labels(status="error").inc()
 
             # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
             if "MaxSequenceLengthOverflowError" in error_detail:
@@ -822,6 +847,14 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+
+        if _HAS_METRICS:
+            OUTPUT_TOKENS.inc(total_completion_tokens)
+            PROMPT_TOKENS.inc(prompt_token_count)
+            REQUEST_DURATION.observe(_engine_duration)
+            if _engine_duration > 0:
+                OUTPUT_TPS.observe(total_completion_tokens / _engine_duration)
+            REQUESTS_TOTAL.labels(status="success").inc()
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization
