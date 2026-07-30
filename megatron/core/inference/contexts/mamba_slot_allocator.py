@@ -649,7 +649,12 @@ class MambaSlotAllocator:
         """Reset all state (mappings, free pool, cache, intermediate tracking)."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
-        self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup. Rebinding here
+        # would make free_slots an inference tensor, and the later in-place write
+        # in _invalidate_blocks_batch (LRU eviction path) runs outside inference
+        # mode, which PyTorch rejects.
+        torch.arange(self.max_slots, out=self.free_slots)
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()

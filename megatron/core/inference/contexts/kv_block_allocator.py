@@ -262,7 +262,12 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup. Rebinding here
+        # would make block_bag an inference tensor, and the later in-place writes
+        # when blocks are returned to the pool run outside inference mode, which
+        # PyTorch rejects.
+        torch.arange(self.pool_size, out=self.block_bag)
 
         self.pool_avail = self.pool_size - 1
 
