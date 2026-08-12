@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import socket
+import time
 from collections import deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -331,9 +332,17 @@ class DataParallelInferenceCoordinator:
             prompt: Either a string (to be tokenized) or a list of token IDs.
 
         Returns:
-            List of integer block hashes, or empty list if prefix caching is disabled.
+            List of integer block hashes, or empty list if no routing decision
+            consumes them.
         """
         if not self.enable_prefix_caching or self.block_size_tokens is None:
+            return []
+        # LOAD_BALANCED routes purely on in-flight counts, so the hashes would be
+        # computed and then discarded by get_best_data_parallel_rank(). This is
+        # the coordinator's single serial loop and hashing is O(prompt length),
+        # so skipping it matters: it was ~35% of coordinator time per request,
+        # 15 ms at a 262k-token prompt.
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
             return []
         if isinstance(prompt, str):
             tokens = self.tokenizer.tokenize(prompt)
@@ -438,8 +447,10 @@ class DataParallelInferenceCoordinator:
                 self._handle_rank_registration(sender_identity)
                 continue
 
+            _t_unpack = time.perf_counter()
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
+            print(f"[COORD] unpack ({header.name}): {(time.perf_counter()-_t_unpack)*1000:.3f} ms  |  {len(serialized_payload)} bytes", flush=True)
 
             handler = self._handlers.get(header)
             if handler is None:

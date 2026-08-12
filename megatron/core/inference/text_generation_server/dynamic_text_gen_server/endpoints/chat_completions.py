@@ -458,6 +458,7 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
+        _t_request_start = time.perf_counter()
         req = await request.get_json()
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
@@ -483,6 +484,7 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
+                _t_tok_start = time.perf_counter()
                 prompt_tokens = await asyncio.get_running_loop().run_in_executor(
                     current_app.config['tokenize_executor'],
                     partial(
@@ -493,6 +495,7 @@ try:
                         chat_template_kwargs,
                     ),
                 )
+                print(f"[TIMER] tokenize (apply_chat_template): {(time.perf_counter() - _t_tok_start)*1000:.2f} ms  |  {len(prompt_tokens)} tokens", flush=True)
 
                 if req.get("prevent_retokenization", True):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
@@ -672,16 +675,20 @@ try:
             response.timeout = None
             return response
 
+        _t_submit_start = time.perf_counter()
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        print(f"[TIMER] submit to engine (add_request): {(time.perf_counter() - _t_submit_start)*1000:.2f} ms", flush=True)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
+        _t_engine_start = time.perf_counter()
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
+        print(f"[TIMER] engine generation (await): {(time.perf_counter() - _t_engine_start)*1000:.2f} ms", flush=True)
 
         if current_app.config['verbose']:
             logging.info(
@@ -732,15 +739,18 @@ try:
         # return_tokenized_data / return_raw_text / return_prompt_tokens were computed
         # at submit time (above) and drive both the response shape here and whether the
         # engine kept the prompt_tokens tensor on the payload.
+        _t_detok_total = 0.0
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
 
+            _t_detok = time.perf_counter()
             text_output = TextGenerationController.detokenize(
                 tokenizer,
                 result["generated_tokens"],
                 remove_EOD=not sampling_params.detokenize_stop_sequence,
             )
+            _t_detok_total += time.perf_counter() - _t_detok
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.
             prompt_tokens_count = result.get("prompt_length")
@@ -875,6 +885,8 @@ try:
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
+        print(f"[TIMER] detokenize (all choices): {_t_detok_total*1000:.2f} ms  |  {total_completion_tokens} tokens", flush=True)
+
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
@@ -890,6 +902,14 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+
+        _t_total = time.perf_counter() - _t_request_start
+        print(
+            f"[TIMER] === request total: {_t_total*1000:.2f} ms"
+            f"  |  prompt={prompt_token_count} gen={total_completion_tokens}"
+            f"  |  throughput={total_completion_tokens/_t_total:.1f} tok/s",
+            flush=True,
+        )
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

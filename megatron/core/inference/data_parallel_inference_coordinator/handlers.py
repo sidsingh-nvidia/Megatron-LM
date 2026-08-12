@@ -14,6 +14,7 @@ signals the coordinator's event loop to stop.
 """
 
 import logging
+import time
 
 import torch
 
@@ -97,11 +98,15 @@ def handle_submit_request(coordinator, sender_identity, payload):
     else:
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
+    _t_pack = time.perf_counter()
     engine_payload = msgpack.packb(
         [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
     )
+    print(f"[COORD][req={request_id}] pack: {(time.perf_counter()-_t_pack)*1000:.3f} ms  |  {len(engine_payload)} bytes", flush=True)
 
+    _t_hash = time.perf_counter()
     request_hashes = coordinator.compute_request_hashes(prompt)
+    print(f"[COORD][req={request_id}] hash-compute: {(time.perf_counter()-_t_hash)*1000:.3f} ms  |  {len(request_hashes)} blocks", flush=True)
     if (
         coordinator.prefix_caching_coordinator_policy
         == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
@@ -109,6 +114,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         request_hashes = request_hashes[:1]
 
     # Account for the fact that some engines may have died.
+    _t_route = time.perf_counter()
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
         if coordinator._send_to_engine(next_identity, engine_payload):
@@ -120,6 +126,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         del coordinator.request_id_to_client_request_id[request_id]
         del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
         return True
+    print(f"[COORD][req={request_id}] route+send: {(time.perf_counter()-_t_route)*1000:.3f} ms  |  rank={coordinator.identity_to_rank_index.get(next_identity)}", flush=True)
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -195,8 +202,12 @@ def handle_engine_reply(coordinator, sender_identity, payload):
     finished_requests = payload[1]
 
     for finished_request in finished_requests:
-        coordinator.detokenize(finished_request)
         fid = finished_request["request_id"]
+
+        _t_detok = time.perf_counter()
+        coordinator.detokenize(finished_request)
+        print(f"[COORD][req={fid}] coordinator detokenize: {(time.perf_counter()-_t_detok)*1000:.3f} ms", flush=True)
+
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
@@ -209,15 +220,14 @@ def handle_engine_reply(coordinator, sender_identity, payload):
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
 
-        coordinator.router_socket.send_multipart(
-            [
-                client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, client_request_id, finished_request],
-                    use_bin_type=True,
-                ),
-            ]
+        _t_pack_reply = time.perf_counter()
+        reply_payload = msgpack.packb(
+            [Headers.ENGINE_REPLY.value, client_request_id, finished_request],
+            use_bin_type=True,
         )
+        print(f"[COORD][req={fid}] pack reply: {(time.perf_counter()-_t_pack_reply)*1000:.3f} ms  |  {len(reply_payload)} bytes", flush=True)
+
+        coordinator.router_socket.send_multipart([client_identity, reply_payload])
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
