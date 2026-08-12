@@ -304,14 +304,18 @@ class DataParallelInferenceCoordinator:
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, payload):
-        """Send payload to an engine, removing it from the pool if unreachable.
+    def _send_to_engine(self, identity, frames):
+        """Send a message to an engine, removing it from the pool if unreachable.
+
+        Args:
+            identity: ZMQ identity of the target engine.
+            frames (list): Raw frames to send, metadata frame first.
 
         Returns:
             True if the send succeeded, False if the engine was unreachable and removed.
         """
         try:
-            self.router_socket.send_multipart([identity, payload])
+            self.router_socket.send_multipart([identity, *frames])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
@@ -323,7 +327,22 @@ class DataParallelInferenceCoordinator:
         """Send a deserialized payload to every connected data parallel rank."""
         serialized = msgpack.packb(payload, use_bin_type=True)
         for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-            self._send_to_engine(data_parallel_rank_id, serialized)
+            self._send_to_engine(data_parallel_rank_id, [serialized])
+
+    @property
+    def routing_needs_prompt(self):
+        """Whether a routing decision requires looking at the prompt.
+
+        Only prefix-affinity policies do. When this is False the prompt stays an
+        opaque frame for its whole crossing, which is what keeps the
+        coordinator's per-request cost independent of prompt length.
+        """
+        return (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prefix_caching_coordinator_policy
+            != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        )
 
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
@@ -440,22 +459,27 @@ class DataParallelInferenceCoordinator:
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         while True:
-            sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            # Messages are one or more frames. frames[0] is the metadata frame:
+            # a header plus whatever the coordinator needs to route the message.
+            # Any later frames are opaque payload bodies, forwarded without ever
+            # being decoded here -- that is what keeps this loop's cost
+            # independent of prompt length.
+            sender_identity, *frames = self.router_socket.recv_multipart()
 
             # An empty payload is a data parallel rank (re-)registering itself.
-            if serialized_payload == b"":
+            if frames[0] == b"":
                 self._handle_rank_registration(sender_identity)
                 continue
 
-            _t_unpack = time.perf_counter()
-            deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
-            header = Headers(deserialized_payload[0])
-            print(f"[COORD] unpack ({header.name}): {(time.perf_counter()-_t_unpack)*1000:.3f} ms  |  {len(serialized_payload)} bytes", flush=True)
+            _t_meta = time.perf_counter()
+            metadata = msgpack.unpackb(frames[0], raw=False)
+            header = Headers(metadata[0])
+            print(f"[COORD] unpack meta ({header.name}): {(time.perf_counter()-_t_meta)*1000:.3f} ms  |  meta={len(frames[0])}B body={sum(len(f) for f in frames[1:])}B", flush=True)
 
             handler = self._handlers.get(header)
             if handler is None:
                 raise UnknownHeaderError(header)
-            if handler(self, sender_identity, deserialized_payload):
+            if handler(self, sender_identity, metadata, frames[1:]):
                 break
 
     def _handle_rank_registration(self, sender_identity):
