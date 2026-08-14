@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -904,8 +905,11 @@ try:
         }
 
         _t_total = time.perf_counter() - _t_request_start
+        # Replicas of a rank share one log, so tag the serving process: it is the
+        # only way to see how evenly connections actually spread across them.
         print(
             f"[TIMER] === request total: {_t_total*1000:.2f} ms"
+            f"  |  replica_pid={os.getpid()}"
             f"  |  prompt={prompt_token_count} gen={total_completion_tokens}"
             f"  |  throughput={total_completion_tokens/_t_total:.1f} tok/s",
             flush=True,
