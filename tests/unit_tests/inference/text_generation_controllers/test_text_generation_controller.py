@@ -1536,7 +1536,7 @@ def test_async_sched_step_overlap_order():
         side_effect=lambda *_: call_order.append("forward")
     )
     controller._run_async_sched_resolve = mock.Mock(
-        side_effect=lambda *_: call_order.append("resolve")
+        side_effect=lambda *_, **_kwargs: call_order.append("resolve")
         or SimpleNamespace(
             sampled_tokens_cpu=sampled_tokens_cpu,
             accepted_tokens_cpu=None,
@@ -1549,6 +1549,7 @@ def test_async_sched_step_overlap_order():
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
+            log_probs_result=None,
         )
     )
 
@@ -1680,6 +1681,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
+            log_probs_result=None,
         )
     )
     observed = []
@@ -1826,6 +1828,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        log_probs_result=None,
     )
     input_ids = torch.empty(1, dtype=torch.int64)
     position_ids = torch.empty(1, dtype=torch.int64)
@@ -1838,7 +1841,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         side_effect=lambda: call_order.append("sample") or sample_result
     )
 
-    def update_request_state(*_args):
+    def update_request_state(*_args, **_kwargs):
         call_order.append("update")
         context.num_prefill_requests = launched_prefill_requests
         return request_result
@@ -1934,11 +1937,12 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        log_probs_result=None,
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
     controller._synchronize_async_sched_event = mock.Mock()
 
-    def update_last_request(*_args):
+    def update_last_request(*_args, **_kwargs):
         context.total_request_count = 0
         context.active_token_count = 0
         return request_result
@@ -1988,6 +1992,7 @@ def test_async_sched_mtp_overlap_step_order():
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        log_probs_result=None,
     )
     input_ids = torch.empty(9, dtype=torch.int64)
     position_ids = torch.empty(9, dtype=torch.int64)
@@ -2028,7 +2033,7 @@ def test_async_sched_mtp_overlap_step_order():
     )
     context.commit_sampled_tokens = mock.Mock(side_effect=lambda *_: call_order.append("commit"))
     controller._run_async_sched_resolve = mock.Mock(
-        side_effect=lambda *_: call_order.append("resolve") or resolve_result
+        side_effect=lambda *_, **_kwargs: call_order.append("resolve") or resolve_result
     )
 
     result = asyncio.run(controller._run_async_sched_step_overlap_mtp())
