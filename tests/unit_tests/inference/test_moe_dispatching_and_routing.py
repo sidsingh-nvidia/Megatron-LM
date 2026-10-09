@@ -879,6 +879,147 @@ class TestNVLSAllGatherVDispatcher:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# NVLAllToAllVDispatcher
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.internal
+class TestNVLAllToAllVDispatcher:
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        NVLSAllGatherVDispatcher._delete_buffers()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    def _make_dispatcher(self):
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLAllToAllVDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2 or Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLink a2a dispatcher test requires a power-of-two EP size > 1.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvl_a2a",
+            inference_moe_combine_precision="bf16",
+        )
+        num_local_experts = config.num_moe_experts // Utils.world_size
+        ep_rank = torch.distributed.get_rank()
+        local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
+
+        # Buffers live on the NVLS class, which the a2a dispatcher shares.
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=NANOV3_BASE["moe_router_topk"],
+            hidden_size=NANOV3_BASE["hidden_size"],
+            ep_group=get_expert_model_parallel_group(),
+            combine_dtype=torch.bfloat16,
+        )
+
+        return NVLAllToAllVDispatcher(
+            num_local_experts=num_local_experts,
+            local_expert_indices=local_expert_indices,
+            config=config,
+            pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
+        )
+
+    @pytest.mark.parametrize("seed", [42, 7])
+    @pytest.mark.parametrize("max_rank_tokens", [1, 7, 64, 512])
+    def test_cuda_graph_dispatch_combine(self, max_rank_tokens, seed):
+        """Dispatch+combine captured in a CUDA graph and replayed, with uneven token counts.
+
+        Routing ids and probs reach every rank; hidden rows reach only the ranks holding
+        one of the token's experts. Feeding the gathered hidden buffer back as the expert
+        output makes every destination's partial equal the token's own hidden row, so
+        combine must return m * hidden, m = number of distinct destination ranks.
+        """
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        num_local_experts = dispatcher.num_local_experts
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+        rank = torch.distributed.get_rank()
+
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
+        torch.distributed.broadcast(global_hidden, src=0)
+        torch.distributed.broadcast(global_probs, src=0)
+        torch.distributed.broadcast(global_routing_map, src=0)
+
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
+        static_hidden = global_hidden[start:end].contiguous()
+        static_probs = global_probs[start:end].contiguous()
+        static_routing_map = global_routing_map[start:end].contiguous()
+
+        with torch.no_grad():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    dispatcher.routing_map = static_routing_map
+                    dispatcher._local_tokens = local_tokens
+                    d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+                    dispatcher.token_combine(d_hidden.clone())
+            torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dispatcher.routing_map = static_routing_map
+            dispatcher._local_tokens = local_tokens
+            d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+            graph_hidden = d_hidden[:total_tokens].clone()
+            graph_probs = d_probs[:total_tokens].clone()
+            graph_routing_map = dispatcher.routing_map[:total_tokens].clone()
+            graph_combined = dispatcher.token_combine(d_hidden.clone())
+
+        graph.replay()
+
+        torch.testing.assert_close(graph_probs, global_probs, atol=0, rtol=0)
+        torch.testing.assert_close(graph_routing_map, global_routing_map, atol=0, rtol=0)
+        lo, hi = rank * num_local_experts, (rank + 1) * num_local_experts
+        routed_here = ((global_routing_map >= lo) & (global_routing_map < hi)).any(dim=1)
+        torch.testing.assert_close(
+            graph_hidden[routed_here], global_hidden[routed_here], atol=0, rtol=0
+        )
+
+        dest_ranks = global_routing_map[start:end] // num_local_experts
+        num_dest = (
+            torch.zeros(local_tokens, ep_size, device="cuda", dtype=torch.bool)
+            .scatter_(1, dest_ranks, True)
+            .sum(dim=1, keepdim=True)
+        )
+        expected_combined = (global_hidden[start:end].float() * num_dest).bfloat16()
+        torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # symmetric-memory collective ordering (explicit barrier-before-reuse)
 # ──────────────────────────────────────────────────────────────────────
 

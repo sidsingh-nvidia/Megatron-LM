@@ -1245,6 +1245,16 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+def _bf16_combine_buffer(nvls_dispatcher: bool) -> Optional[torch.Tensor]:
+    """The NVLink dispatchers' combine buffer if it is BF16, else None."""
+    if not nvls_dispatcher:
+        return None
+    buffer = NVLSAllGatherVDispatcher._get_rsv_tensor()
+    if buffer is None or buffer.dtype != torch.bfloat16:
+        return None
+    return buffer
+
+
 class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
@@ -1286,7 +1296,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
-        self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+        # Both NVLink dispatchers combine out of the shared NVLS RSV buffer.
+        self._nvls_dispatcher = config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
@@ -1536,10 +1547,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
-            # FlashInfer's BF16 CUTLASS kernel requires a BF16 output, while the
-            # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
-            # token_combine() copies it into the symmetric FP32 buffer.
-            output=None,
+            # FlashInfer's BF16 CUTLASS kernel requires a BF16 output. With a BF16
+            # combine buffer it writes there directly; with the default FP32 buffer
+            # the kernel returns BF16 and token_combine() copies it in.
+            output=_bf16_combine_buffer(self._nvls_dispatcher),
         )[0]
         return output, None
 

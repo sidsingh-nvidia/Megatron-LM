@@ -797,11 +797,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
-        # are we using the inference_optimized nvls ep dispatcher for MoEs?
-        self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nvls'
-        )
+        # are we using an inference_optimized NVLink ep dispatcher ('nvls' or 'nvl_a2a',
+        # which share the NVLS buffers and step metadata) for MoEs?
+        self._nvls_dispatcher = get_pg_size(
+            self.expert_model_parallel_group
+        ) > 1 and model_config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
 
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
@@ -867,6 +867,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+                combine_dtype=(
+                    torch.bfloat16
+                    if model_config.inference_moe_combine_precision == 'bf16'
+                    else torch.float32
+                ),
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
