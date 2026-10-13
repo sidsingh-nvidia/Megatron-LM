@@ -1,10 +1,10 @@
 # moe-bench
 
-Single-node tooling for benchmarking and profiling the mcore dynamic inference server on
+Tooling for benchmarking and profiling the mcore dynamic inference server on
 Nemotron MoE models, built to compare the MoE expert-parallel dispatchers (`nvls`, `nvl_a2a`).
 
-- `server/launch.sh`: one sbatch script that serves nano-3.5 or Super v3 on a 4-GPU node and,
-  optionally, runs a throughput sweep or an nsys profile inside the same job.
+- `server/launch.sh`: one sbatch script that serves nano-3.5 or Super v3 on one 4-GPU node (Ultra v3
+  on two) and, optionally, runs a throughput sweep or an nsys profile inside the same job.
 - `server/client.py`: the in-job sweep client (stdlib HTTP plus HF `datasets` / `transformers`).
 - `convert/convert_ultra_tp8ep8.sh`: Megatron Bridge HF -> mcore conversion of Nemotron 3 Ultra
   (2 nodes, TP8 x EP8).
@@ -35,7 +35,13 @@ printed in the slurm log and written to `<exp dir>/host`.
 sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 moe-bench/server/launch.sh
 # Super v3, for evals: prefix caching, and chat responses without prompt token ids
 sbatch --export=ALL,EXP_NAME=eval,MODEL=superv3,PREFIX_CACHING=1,EVAL_MODE=1 moe-bench/server/launch.sh
+# Ultra v3 (~1.1 TB of weights) on 2 nodes, TP8 x EP8; --segment keeps both nodes in one NVLink
+# domain, which the cross-node TP8 multicast collectives need
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra,MODEL=ultrav3 moe-bench/server/launch.sh
 ```
+
+Multi-node runs launch one task per GPU on every node (`sbatch -N <n>`); global rank 0 hosts the
+HTTP server, and ranks rendezvous through the `MASTER_ADDR` / `MASTER_PORT` the cluster exports.
 
 ## Throughput sweeps
 
