@@ -1430,13 +1430,12 @@ class TransformerConfig(ModelParallelConfig):
       inference_moe_combine_precision='bf16' and expert_tensor_parallel_size == 1.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
-    inference_moe_combine_precision: Optional[Literal['fp32', 'bf16']] = None
+    inference_moe_combine_precision: Literal['fp32', 'bf16'] = 'fp32'
     """Precision of the expert outputs that the 'nvls' and 'nvl_a2a' dispatchers sum across
     EP ranks. 'bf16' halves the combine traffic and symmetric-buffer memory, at the cost of
     rounding each rank's partial output to bf16 before the cross-rank sum. 'bf16' is
-    required by 'nvl_a2a', and is not supported by the 'nccl' dispatcher, the torch
-    grouped-GEMM backend, MXFP8 experts on the vLLM backend, or batch_invariant_mode.
-    Unset (default) resolves to 'bf16' where it is supported and 'fp32' otherwise."""
+    required by 'nvl_a2a', and is not supported by the torch grouped-GEMM backend, by MXFP8
+    experts on the vLLM backend, or in batch_invariant_mode."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -2036,22 +2035,6 @@ class TransformerConfig(ModelParallelConfig):
                         "expert_model_parallel_size > 1"
                     )
 
-            # These run mcore_fused_moe, which accumulates the combine buffer with fp32 atomics.
-            fp32_combine_backend = (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                or (
-                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                    and mxfp8_enabled
-                )
-            )
-            if self.inference_moe_combine_precision is None:
-                bf16_combine_supported = (
-                    self.inference_moe_token_dispatcher_type != "nccl"
-                    and not fp32_combine_backend
-                    and not self.batch_invariant_mode
-                )
-                self.inference_moe_combine_precision = "bf16" if bf16_combine_supported else "fp32"
-
             if self.inference_moe_token_dispatcher_type == "nvl_a2a":
                 if self.inference_moe_combine_precision != "bf16":
                     raise ValueError(
@@ -2072,7 +2055,12 @@ class TransformerConfig(ModelParallelConfig):
                         "inference_moe_combine_precision='bf16' applies only to the 'nvls' and "
                         "'nvl_a2a' dispatchers, got inference_moe_token_dispatcher_type='nccl'."
                     )
-                if fp32_combine_backend:
+                # These run mcore_fused_moe, which accumulates the combine buffer with fp32
+                # atomics.
+                if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH or (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+                    and mxfp8_enabled
+                ):
                     raise ValueError(
                         "inference_moe_combine_precision='bf16' is not supported by the torch "
                         "grouped-GEMM backend or by MXFP8 experts on the vLLM backend. Use "
