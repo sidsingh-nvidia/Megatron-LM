@@ -30,8 +30,19 @@ def _make_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_combine_precision_defaults_to_fp32():
-    assert _make_config().inference_moe_combine_precision == "fp32"
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({}, "bf16"),
+        ({"inference_moe_token_dispatcher_type": "nvl_a2a"}, "bf16"),
+        ({"inference_grouped_gemm_backend": "flashinfer"}, "bf16"),
+        ({"inference_moe_token_dispatcher_type": "nccl"}, "fp32"),
+        ({"inference_grouped_gemm_backend": "torch"}, "fp32"),
+        ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}, "fp32"),
+    ],
+)
+def test_combine_precision_default_resolves_by_support(overrides, expected):
+    assert _make_config(**overrides).inference_moe_combine_precision == expected
 
 
 @pytest.mark.parametrize("dispatcher", ["nvls", "nvl_a2a"])
@@ -48,7 +59,17 @@ def test_bf16_combine_accepted(dispatcher, backend):
 @pytest.mark.parametrize(
     "overrides, match",
     [
-        ({"inference_moe_token_dispatcher_type": "nvl_a2a"}, "requires.*'bf16'"),
+        (
+            {
+                "inference_moe_token_dispatcher_type": "nvl_a2a",
+                "inference_moe_combine_precision": "fp32",
+            },
+            "requires.*'bf16'",
+        ),
+        (
+            {"inference_moe_token_dispatcher_type": "nvl_a2a", "inference_grouped_gemm_backend": "torch"},
+            "requires.*'bf16'",
+        ),
         (
             {
                 "inference_moe_token_dispatcher_type": "nccl",
