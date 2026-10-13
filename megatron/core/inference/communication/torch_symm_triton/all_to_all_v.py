@@ -304,15 +304,14 @@ def _a2a_combine_v_kernel(
     if pid >= ep_max_tokens:
         return
 
-    # Every destination's partials (written by earlier kernels) must be visible before any pull:
-    # release on the signal side, acquire on the wait side (these are plain peer loads).
+    # see https://github.com/yifuwang/symm-mem-recipes/blob/8ee5d5b8f53efb9c051e6cdf0ca62270c2b43c34/triton_barrier.py#L115-L119
     symm_mem_sync(
         signal_pad_ptrs,
         None,
         RANK,
         WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
+        hasPreviousMemAccess=False,
+        hasSubsequentMemAccess=False,
     )
     sync_threads()
 
@@ -446,7 +445,7 @@ def a2a_dispatch_v(
     routing_bits, routing_packs = _row_params(input_routing)
     probs_bits, probs_packs = _row_params(input_probs)
 
-    max_num_blocks = kwargs.get("max_num_blocks", 148)
+    max_num_blocks = kwargs.get("max_num_blocks", 128)
     block_size = min(
         max(triton.next_power_of_2(p) for p in (hidden_packs, routing_packs, probs_packs)),
         _MAX_BLOCK_SIZE,
@@ -518,7 +517,7 @@ def a2a_combine_v(
     bits, hidden_packs = _row_params(output)
     assert bits == 128, "hidden rows must be 16-byte aligned"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 148)
+    max_num_blocks = kwargs.get("max_num_blocks", 128)
     block_size = min(triton.next_power_of_2(hidden_packs), _MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // _WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
