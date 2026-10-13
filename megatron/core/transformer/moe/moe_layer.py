@@ -455,11 +455,11 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
-        # Wire shared-expert overlap into the inference dispatcher (NVLS only).
-        # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
-        # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
+        # Wire shared-expert overlap into the NVLink inference dispatchers. The dispatcher
+        # launches the shared-expert forward on SharedExpertMLP.stream concurrently with
+        # dispatch+experts+combine and adds it back in combine_postprocess.
         if (
-            dispatcher_type == 'nvls'
+            dispatcher_type in ('nvls', 'nvl_a2a')
             and self.use_shared_expert
             and self.config.moe_shared_expert_overlap
         ):
