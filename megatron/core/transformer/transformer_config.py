@@ -1418,13 +1418,25 @@ class TransformerConfig(ModelParallelConfig):
     the NVLS inference dispatcher and EP > 1.
     """
 
-    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
+    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls', 'nvl_a2a'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
       decode-only CUDA graphs (forced automatically).
     - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
       Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
+    - 'nvl_a2a': Variable-count all-to-all-V over NVLink. Hidden rows are sent only to the
+      ranks that hold one of the token's experts, and combine pulls each token's partial
+      outputs from those ranks. Needs the same hardware as 'nvls' (routing ids and probs
+      are still multicast), but uses no in-switch reduction. Requires
+      inference_moe_combine_precision='bf16' and expert_tensor_parallel_size == 1.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
+
+    inference_moe_combine_precision: Literal['fp32', 'bf16'] = 'fp32'
+    """Precision of the expert outputs that the 'nvls' and 'nvl_a2a' dispatchers sum across
+    EP ranks. 'bf16' halves the combine traffic and symmetric-buffer memory, at the cost of
+    rounding each rank's partial output to bf16 before the cross-rank sum. 'bf16' is
+    required by 'nvl_a2a', and is not supported by the torch grouped-GEMM backend, by MXFP8
+    experts on the vLLM backend, or in batch_invariant_mode."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -2022,6 +2034,42 @@ class TransformerConfig(ModelParallelConfig):
                         "fp8_recipe='mxfp8', "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
+                    )
+
+            if self.inference_moe_token_dispatcher_type == "nvl_a2a":
+                if self.inference_moe_combine_precision != "bf16":
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='nvl_a2a' requires "
+                        "inference_moe_combine_precision='bf16'."
+                    )
+                # Unreachable while the general expert-tensor-parallel check above stands; the
+                # a2a kernels route by expert_id // num_local_experts over the EP group only.
+                if self.expert_tensor_parallel_size != 1:
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='nvl_a2a' does not support "
+                        "expert tensor parallelism; set expert_tensor_parallel_size=1."
+                    )
+
+            if self.inference_moe_combine_precision == "bf16":
+                if self.inference_moe_token_dispatcher_type == "nccl":
+                    raise ValueError(
+                        "inference_moe_combine_precision='bf16' applies only to the 'nvls' and "
+                        "'nvl_a2a' dispatchers, got inference_moe_token_dispatcher_type='nccl'."
+                    )
+                # These run mcore_fused_moe, which accumulates the combine buffer with fp32
+                # atomics.
+                if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH or (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+                    and mxfp8_enabled
+                ):
+                    raise ValueError(
+                        "inference_moe_combine_precision='bf16' is not supported by the torch "
+                        "grouped-GEMM backend or by MXFP8 experts on the vLLM backend. Use "
+                        "inference_grouped_gemm_backend 'vllm' (BF16) or 'flashinfer'."
+                    )
+                if self.batch_invariant_mode:
+                    raise ValueError(
+                        "batch_invariant_mode requires inference_moe_combine_precision='fp32'."
                     )
 
             if self.batch_invariant_mode:

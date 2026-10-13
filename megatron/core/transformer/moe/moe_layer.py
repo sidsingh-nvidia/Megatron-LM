@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
+    NVLAllToAllVDispatcher,
     NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -435,14 +436,16 @@ class MoELayer(BaseMoELayer):
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
         Stores the training dispatcher and creates the inference dispatcher selected
-        by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
+        by config.inference_moe_token_dispatcher_type ('nccl', 'nvls' or 'nvl_a2a').
         The active dispatcher is selected at the start of `forward` based on
         `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
-        dispatcher_cls = (
-            NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
-        )
+        dispatcher_cls = {
+            'nccl': NCCLAllGatherDispatcher,
+            'nvls': NVLSAllGatherVDispatcher,
+            'nvl_a2a': NVLAllToAllVDispatcher,
+        }[dispatcher_type]
 
         self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(
@@ -452,11 +455,11 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
-        # Wire shared-expert overlap into the inference dispatcher (NVLS only).
-        # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
-        # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
+        # Wire shared-expert overlap into the NVLink inference dispatchers. The dispatcher
+        # launches the shared-expert forward on SharedExpertMLP.stream concurrently with
+        # dispatch+experts+combine and adds it back in combine_postprocess.
         if (
-            dispatcher_type == 'nvls'
+            dispatcher_type in ('nvls', 'nvl_a2a')
             and self.use_shared_expert
             and self.config.moe_shared_expert_overlap
         ):

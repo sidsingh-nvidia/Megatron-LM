@@ -359,6 +359,45 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     assert captured["output"] is None
 
 
+def test_bf16_flashinfer_writes_into_bf16_combine_buffer(monkeypatch):
+    from megatron.core.transformer.moe import experts
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        NVLSAllGatherVDispatcher,
+    )
+
+    combine_buffer = torch.empty(4, 8, dtype=torch.bfloat16)
+    captured = {}
+
+    def cutlass_fused_moe(*args, **kwargs):
+        captured["output"] = kwargs["output"]
+        return (kwargs["output"],)
+
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(
+        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+    )
+    monkeypatch.setattr(NVLSAllGatherVDispatcher, "_symm_rsv", {"tensor": combine_buffer})
+
+    grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=False,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
+        _nvls_dispatcher=True,
+        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+    )
+    output, _ = experts.InferenceGroupedMLP._flashinfer_forward(
+        grouped_mlp,
+        torch.empty(4, 8, dtype=torch.bfloat16),
+        torch.zeros(4, 1, dtype=torch.int64),
+        torch.zeros(4, 1, dtype=torch.float32),
+    )
+
+    assert captured["output"] is combine_buffer
+    assert output is combine_buffer
+
+
 def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
     from megatron.core.transformer.moe import token_dispatcher_inference

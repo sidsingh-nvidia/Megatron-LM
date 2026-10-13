@@ -582,6 +582,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_nvls_symmetric_memory_collectives",
         sources=(
+            "megatron/core/inference/communication/torch_symm_triton/all_to_all_v.py",
             "megatron/core/inference/communication/torch_symm_triton/barrier.py",
             "megatron/core/inference/communication/torch_symm_triton/collectives.py",
             "megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",
@@ -594,7 +595,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
-        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
+        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them. "
+        "The NVLink all-to-all-v combine sums partials in a fixed per-token order but also needs a peer group.",
     ),
     KernelEntry(
         name="unified_memory_allocator",
