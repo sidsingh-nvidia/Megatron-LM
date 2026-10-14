@@ -213,38 +213,35 @@ class TestAllToAllVLargeGrid(TestAllToAllV):
     @classmethod
     def setup_class(cls):
         from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+            SYMM_MEM_KERNEL_CONFIG,
             ep_collectives_max_num_blocks,
         )
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
         super().setup_class()
-        # The cap sizes the signal pads, so set it while no symmetric-memory buffer exists.
+        # The cap sizes the signal pads, so set it while no symmetric-memory buffer exists,
+        # as the inference context does at startup.
         SymmetricMemoryManager.destroy()
         device = torch.cuda.current_device()
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         cls.per_rank_max_tokens = ep_collectives_max_num_blocks(num_sms, Utils.world_size)
         cls.tokens_per_rank = cls.per_rank_max_tokens
-        SymmetricMemoryManager.set_max_num_blocks(cls.per_rank_max_tokens)
+        cls._saved_max_num_blocks = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
+        SYMM_MEM_KERNEL_CONFIG.max_num_blocks = cls.per_rank_max_tokens
 
     @classmethod
     def teardown_class(cls):
         from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
-            SymmMemKernelConfig,
+            SYMM_MEM_KERNEL_CONFIG,
         )
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
         SymmetricMemoryManager.destroy()
-        SymmetricMemoryManager.set_max_num_blocks(SymmMemKernelConfig().max_num_blocks)
+        SYMM_MEM_KERNEL_CONFIG.max_num_blocks = cls._saved_max_num_blocks
         Utils.destroy_model_parallel()
 
     def test_signal_pads_fit_grid(self):
-        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
-            SYMM_MEM_KERNEL_CONFIG,
-        )
-
         ep_group, bufs = self._require_buffers()
-        if SYMM_MEM_KERNEL_CONFIG.max_num_blocks != self.per_rank_max_tokens:
-            pytest.skip("this torch cannot grow the symmetric-memory signal pad")
         needed = self.per_rank_max_tokens * torch.distributed.get_world_size(ep_group) * 4
         for buf in bufs.values():
             assert buf["handle"].signal_pad_size >= needed

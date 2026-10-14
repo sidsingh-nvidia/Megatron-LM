@@ -7,10 +7,6 @@ the symmetric-memory signal pad, at block_id * world_size + rank. SymmetricMemor
 sizes the pad from max_num_blocks when each buffer is allocated, so no launch may use
 more than max_num_blocks blocks.
 
-max_num_blocks defaults to 128. The inference context may change it once at startup,
-before any symmetric-memory buffer is allocated (SymmetricMemoryManager.set_max_num_blocks),
-e.g. to ep_collectives_max_num_blocks for the MoE dispatchers.
-
 Do not autotune the number of blocks (the grid size, or BLOCK_SIZE where the grid is
 derived from it) with triton.autotune or any other per-rank tuning:
 
@@ -27,10 +23,6 @@ rank, capped at max_num_blocks.
 """
 
 from dataclasses import dataclass
-
-# Grid cap of the uniform collectives (collectives.py, fused_collectives.py), which serve
-# tensor parallelism. Kept at 128 when max_num_blocks is raised for the EP collectives.
-UNIFORM_COLLECTIVES_MAX_NUM_BLOCKS = 128
 
 # See ep_collectives_max_num_blocks.
 _SMALL_EP_MAX_SIZE = 8
@@ -59,29 +51,23 @@ def ep_collectives_max_num_blocks(num_sms: int, ep_size: int) -> int:
     return blocks_per_sm * num_sms
 
 
-@dataclass(frozen=True)
+@dataclass
 class SymmMemKernelConfig:
     """Launch limits for the symmetric-memory collectives.
 
-    Frozen because the signal pads are sized from max_num_blocks at allocation time;
-    raising it afterwards would let launches overflow pads that already exist. The only
-    supported change is SymmetricMemoryManager.set_max_num_blocks, which refuses while any
-    symmetric-memory buffer exists.
+    The inference context sets max_num_blocks once at startup, before any symmetric-memory
+    buffer is allocated. Do not change it after that: the signal pads are sized from
+    max_num_blocks at allocation time, so raising it would let launches overflow pads that
+    already exist.
     """
 
     max_num_blocks: int = 128
-    """Grid cap for every kernel that synchronizes through symm_mem_sync, and the default
-    grid of the variable-count EP collectives."""
+    """Grid cap for every kernel that synchronizes through symm_mem_sync."""
 
     max_block_size: int = 1024
     """Threads per block cap; each thread moves one 64- or 128-bit chunk."""
 
     warp_size: int = 32
-
-    @property
-    def uniform_max_num_blocks(self) -> int:
-        """Grid cap of the uniform (tensor-parallel) collectives; never above max_num_blocks."""
-        return min(UNIFORM_COLLECTIVES_MAX_NUM_BLOCKS, self.max_num_blocks)
 
     def signal_pad_bytes(self, world_size: int) -> int:
         """Signal pad bytes symm_mem_sync needs for a group of world_size ranks."""
@@ -94,12 +80,6 @@ class SymmMemKernelConfig:
             f"Launching {num_blocks} blocks, but symmetric-memory signal pads are sized for "
             f"at most max_num_blocks={self.max_num_blocks}."
         )
-
-    def _set_max_num_blocks(self, max_num_blocks: int) -> None:
-        """Change max_num_blocks. Call only through SymmetricMemoryManager.set_max_num_blocks,
-        which checks that no signal pad has been sized from the current value."""
-        assert max_num_blocks > 0, f"max_num_blocks must be positive, got {max_num_blocks}"
-        object.__setattr__(self, "max_num_blocks", max_num_blocks)
 
 
 SYMM_MEM_KERNEL_CONFIG = SymmMemKernelConfig()

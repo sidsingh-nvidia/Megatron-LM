@@ -10,7 +10,6 @@ relative to the inference context.
 
 from __future__ import annotations
 
-import logging
 import operator
 from functools import reduce
 from typing import Optional
@@ -30,8 +29,6 @@ try:
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
-
-logger = logging.getLogger(__name__)
 
 
 def _ensure_signal_pad_size(world_size: int) -> None:
@@ -193,45 +190,6 @@ class SymmetricMemoryManager:
                 size_in_mb=size_mb or cls._default_size_mb, process_group=process_group
             )
         return cls._buffers[key]
-
-    @classmethod
-    def set_max_num_blocks(cls, max_num_blocks: int) -> None:
-        """Set the grid cap of the symmetric-memory collectives.
-
-        Signal pads are sized from SYMM_MEM_KERNEL_CONFIG.max_num_blocks when each buffer is
-        allocated, so the cap can only change while no buffer exists: call this at startup,
-        before the first get_buffer. Every rank must pass the same value, because all ranks
-        of a group must launch the same grid. A no-op if the cap already has this value.
-
-        Raising the cap above the current value needs torch's set_signal_pad_size
-        (torch >= 2.10); with older torch the cap is left unchanged.
-
-        Args:
-            max_num_blocks: new SYMM_MEM_KERNEL_CONFIG.max_num_blocks.
-        """
-        # Imported here to avoid an import cycle; see _ensure_signal_pad_size.
-        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
-            SYMM_MEM_KERNEL_CONFIG,
-        )
-
-        current = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
-        if max_num_blocks == current:
-            return
-        assert not cls._buffers, (
-            f"Cannot change max_num_blocks from {current} to {max_num_blocks}: symmetric-memory "
-            f"buffers {sorted(cls._buffers)} already have signal pads sized for {current} blocks."
-        )
-        if max_num_blocks > current and not (
-            HAVE_TORCH_SYMM_MEM and hasattr(symm_mem, "set_signal_pad_size")
-        ):
-            logger.warning(
-                "Keeping max_num_blocks=%d instead of %d: this torch cannot grow the "
-                "symmetric-memory signal pad (needs set_signal_pad_size, torch >= 2.10).",
-                current,
-                max_num_blocks,
-            )
-            return
-        SYMM_MEM_KERNEL_CONFIG._set_max_num_blocks(max_num_blocks)
 
     @classmethod
     def destroy(cls, key: Optional[str] = None) -> None:
