@@ -22,6 +22,7 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
@@ -222,7 +223,13 @@ def _multimem_reduce_scatter_kernel(
 
 # ── Python wrappers ─────────────────────────────────────────────────────────
 
-_DEFAULT_KERNEL_CONFIG = {"max_num_blocks": 128, "num_warps": 32, "BLOCK_SIZE": 1024}
+# Do not autotune BLOCK_SIZE or the number of blocks with Triton. The grid is derived from
+# BLOCK_SIZE, and every rank must launch the same grid of at most max_num_blocks blocks, or
+# the barrier overflows the signal pad or hangs. See kernel_config.py.
+_DEFAULT_KERNEL_CONFIG = {
+    "num_warps": SYMM_MEM_KERNEL_CONFIG.max_block_size // SYMM_MEM_KERNEL_CONFIG.warp_size,
+    "BLOCK_SIZE": SYMM_MEM_KERNEL_CONFIG.max_block_size,
+}
 
 
 def _kernel_launch_config(element_size: int, max_numel: int, world_size: int, **kwargs):
@@ -237,9 +244,14 @@ def _kernel_launch_config(element_size: int, max_numel: int, world_size: int, **
         (numel_per_thread, num_blocks, config) tuple.
     """
     config = {k: kwargs.get(k, v) for k, v in _DEFAULT_KERNEL_CONFIG.items()}
+    # Read at launch, not import: the cap may be set at startup, after this module is imported.
+    config["max_num_blocks"] = kwargs.get(
+        "max_num_blocks", SYMM_MEM_KERNEL_CONFIG.uniform_max_num_blocks
+    )
     numel_per_thread = 128 // (element_size * 8)
     num_threads = triton.cdiv(max_numel // numel_per_thread, world_size)
     num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
     return numel_per_thread, num_blocks, config
 
 

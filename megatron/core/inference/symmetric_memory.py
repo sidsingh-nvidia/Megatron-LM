@@ -10,6 +10,7 @@ relative to the inference context.
 
 from __future__ import annotations
 
+import logging
 import operator
 from functools import reduce
 from typing import Optional
@@ -29,6 +30,32 @@ try:
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_signal_pad_size(world_size: int) -> None:
+    """Grow torch's signal pad so the Triton collectives' barrier slots fit for this group.
+
+    symm_mem_sync uses one int32 slot per (block, peer). torch reads the signal pad size
+    when each allocation is made, so this must run before symm_mem.empty. It only grows
+    the size, and every rank runs the same allocations in the same order, so all ranks of
+    a group allocate the same pad.
+    """
+    # Imported here to avoid an import cycle: parallel_state imports this module, and the
+    # kernel package imports megatron.core.utils, which imports parallel_state.
+    from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+        SYMM_MEM_KERNEL_CONFIG,
+    )
+
+    if not hasattr(symm_mem, "set_signal_pad_size"):
+        # Older torch (e.g. 2.9) has a fixed 2 KiB pad and no setter. Its allocator puts the
+        # pad after the data and zeroes the whole granularity-rounded block, so barrier slots
+        # past the pad land in zeroed memory that nothing else uses.
+        return
+    needed = SYMM_MEM_KERNEL_CONFIG.signal_pad_bytes(world_size)
+    if symm_mem.get_signal_pad_size() < needed:
+        symm_mem.set_signal_pad_size(needed)
 
 
 class SymmetricMemoryBuffer:
@@ -52,6 +79,7 @@ class SymmetricMemoryBuffer:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
             try:
                 symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                _ensure_signal_pad_size(process_group.size())
                 self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
                 self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
             except RuntimeError as e:
@@ -165,6 +193,45 @@ class SymmetricMemoryManager:
                 size_in_mb=size_mb or cls._default_size_mb, process_group=process_group
             )
         return cls._buffers[key]
+
+    @classmethod
+    def set_max_num_blocks(cls, max_num_blocks: int) -> None:
+        """Set the grid cap of the symmetric-memory collectives.
+
+        Signal pads are sized from SYMM_MEM_KERNEL_CONFIG.max_num_blocks when each buffer is
+        allocated, so the cap can only change while no buffer exists: call this at startup,
+        before the first get_buffer. Every rank must pass the same value, because all ranks
+        of a group must launch the same grid. A no-op if the cap already has this value.
+
+        Raising the cap above the current value needs torch's set_signal_pad_size
+        (torch >= 2.10); with older torch the cap is left unchanged.
+
+        Args:
+            max_num_blocks: new SYMM_MEM_KERNEL_CONFIG.max_num_blocks.
+        """
+        # Imported here to avoid an import cycle; see _ensure_signal_pad_size.
+        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+            SYMM_MEM_KERNEL_CONFIG,
+        )
+
+        current = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
+        if max_num_blocks == current:
+            return
+        assert not cls._buffers, (
+            f"Cannot change max_num_blocks from {current} to {max_num_blocks}: symmetric-memory "
+            f"buffers {sorted(cls._buffers)} already have signal pads sized for {current} blocks."
+        )
+        if max_num_blocks > current and not (
+            HAVE_TORCH_SYMM_MEM and hasattr(symm_mem, "set_signal_pad_size")
+        ):
+            logger.warning(
+                "Keeping max_num_blocks=%d instead of %d: this torch cannot grow the "
+                "symmetric-memory signal pad (needs set_signal_pad_size, torch >= 2.10).",
+                current,
+                max_num_blocks,
+            )
+            return
+        SYMM_MEM_KERNEL_CONFIG._set_max_num_blocks(max_num_blocks)
 
     @classmethod
     def destroy(cls, key: Optional[str] = None) -> None:

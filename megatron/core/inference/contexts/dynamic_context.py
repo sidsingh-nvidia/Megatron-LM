@@ -18,6 +18,9 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+    ep_collectives_max_num_blocks,
+)
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -33,6 +36,7 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -860,6 +864,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
         elif self._nvls_dispatcher:
+            # Grid cap of the dispatch / combine kernels, which process one token per block.
+            # Signal pads are sized from it when each symmetric-memory buffer is allocated, so
+            # set it before the dispatcher allocates its buffers. It depends only on values
+            # that are identical on every rank: ranks pick their CUDA graphs independently
+            # (and may run eagerly), yet every launch must use the same grid on all ranks.
+            num_sms = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            SymmetricMemoryManager.set_max_num_blocks(
+                model_config.inference_moe_nvl_max_num_blocks
+                or ep_collectives_max_num_blocks(
+                    num_sms, get_pg_size(self.expert_model_parallel_group)
+                )
+            )
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(

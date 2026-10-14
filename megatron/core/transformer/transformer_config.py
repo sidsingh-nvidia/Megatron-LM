@@ -1438,6 +1438,13 @@ class TransformerConfig(ModelParallelConfig):
     required by 'nvl_a2a', and is not supported by the torch grouped-GEMM backend, by MXFP8
     experts on the vLLM backend, or in batch_invariant_mode."""
 
+    inference_moe_nvl_max_num_blocks: Optional[int] = None
+    """Grid cap (thread blocks) of the 'nvls' and 'nvl_a2a' dispatch / combine kernels, which
+    process one token per block. None picks it from the EP size and the GPU's SM count: 4
+    blocks per SM at EP <= 8, 1 block per SM above (see ep_collectives_max_num_blocks in
+    torch_symm_triton/kernel_config.py). 128 restores the previous fixed cap. Also sizes the
+    signal pad of every symmetric-memory buffer, so it must match on all ranks."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -2070,6 +2077,18 @@ class TransformerConfig(ModelParallelConfig):
                 if self.batch_invariant_mode:
                     raise ValueError(
                         "batch_invariant_mode requires inference_moe_combine_precision='fp32'."
+                    )
+
+            if self.inference_moe_nvl_max_num_blocks is not None:
+                if self.inference_moe_nvl_max_num_blocks <= 0:
+                    raise ValueError(
+                        "inference_moe_nvl_max_num_blocks must be > 0, got "
+                        f"{self.inference_moe_nvl_max_num_blocks}"
+                    )
+                if self.inference_moe_token_dispatcher_type == "nccl":
+                    raise ValueError(
+                        "inference_moe_nvl_max_num_blocks applies only to the 'nvls' and "
+                        "'nvl_a2a' dispatchers, got inference_moe_token_dispatcher_type='nccl'."
                     )
 
             if self.batch_invariant_mode:
