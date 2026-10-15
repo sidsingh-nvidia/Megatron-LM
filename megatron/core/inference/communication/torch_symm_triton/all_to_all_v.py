@@ -56,11 +56,15 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_64, ld_128, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
 
-_MAX_BLOCK_SIZE = 1024
-_WARP_SIZE = 32
+# Do not autotune the number of blocks with Triton: every rank must launch the same grid
+# of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+# See kernel_config.py.
+_MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+_WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 _MAX_WORLD_SIZE = 64  # destinations are tracked in an int64 bitmask
 
 
@@ -304,7 +308,8 @@ def _a2a_combine_v_kernel(
     if pid >= ep_max_tokens:
         return
 
-    # see https://github.com/yifuwang/symm-mem-recipes/blob/8ee5d5b8f53efb9c051e6cdf0ca62270c2b43c34/triton_barrier.py#L115-L119
+    # See:
+    # https://github.com/yifuwang/symm-mem-recipes/blob/8ee5d5b8f53efb9c051e6cdf0ca62270c2b43c34/triton_barrier.py#L115-L119
     symm_mem_sync(
         signal_pad_ptrs,
         None,
@@ -445,13 +450,14 @@ def a2a_dispatch_v(
     routing_bits, routing_packs = _row_params(input_routing)
     probs_bits, probs_packs = _row_params(input_probs)
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
     block_size = min(
         max(triton.next_power_of_2(p) for p in (hidden_packs, routing_packs, probs_packs)),
         _MAX_BLOCK_SIZE,
     )
     num_warps = max(1, block_size // _WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _a2a_dispatch_v_kernel[(num_blocks, 1, 1)](
         input_hidden.data_ptr(),
@@ -517,10 +523,11 @@ def a2a_combine_v(
     bits, hidden_packs = _row_params(output)
     assert bits == 128, "hidden rows must be 16-byte aligned"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
     block_size = min(triton.next_power_of_2(hidden_packs), _MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // _WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _a2a_combine_v_kernel[(num_blocks, 1, 1)](
         output.data_ptr(),
