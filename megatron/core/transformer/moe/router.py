@@ -8,6 +8,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -1366,6 +1367,31 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
 
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether the fused sigmoid top-k kernel replaces the compiled routing for this call.
+
+        Covers sigmoid scores with an expert bias, fp32 CUDA logits and top-k > 1, with gradients
+        disabled and without pre-softmax, group-limited routing, router replay, precomputed
+        indices, TE's fused router or batch-invariant mode. The expert set matches the compiled
+        path; experts come out sorted by biased score and probabilities match to fp32 rounding.
+        """
+        return (
+            logits.is_cuda
+            and logits.dtype == torch.float32
+            and not torch.is_grad_enabled()
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and self.topk > 1
+            and precomputed_indices is None
+            and not self.config.moe_router_pre_softmax
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def _forward(
         self,
         input: torch.Tensor,
@@ -1389,6 +1415,16 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            # One launch for sigmoid + bias, top-k and normalization (needs tl.topk; fails
+            # loudly without it rather than falling back).
+            return sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
 
         routing = (
             topk_routing_with_score_function
