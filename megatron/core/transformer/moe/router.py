@@ -8,6 +8,8 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -1366,6 +1368,36 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
 
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether sigmoid_topk_routing can replace the compiled routing for this call.
+
+        It covers sigmoid scores with an expert bias, fp32 logits and top-k > 1, with
+        gradients disabled, without group-limited routing, router replay, precomputed
+        indices or TE's fused router; batch-invariant mode keeps its uncompiled reference
+        path. The expert set and order always match the compiled path. For top-k < 8 the
+        probabilities are bit-identical too (measured on GB300); at top-k >= 8 (e.g. the
+        top-22 of Nemotron 3 Super/Ultra) inductor reduces the k scores in a different
+        order, so a probability can differ in its last bit.
+        """
+        return (
+            HAVE_SIGMOID_TOPK_KERNEL
+            and logits.is_cuda
+            and logits.dtype == torch.float32
+            # InferenceMode is independent of autograd. With gradients enabled,
+            # the reference uses sorted top-k and retains probability gradients.
+            and not torch.is_grad_enabled()
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and self.topk > 1
+            and precomputed_indices is None
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def _forward(
         self,
         input: torch.Tensor,
@@ -1389,6 +1421,15 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            # One launch replacing the compiled sigmoid + bias, topk and gather/normalize.
+            return sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
 
         routing = (
             topk_routing_with_score_function
