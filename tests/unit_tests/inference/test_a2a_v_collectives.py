@@ -54,6 +54,11 @@ def _routing(valid, ep_size, gen, device):
 
 class TestAllToAllV:
 
+    # Static per-rank token capacity; the kernels launch min(per_rank_max_tokens, cap) blocks.
+    per_rank_max_tokens = _PER_RANK_MAX_TOKENS
+    # Tokens per rank in the full-batch case.
+    tokens_per_rank = 2
+
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
@@ -68,9 +73,7 @@ class TestAllToAllV:
     def _require_buffers(self):
         """Return (ep_group, buffers) or skip if NVLink symmetric memory is unavailable."""
         from megatron.core import parallel_state
-        from megatron.core.inference.communication.torch_symm_triton import (
-            is_device_nvls_capable,
-        )
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
         device = torch.device("cuda", torch.cuda.current_device())
@@ -83,7 +86,7 @@ class TestAllToAllV:
         if _TOPK > ep_size * _NUM_LOCAL_EXPERTS:
             pytest.skip("not enough experts for distinct top-k picks")
 
-        global_max = _PER_RANK_MAX_TOKENS * ep_size
+        global_max = self.per_rank_max_tokens * ep_size
         buffers = {}
         for key, width, dtype in (
             ("hidden", _HIDDEN, torch.bfloat16),
@@ -113,9 +116,9 @@ class TestAllToAllV:
         ep_size = torch.distributed.get_world_size(ep_group)
         rank = torch.distributed.get_rank(ep_group)
         device = torch.device("cuda", torch.cuda.current_device())
-        global_max = _PER_RANK_MAX_TOKENS * ep_size
+        global_max = self.per_rank_max_tokens * ep_size
 
-        batch = 1 if single_token else 2 * ep_size
+        batch = 1 if single_token else self.tokens_per_rank * ep_size
         counts = [batch // ep_size + (1 if r < batch % ep_size else 0) for r in range(ep_size)]
         local_tokens, offset, valid = counts[rank], sum(counts[:rank]), sum(counts)
 
@@ -160,7 +163,7 @@ class TestAllToAllV:
             bufs["probs"]["handle"],
             rank_token_offset=step_metadata[1:2],
             ep_max_tokens=step_metadata[2:3],
-            per_rank_max_tokens=_PER_RANK_MAX_TOKENS,
+            per_rank_max_tokens=self.per_rank_max_tokens,
             num_local_experts=_NUM_LOCAL_EXPERTS,
         )
         torch.cuda.synchronize()
@@ -186,7 +189,7 @@ class TestAllToAllV:
             in_routing,
             rank_token_offset=step_metadata[1:2],
             ep_max_tokens=step_metadata[2:3],
-            per_rank_max_tokens=_PER_RANK_MAX_TOKENS,
+            per_rank_max_tokens=self.per_rank_max_tokens,
             num_local_experts=_NUM_LOCAL_EXPERTS,
         )
         torch.cuda.synchronize()
@@ -201,3 +204,44 @@ class TestAllToAllV:
 
         # Keep the next test's sentinel writes behind every rank's pulls from this one.
         torch.distributed.barrier(ep_group)
+
+
+class TestAllToAllVLargeGrid(TestAllToAllV):
+    """The same checks with the EP heuristic's grid (4 blocks per SM at EP <= 8) and a token on
+    every block, so the barrier uses signal slots far past torch's default signal pad."""
+
+    @classmethod
+    def setup_class(cls):
+        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+            SYMM_MEM_KERNEL_CONFIG,
+            ep_collectives_max_num_blocks,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        super().setup_class()
+        # The cap sizes the signal pads, so set it while no symmetric-memory buffer exists,
+        # as the inference context does at startup.
+        SymmetricMemoryManager.destroy()
+        device = torch.cuda.current_device()
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        cls.per_rank_max_tokens = ep_collectives_max_num_blocks(num_sms, Utils.world_size)
+        cls.tokens_per_rank = cls.per_rank_max_tokens
+        cls._saved_max_num_blocks = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
+        SYMM_MEM_KERNEL_CONFIG.max_num_blocks = cls.per_rank_max_tokens
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+            SYMM_MEM_KERNEL_CONFIG,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        SymmetricMemoryManager.destroy()
+        SYMM_MEM_KERNEL_CONFIG.max_num_blocks = cls._saved_max_num_blocks
+        Utils.destroy_model_parallel()
+
+    def test_signal_pads_fit_grid(self):
+        ep_group, bufs = self._require_buffers()
+        needed = self.per_rank_max_tokens * torch.distributed.get_world_size(ep_group) * 4
+        for buf in bufs.values():
+            assert buf["handle"].signal_pad_size >= needed
