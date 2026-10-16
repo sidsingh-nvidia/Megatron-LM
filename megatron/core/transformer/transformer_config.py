@@ -1388,7 +1388,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm', 'trtllm_bf16_routed'] = (
+        "vllm"
+    )
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
@@ -1400,6 +1402,10 @@ class TransformerConfig(ModelParallelConfig):
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
       permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
+    - 'trtllm_bf16_routed': FlashInfer's TRT-LLM BF16 routed MoE kernel (BF16 only).
+      Keeps a BlockMajorK copy of the expert weights. Under the 'nvls' dispatcher the
+      context runs an EP consensus every step so the kernel only processes a host-known
+      bound on the gathered rows.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1988,6 +1994,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
                 InferenceGroupedGemmBackend.TORCH,
                 InferenceGroupedGemmBackend.VLLM,
+                InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
@@ -2014,6 +2021,18 @@ class TransformerConfig(ModelParallelConfig):
                     "gated_linear_unit=False, or select inference_grouped_gemm_backend "
                     "'torch' or 'vllm'."
                 )
+
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+                if mxfp8_enabled:
+                    raise ValueError(
+                        "inference_grouped_gemm_backend='trtllm_bf16_routed' supports BF16 "
+                        "experts only; use 'flashinfer' for MXFP8."
+                    )
+                if self.inference_moe_token_dispatcher_type == "nvl_a2a":
+                    raise ValueError(
+                        "inference_grouped_gemm_backend='trtllm_bf16_routed' supports the "
+                        "'nvls' and 'nccl' dispatchers, not 'nvl_a2a'."
+                    )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:

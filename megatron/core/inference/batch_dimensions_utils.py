@@ -212,6 +212,59 @@ class InferenceBatchDimensions:
 
         return adjusted_batch_dim
 
+    @staticmethod
+    def sync_ep_batch_dims_with_token_sum(
+        local_batch_dims,
+        local_eager_token_count: int,
+        ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        ep_zmq_communicator=None,
+    ) -> Tuple[Optional["InferenceBatchDimensions"], int]:
+        """adjust_batch_dims_for_expert_parallelism plus an EP-wide token SUM.
+
+        Same MAX consensus (None when any EP rank has a prefill, i.e. all ranks run
+        eager), and in the same round trip SUMs each rank's local_eager_token_count:
+        the tokens the rank would pad to if this step runs eager. When the step runs
+        eager on every rank, that sum bounds the rows the MoE dispatcher gathers,
+        which a decode-only rank cannot know from its own token count.
+
+        Returns:
+            (adjusted batch dims or None, EP-wide sum of local_eager_token_count).
+        """
+        ep_size = get_pg_size(ep_group)
+        if ep_size <= 1:
+            return local_batch_dims, local_eager_token_count
+
+        is_non_decode = int(local_batch_dims.prefill_req_count > 0)
+        if ep_zmq_communicator is not None:
+            (max_token_count, max_is_non_decode), (eager_token_sum,) = (
+                ep_zmq_communicator.sync_all_reduce_max_and_sum(
+                    (local_batch_dims.token_count, is_non_decode), (local_eager_token_count,)
+                )
+            )
+        else:
+            device = torch.cuda.current_device()
+            max_tensor = torch.tensor(
+                [local_batch_dims.token_count, is_non_decode], dtype=torch.int32, device=device
+            )
+            sum_tensor = torch.tensor([local_eager_token_count], dtype=torch.int64, device=device)
+            torch.distributed.all_reduce(
+                max_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+            )
+            torch.distributed.all_reduce(
+                sum_tensor, op=torch.distributed.ReduceOp.SUM, group=ep_group
+            )
+            max_token_count, max_is_non_decode = max_tensor.tolist()
+            eager_token_sum = int(sum_tensor.item())
+
+        if max_is_non_decode == 1:
+            return None, eager_token_sum
+        adjusted_batch_dim = InferenceBatchDimensions(
+            token_count=max_token_count,
+            prefill_req_count=local_batch_dims.prefill_req_count,
+            decode_req_count=local_batch_dims.decode_req_count,
+        )
+        return adjusted_batch_dim, eager_token_sum
+
 
 def _batch_invariant_token_align(token_count: int) -> int:
     """Round a CUDA-graph bucket token count UP to a 64-multiple (min 64).
