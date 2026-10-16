@@ -86,6 +86,11 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.trtllm_bf16 import (
+    build_trtllm_bf16_weights,
+    pack_routing,
+    trtllm_bf16_routed_moe_forward,
+)
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -1299,6 +1304,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Both NVLink dispatchers combine out of the shared NVLS RSV buffer.
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+        # TRT-LLM BlockMajorK copies of the expert weights, built with the concatenated ones.
+        self._trtllm_fc1_weight: Optional[torch.Tensor] = None
+        self._trtllm_fc2_weight: Optional[torch.Tensor] = None
+        self._trtllm_intermediate_size: Optional[int] = None
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1306,6 +1315,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
+        if self.config.gated_linear_unit and func == F.silu:
+            return ActivationType.Swiglu
         if func == F.silu:
             return ActivationType.Silu
         elif func == F.gelu:
@@ -1554,6 +1565,38 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
+        """FlashInfer TRT-LLM BF16 routed MoE on the host-known bound of gathered rows."""
+        assert self._activation_clamp_scale is None, (
+            "activation_func_tanh_clamp_scale is not supported by trtllm_bf16_routed."
+        )
+        assert routing_map is not None, "routing_map is required for trtllm_bf16_routed."
+        # NVLS: the dispatcher's bound (local rows x EP on graphed steps, the EP-consensus
+        # sum on eager ones); rows past it are never touched. Other dispatchers hand over
+        # exactly the gathered tokens.
+        rows = hidden_states.shape[0]
+        out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        if out is not None:
+            rows = min(rows, InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate())
+        # The NVLS dispatcher gathers routing already packed (pack_routing before the AGV);
+        # other dispatchers hand over int64 ids + fp32 probs for exactly the gathered tokens.
+        if routing_map.dtype != torch.int32:
+            routing_map = pack_routing(routing_map.contiguous(), probs.contiguous())
+        output = trtllm_bf16_routed_moe_forward(
+            hidden_states,
+            routing_map,
+            self._trtllm_fc1_weight,
+            self._trtllm_fc2_weight,
+            num_experts=self.num_local_experts * self.ep_group.size(),
+            local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+            intermediate_size=self._trtllm_intermediate_size,
+            activation_type=self._flashinfer_activation_type.value,
+            rows=rows,
+            out=out,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+        )
+        return output, None
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1629,6 +1672,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+                assert not self._uses_mxfp8_weights, "trtllm_bf16_routed requires BF16 experts"
+                (
+                    self._trtllm_fc1_weight,
+                    self._trtllm_fc2_weight,
+                    self._trtllm_intermediate_size,
+                ) = build_trtllm_bf16_weights(
+                    self._fc1_weight, self._fc2_weight, self.config.gated_linear_unit
+                )
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -1636,6 +1688,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
+            )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+            return self._trtllm_bf16_routed_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(

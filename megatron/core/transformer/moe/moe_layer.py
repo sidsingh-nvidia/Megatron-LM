@@ -417,6 +417,15 @@ class MoELayer(BaseMoELayer):
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
+            elif (
+                config.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            ):
+                from megatron.core.inference.moe.trtllm_bf16 import (
+                    require_flashinfer_trtllm_bf16,
+                )
+
+                require_flashinfer_trtllm_bf16()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
