@@ -1308,6 +1308,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._trtllm_fc1_weight: Optional[torch.Tensor] = None
         self._trtllm_fc2_weight: Optional[torch.Tensor] = None
         self._trtllm_intermediate_size: Optional[int] = None
+        # True once the canonical expert weights are freed after the TRT-LLM conversion.
+        self._canonical_expert_weights_consumed = False
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1565,6 +1567,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _free_canonical_expert_weights(self):
+        """Release the canonical expert weights and the TE param views that keep them alive."""
+        for linear in (self.linear_fc1, self.linear_fc2):
+            for i in range(self.num_local_experts):
+                param = getattr(linear, f"weight{i}")
+                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        self._fc1_weight = None
+        self._fc2_weight = None
+        self._canonical_expert_weights_consumed = True
+
     def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
         """FlashInfer TRT-LLM BF16 routed MoE on the host-known bound of gathered rows."""
         assert self._activation_clamp_scale is None, (
@@ -1661,6 +1673,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
 
         if not InferenceMode.is_active():
+            assert not self._canonical_expert_weights_consumed, (
+                "The trtllm_bf16_routed backend freed the canonical expert weights after "
+                "converting them to TRT-LLM's layout; this module can no longer run training "
+                "or refit."
+            )
             assert (
                 not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -1681,6 +1698,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 ) = build_trtllm_bf16_weights(
                     self._fc1_weight, self._fc2_weight, self.config.gated_linear_unit
                 )
+                # Keeping both layouts doubles expert memory (129 GB more per GPU for Ultra at
+                # EP8) and nothing on this backend reads the canonical one, so free it layer by
+                # layer. The TE weight params are views into these buffers; empty them too.
+                self._free_canonical_expert_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

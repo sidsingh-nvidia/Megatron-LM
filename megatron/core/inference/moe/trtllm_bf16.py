@@ -75,29 +75,42 @@ def _pad_expert_weights(fc1, fc2, gated):
     return fc1, F.pad(fc2, (0, padding)), padded
 
 
+def _convert_expert(w1, w2, gated, cache):
+    """BlockMajorK uint8 copies of one expert's (already padded) fc1 / fc2."""
+    w1 = w1.contiguous().view(torch.uint8)
+    w2 = w2.contiguous().view(torch.uint8)
+    idx1 = _maybe_get_cached_w3_w1_permute_indices(cache, w1, _TILE, is_gated_act_gemm=gated)
+    idx2 = get_w2_permute_indices_with_cache(cache, w2, _TILE)
+    return (
+        convert_to_block_layout(w1[idx1].contiguous(), _TILE),
+        convert_to_block_layout(w2[idx2].contiguous(), _TILE),
+    )
+
+
 @torch.no_grad()
 def build_trtllm_bf16_weights(
     fc1: torch.Tensor, fc2: torch.Tensor, gated: bool
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Convert [E, fc1_out, H] / [E, H, I] BF16 expert weights to TRT-LLM BlockMajorK.
 
-    Returns (fc1, fc2, padded intermediate size).
+    Each expert is converted into a preallocated output, so the peak is one extra copy of the
+    layer's experts (not two, as with stacking a list). Returns (fc1, fc2, padded intermediate).
     """
     require_flashinfer_trtllm_bf16()
     assert fc1.dtype == torch.bfloat16 and fc2.dtype == torch.bfloat16
     assert fc1.shape[-1] % _TILE == 0, f"hidden size {fc1.shape[-1]} must be a multiple of 128"
     cache: dict = {}
-    fc1_out, fc2_out = [], []
+    out1 = out2 = None
     intermediate_size = None
     for expert in range(fc1.shape[0]):
         w1, w2, intermediate_size = _pad_expert_weights(fc1[expert], fc2[expert], gated)
-        w1 = w1.contiguous().view(torch.uint8)
-        w2 = w2.contiguous().view(torch.uint8)
-        idx1 = _maybe_get_cached_w3_w1_permute_indices(cache, w1, _TILE, is_gated_act_gemm=gated)
-        idx2 = get_w2_permute_indices_with_cache(cache, w2, _TILE)
-        fc1_out.append(convert_to_block_layout(w1[idx1].contiguous(), _TILE).view(torch.bfloat16))
-        fc2_out.append(convert_to_block_layout(w2[idx2].contiguous(), _TILE).view(torch.bfloat16))
-    return torch.stack(fc1_out), torch.stack(fc2_out), intermediate_size
+        b1, b2 = _convert_expert(w1, w2, gated, cache)
+        if out1 is None:
+            out1 = torch.empty((fc1.shape[0], *b1.shape), dtype=torch.uint8, device=fc1.device)
+            out2 = torch.empty((fc2.shape[0], *b2.shape), dtype=torch.uint8, device=fc2.device)
+        out1[expert].copy_(b1)
+        out2[expert].copy_(b2)
+    return out1.view(torch.bfloat16), out2.view(torch.bfloat16), intermediate_size
 
 
 @triton.jit
