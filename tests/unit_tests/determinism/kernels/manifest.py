@@ -600,6 +600,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "The NVLink all-to-all-v combine sums partials in a fixed per-token order but also needs a peer group.",
     ),
     KernelEntry(
+        name="inference_moe_token_dispatchers",
+        sources=("megatron/core/transformer/moe/token_dispatcher_inference.py",),
+        kind="external-lib",
+        training_path=False,
+        exempt_reason="DeepEPDispatcher calls DeepEP >= 2.5 (EPBuffer) dispatch/combine, which the CI container "
+        "lacks, over an NVLink peer group. Combine sums the per-rank partials in a fixed per-token order. "
+        "tests/unit_tests/inference/test_moe_dispatching_and_routing.py::TestDeepEPDispatcher checks results "
+        "bit-exactly where DeepEP is installed. The other dispatchers call the NCCL and NVLS collectives "
+        "covered above.",
+    ),
+    KernelEntry(
         name="unified_memory_allocator",
         sources=("megatron/core/inference/unified_memory.py",),
         kind="cuda-ext",

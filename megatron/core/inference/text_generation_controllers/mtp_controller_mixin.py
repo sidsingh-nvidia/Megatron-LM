@@ -374,7 +374,7 @@ class MTPControllerMixin:
             request_start_positions=request_start_positions,
             total=total,
         )
-        if context._nvls_dispatcher:
+        if context._nvls_dispatcher or context._deepep_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(total)
 
         token_ids = packed_tokens.view(1, -1).to(torch.long)
@@ -552,9 +552,9 @@ class MTPControllerMixin:
 
         # MTP MoE forwards are request-count shaped: the routing map holds
         # active_request_count real rows followed by padding up to padded_count.
-        # The NVLS routing mask defaults to the main step's token count, so point
+        # The NVLS/DeepEP routing mask defaults to the main step's token count, so point
         # it at the MTP row count instead, else padding rows route to experts.
-        if context._nvls_dispatcher:
+        if context._nvls_dispatcher or context._deepep_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
 
         # Give the draft attention its own KV in the shared buffer's reserved

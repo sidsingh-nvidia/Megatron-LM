@@ -3,7 +3,7 @@
 """
 Inference token dispatchers for MoE expert parallelism.
 
-Three dispatchers are provided, selected via config.inference_moe_token_dispatcher_type:
+Four dispatchers are provided, selected via config.inference_moe_token_dispatcher_type:
 
   NCCLAllGatherDispatcher ('nccl', default)
     Standard NCCL AllGather/ReduceScatter. All EP ranks must contribute the same
@@ -19,6 +19,11 @@ Three dispatchers are provided, selected via config.inference_moe_token_dispatch
     one of the token's experts, and combine pulls bf16 partials back from them. Shares
     the NVLS dispatcher's buffers and step metadata; requires a bf16 combine buffer.
 
+  DeepEPDispatcher ('deepep')
+    DeepEP (>= 2.5) dispatch/combine over NVLink in its non-expand layout: each rank receives
+    a compact list of the tokens routed to it, and combine returns one bf16 partial per
+    token and rank. Requires the vLLM grouped-GEMM backend with BF16 experts.
+
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
 gate kernel work to the valid token prefix. Each dispatcher defines its own
@@ -27,6 +32,7 @@ per-step metadata kernel is captured inside the CUDA graph.
 """
 
 import operator
+import os
 from functools import reduce
 from typing import List, Optional
 
@@ -56,6 +62,19 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDisp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+try:
+    # Import at module load, before any NCCL communicator exists: DeepEP's import-time check
+    # rejects every loaded libnccl* library, including the NCCL net plugin that creating a
+    # communicator loads.
+    from deep_ep import EPBuffer as DeepEPBuffer
+    from deep_ep import get_physical_domain_size as deep_ep_physical_domain_size
+
+    HAVE_DEEP_EP_EPBUFFER = True
+except ImportError:
+    DeepEPBuffer = None
+    deep_ep_physical_domain_size = None
+    HAVE_DEEP_EP_EPBUFFER = False
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -792,4 +811,209 @@ class NVLAllToAllVDispatcher(NVLSAllGatherVDispatcher):
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
             num_local_experts=self.num_local_experts,
         )
+        return output
+
+
+class DeepEPDispatcher(NVLSAllGatherVDispatcher):
+    """DeepEP (>= 2.5) dispatch and combine over NVLink for inference CUDA graphs.
+
+    Dispatch sends each token once to every EP rank that holds one of its experts, together
+    with its routing ids and probs (DeepEP's non-expand layout). Each rank receives a compact,
+    token-major buffer of [ep_size * max_tokens_per_rank, hidden] rows: the tokens routed to
+    it, grouped by source rank, in arrival order within a source. Routing ids arrive as local
+    expert ids, -1 for experts on other ranks. Only the first received-count rows are valid.
+    That count stays on the GPU (do_cpu_sync=False), so nothing syncs with the host and the
+    step can be CUDA-graphed. vllm_fused_moe groups the received rows by expert itself.
+
+    Combine sends each received token's bf16 output, already weighted and summed over this
+    rank's experts, back to its source rank, where DeepEP sums the per-rank partials.
+
+    Reuses the CUDA-graph padding mask, MTP token-count override and shared-expert overlap of
+    NVLSAllGatherVDispatcher, but none of its symmetric buffers or step metadata. Requires an
+    EP group inside one NVLink domain, and the vLLM grouped-GEMM backend with BF16 experts.
+    """
+
+    # Class-level state, allocated once at model init (allocate_buffers).
+    _buffer = None  # deep_ep.EPBuffer for the EP group
+    _num_max_tokens_per_rank: int = 0
+    _num_sms: int = 0
+    # [ep_size * max_tokens_per_rank, hidden] bf16. vllm_fused_moe writes the expert output
+    # straight into it, and combine reads it from there.
+    _combine_input: Optional[torch.Tensor] = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # DeepEP handle of the in-flight dispatch; combine needs it to route outputs back.
+        self._handle = None
+
+    @classmethod
+    def _get_combine_input(cls) -> Optional[torch.Tensor]:
+        """Return the buffer that vllm_fused_moe writes the expert output into."""
+        return cls._combine_input
+
+    @classmethod
+    def allocate_buffers(
+        cls,
+        per_rank_worst_case_token_count: int,
+        topk: int,
+        hidden_size: int,
+        num_experts: int,
+        ep_group: torch.distributed.ProcessGroup,
+        num_sms: Optional[int] = None,
+    ) -> None:
+        """Create the DeepEP buffer and the combine-input buffer.
+
+        Called once at model init, outside CUDA graph capture. Collective over ep_group.
+
+        Args:
+            per_rank_worst_case_token_count: Max tokens this rank can dispatch in one step.
+                Every rank must pass the same value.
+            topk: MoE router top-k value.
+            hidden_size: Hidden size of the dispatched tokens (moe_latent_size if set).
+            num_experts: Total number of experts.
+            ep_group: Expert parallel process group. Must be an NCCL group inside one
+                NVLink domain.
+            num_sms: SMs used by DeepEP's dispatch and combine kernels. None uses DeepEP's
+                bandwidth-based estimate.
+        """
+        if not HAVE_DEEP_EP_EPBUFFER:
+            raise RuntimeError(
+                "inference_moe_token_dispatcher_type='deepep' requires DeepEP >= 2.5 "
+                "(deep_ep.EPBuffer)."
+            )
+        ep_size = get_pg_size(ep_group)
+        device = torch.cuda.current_device()
+
+        # DeepEP reuses the group's NCCL communicator, which PyTorch may create lazily.
+        torch.distributed.barrier(group=ep_group)
+        num_rdma_ranks, num_nvlink_ranks = deep_ep_physical_domain_size(ep_group)
+        if num_rdma_ranks != 1:
+            raise RuntimeError(
+                f"DeepEPDispatcher needs the EP group inside one NVLink domain, but its "
+                f"{ep_size} ranks span {num_rdma_ranks} domains of {num_nvlink_ranks} ranks."
+            )
+        # NVLink only, so skip DeepEP's RDMA (NCCL GIN) setup unless the user chose otherwise.
+        os.environ.setdefault("EP_DISABLE_GIN", "1")
+
+        required_bytes = DeepEPBuffer.get_buffer_size_hint(
+            ep_group,
+            per_rank_worst_case_token_count,
+            hidden_size,
+            num_topk=topk,
+            allow_hybrid_mode=False,
+        )
+        if cls._buffer is not None and (
+            cls._buffer.group is not ep_group or cls._buffer.num_bytes < required_bytes
+        ):
+            cls._buffer.destroy()
+            cls._buffer = None
+        if cls._buffer is None:
+            cls._buffer = DeepEPBuffer(
+                ep_group,
+                num_max_tokens_per_rank=per_rank_worst_case_token_count,
+                hidden=hidden_size,
+                num_topk=topk,
+                allow_hybrid_mode=False,
+                # Destroy before the process group is torn down (see _delete_buffers). Left
+                # to the destructor, it would run a cross-rank barrier at interpreter exit.
+                explicitly_destroy=True,
+            )
+
+        # The SM count is a JIT template parameter; use one value on every rank.
+        if num_sms is None:
+            num_sms = cls._buffer.get_theoretical_num_sms(num_experts, topk)
+        num_sms_tensor = torch.tensor([num_sms], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(
+            num_sms_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+        )
+        cls._num_sms = int(num_sms_tensor.item())
+        cls._num_max_tokens_per_rank = per_rank_worst_case_token_count
+        cls._combine_input = torch.empty(
+            ep_size * per_rank_worst_case_token_count,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        if InferenceAllGatherDispatcherBase._valid_tokens_tensor is None:
+            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+
+    @classmethod
+    def _delete_buffers(cls):
+        # Leaves the NVLS dispatcher's state (including the real-token-count tensor) alone.
+        if cls._buffer is not None:
+            cls._buffer.destroy()
+        cls._buffer = None
+        cls._combine_input = None
+        cls._num_max_tokens_per_rank = 0
+        cls._num_sms = 0
+
+    def update_metadata(self, local_tokens: int) -> None:
+        """Per-step host-side token estimate that vllm_fused_moe uses to pick its tiles.
+
+        There is no per-step metadata kernel: DeepEP exchanges token counts inside every
+        dispatch, because the number of tokens each rank receives depends on the routing.
+        """
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+
+    def token_dispatch(self, hidden_states, probs):
+        """Send each local token to the EP ranks holding one of its experts.
+
+        Args:
+            hidden_states: [local_tokens, hidden_size] bf16 local input.
+            probs: [local_tokens, topk] fp32 local routing probabilities.
+
+        Returns:
+            (hidden_states, probs) received by this rank, [ep_size * max_tokens_per_rank, *].
+            Also replaces self.routing_map with the received [*, topk] local expert ids, and
+            writes the received-token count into the base class's valid-tokens scalar.
+        """
+        if self.ep_size == 1:
+            # No communication: mask CUDA-graph padding rows exactly like the NVLS dispatcher.
+            return super().token_dispatch(hidden_states, probs)
+
+        # Route CUDA-graph padding rows to no expert, so DeepEP does not send them.
+        if self.__class__._real_token_count_tensor is not None:
+            mask_routing_padding(
+                self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+            )
+        if self._runs_metadata_sync:
+            self.update_metadata(hidden_states.shape[0])
+
+        cls = DeepEPDispatcher
+        recv_hidden, recv_routing_map, recv_probs, handle, _ = cls._buffer.dispatch(
+            hidden_states,
+            topk_idx=self.routing_map,
+            topk_weights=probs,
+            num_experts=self.config.num_moe_experts,
+            num_max_tokens_per_rank=cls._num_max_tokens_per_rank,
+            num_sms=cls._num_sms,
+            do_cpu_sync=False,
+            do_expand=False,
+        )
+        self._handle = handle
+        # Received-token count of this layer (it depends on the routing), read by the experts.
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(
+            handle.psum_num_recv_tokens_per_scaleup_rank[-1:]
+        )
+        self.routing_map = recv_routing_map
+        return recv_hidden, recv_probs
+
+    def token_combine(self, hidden_states):
+        """Return each received token's partial output to its source rank and sum there.
+
+        Args:
+            hidden_states: [ep_size * max_tokens_per_rank, hidden_size] bf16 expert output,
+                normally the combine-input buffer itself; valid on the received rows only.
+
+        Returns:
+            [local_tokens, hidden_size] bf16 local token outputs.
+        """
+        if self.ep_size == 1:
+            return hidden_states.to(torch.bfloat16)
+
+        combine_input = DeepEPDispatcher._combine_input
+        if hidden_states is not combine_input:
+            combine_input.copy_(hidden_states)
+        output, _, _ = DeepEPDispatcher._buffer.combine(combine_input, handle=self._handle)
+        self._handle = None
         return output

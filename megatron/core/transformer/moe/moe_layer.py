@@ -31,6 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    DeepEPDispatcher,
     NCCLAllGatherDispatcher,
     NVLAllToAllVDispatcher,
     NVLSAllGatherVDispatcher,
@@ -436,7 +437,7 @@ class MoELayer(BaseMoELayer):
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
         Stores the training dispatcher and creates the inference dispatcher selected
-        by config.inference_moe_token_dispatcher_type ('nccl', 'nvls' or 'nvl_a2a').
+        by config.inference_moe_token_dispatcher_type ('nccl', 'nvls', 'nvl_a2a' or 'deepep').
         The active dispatcher is selected at the start of `forward` based on
         `InferenceMode.is_active()`.
         """
@@ -445,6 +446,7 @@ class MoELayer(BaseMoELayer):
             'nccl': NCCLAllGatherDispatcher,
             'nvls': NVLSAllGatherVDispatcher,
             'nvl_a2a': NVLAllToAllVDispatcher,
+            'deepep': DeepEPDispatcher,
         }[dispatcher_type]
 
         self._training_token_dispatcher = self.token_dispatcher
@@ -459,7 +461,7 @@ class MoELayer(BaseMoELayer):
         # launches the shared-expert forward on SharedExpertMLP.stream concurrently with
         # dispatch+experts+combine and adds it back in combine_postprocess.
         if (
-            dispatcher_type in ('nvls', 'nvl_a2a')
+            dispatcher_type in ('nvls', 'nvl_a2a', 'deepep')
             and self.use_shared_expert
             and self.config.moe_shared_expert_overlap
         ):
