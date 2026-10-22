@@ -98,6 +98,33 @@ sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_prefill,MODEL=ultrav3,DISPAT
 sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_decode,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,CUDA_GRAPH_MAX_TOKENS=2048,BENCH="1 2 4 8 16 32",BENCH_OSL=1024 moe-bench/server/launch.sh
 ```
 
+## Ultra v3 trace log
+
+nsys traces of Ultra v3 decode, each adding one change. All: 16 GB200 nodes, EP64, `nvls` dispatch
+unless noted, bf16 combine, `BUFFER_GB=80`, `MAMBA_RATIO=0.4`, `LOG_INTERVAL=1000`, eval mode,
+client on its own node (`server/client.sh`), 128 GSM8K requests x 128 output tokens (1 warmup +
+1 profiled batch). Step period = median over the 128 decode steps of rank 4 (rank 44 agrees to
+0.01 ms), stalls excluded, from `analysis/decode_steps.py`; wall = the profiled batch's client wall
+time, which also includes prefill and stalls. Run directories are under `experiments/`; details in
+`REPORT.md`.
+
+| Run directory | Code | TP | Change | Step period | vs previous | Stalls | Wall |
+|---|---|---|---|---|---|---|---|
+| `20261014_153243_trace_ultrav3_ep64_nvl_a2a_bs128` | `065e74b66` | 4 | baseline, `nvl_a2a` dispatcher | 14.41 ms | - | 0 | 3.44 s |
+| `20261014_153245_trace_ultrav3_ep64_nvls_bs128` | `065e74b66` | 4 | baseline, `nvls` dispatcher | **14.07 ms** | - | 0 | 3.29 s |
+| `20261015_134511_trace_ultrav3_tp8_ep64_nvls_bs128_rmsnorm` | `59c9a7583` | 8 | TP8 + FlashInfer RMSNorm | **12.52 ms** | -1.55 ms (-11%) | 8 (487 ms) | 3.81 s |
+| `20261015_143831_trace_ultrav3_tp8_ep64_nvls_bs128_pr8114` | `ca3b432f1` | 8 | + #8114 router and alignment kernels (reverted) | 14.15 ms | +1.63 ms (regression) | 4 (222 ms) | 3.88 s |
+| `20261015_152634_trace_ultrav3_tp8_ep64_nvls_bs128_tltopk` | `d2ec3f55e` | 8 | + fused `tl.topk` router (instead of #8114) | **12.00 ms** | -0.52 ms (-4.2%) vs `134511` | 5 (327 ms) | 3.62 s |
+| `20261016_101531_trace_ultrav3_tp8_ep64_nvls_bs128_trtllm` | `0345cd18e` (pre-dispatch pack not yet) | 8 | + TRT-LLM BF16 routed MoE (`GEMM_BACKEND=trtllm_bf16_routed`, EP token-sum consensus; torch routing pack) | **10.65 ms** | -1.35 ms (-11.2%) | - | 2.67 s |
+| `20261016_115006_trace_ultrav3_tp8_ep64_nvls_bs128_trtllm_packed` | `0345cd18e` | 8 | + routing packed before the dispatch (one Triton kernel, also masks padding) + 2-tensor AGV | **10.06 ms** | -0.59 ms (-5.5%) | - | 3.63 s |
+
+Current best: **10.06 ms** per decode step at concurrency 128 (-28.5% vs the TP4 `nvls` baseline).
+
+To analyze a new trace: export two ranks to SQLite (`nsys stats --force-export=true --report
+cuda_gpu_kern_sum --format csv -o <run>/rank<r> <run>/trace_rank<r>.nsys-rep`), then run
+`analysis/decode_steps.py <label>=<run> <label>=<previous run>` (per-step breakdown and deltas) and
+`analysis/gemm_bandwidth.py <run>` (achieved bandwidth per GEMM).
+
 ## Throughput sweeps
 
 When `BENCH` is set, rank 0 runs `server/client.py` once the server is ready and the job exits
