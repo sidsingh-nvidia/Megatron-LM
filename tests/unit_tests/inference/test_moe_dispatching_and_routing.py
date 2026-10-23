@@ -1020,6 +1020,254 @@ class TestNVLAllToAllVDispatcher:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# DeepEPDispatcher
+# ──────────────────────────────────────────────────────────────────────
+
+# DeepEP's combine kernels need the hidden size to be a multiple of 256.
+_DEEPEP_HIDDEN = 256
+
+
+def _deepep_config(**overrides):
+    params = dict(
+        hidden_size=_DEEPEP_HIDDEN,
+        expert_model_parallel_size=Utils.world_size,
+        inference_grouped_gemm_backend="vllm",
+        inference_moe_token_dispatcher_type="deepep",
+        inference_moe_combine_precision="bf16",
+    )
+    params.update(overrides)
+    return _make_base_config(**params)
+
+
+@pytest.mark.internal
+class TestDeepEPDispatcher:
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            DeepEPDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
+
+        # The DeepEP buffer holds the EP group's NCCL communicator: destroy it first.
+        DeepEPDispatcher._delete_buffers()
+        NVLSAllGatherVDispatcher._delete_buffers()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    def _skip_unless_supported(self):
+        from megatron.core.transformer.moe.token_dispatcher_inference import HAVE_DEEP_EP_EPBUFFER
+
+        if not HAVE_DEEP_EP_EPBUFFER:
+            pytest.skip("Requires DeepEP >= 2.5 (deep_ep.EPBuffer).")
+        if Utils.world_size < 2:
+            pytest.skip("DeepEP dispatcher test requires an EP size > 1.")
+
+    def _allocate(self, config):
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import DeepEPDispatcher
+
+        DeepEPDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            num_experts=config.num_moe_experts,
+            ep_group=get_expert_model_parallel_group(),
+        )
+
+    @pytest.mark.parametrize("seed", [42, 7])
+    @pytest.mark.parametrize("max_rank_tokens", [1, 7, 64, 512])
+    def test_cuda_graph_dispatch_combine(self, max_rank_tokens, seed):
+        """Dispatch+combine captured in a CUDA graph and replayed, with uneven token counts.
+
+        Each received row must be one of the tokens routed to this rank, carrying its probs
+        and its routing as local expert ids (-1 for other ranks' experts). Feeding the
+        received rows back as the expert output makes each destination's partial equal the
+        token's own row, so combine must return m * hidden, m = number of distinct
+        destination ranks.
+        """
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            DeepEPDispatcher,
+            InferenceAllGatherDispatcherBase,
+        )
+
+        self._skip_unless_supported()
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+        config = _deepep_config()
+        self._allocate(config)
+        ep_size = Utils.world_size
+        rank = torch.distributed.get_rank()
+        num_local_experts = config.num_moe_experts // ep_size
+        dispatcher = DeepEPDispatcher(
+            num_local_experts=num_local_experts,
+            local_expert_indices=[rank * num_local_experts + i for i in range(num_local_experts)],
+            config=config,
+            pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
+        )
+        hidden_size = config.hidden_size
+        topk = config.moe_router_topk
+        num_experts = config.num_moe_experts
+
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.rand(total_tokens, topk, device="cuda", dtype=torch.float32)
+        # Distinct experts per token, as the router produces: DeepEP rejects repeats.
+        global_routing_map = (
+            torch.rand(total_tokens, num_experts, device="cuda").topk(topk, dim=-1).indices
+        )
+        torch.distributed.broadcast(global_hidden, src=0)
+        torch.distributed.broadcast(global_probs, src=0)
+        torch.distributed.broadcast(global_routing_map, src=0)
+
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
+        static_hidden = global_hidden[start:end].contiguous()
+        static_probs = global_probs[start:end].contiguous()
+        static_routing_map = global_routing_map[start:end].contiguous()
+
+        def dispatch_and_combine():
+            dispatcher.routing_map = static_routing_map
+            d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+            d_routing_map = dispatcher.routing_map
+            num_received = InferenceAllGatherDispatcherBase._valid_tokens().clone()
+            combined = dispatcher.token_combine(d_hidden)
+            return d_hidden, d_probs, d_routing_map, num_received, combined
+
+        with torch.no_grad():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    dispatch_and_combine()
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                d_hidden, d_probs, d_routing_map, num_received, combined = dispatch_and_combine()
+            graph.replay()
+
+        assert d_hidden.shape == (ep_size * _NVLS_ENGINE_MAX_TOKENS, hidden_size)
+        assert combined.shape == (local_tokens, hidden_size)
+
+        lo, hi = rank * num_local_experts, (rank + 1) * num_local_experts
+        local_hit = (global_routing_map >= lo) & (global_routing_map < hi)
+        routed_here = local_hit.any(dim=1)
+        n = int(num_received.item())
+        assert n == int(routed_here.sum().item())
+
+        # Received rows arrive in no fixed order: match each to its source token by its bits.
+        coeffs = torch.randint(1, 1 << 30, (hidden_size,), device="cuda", dtype=torch.int64)
+
+        def row_keys(rows):
+            return (rows.view(torch.int16).to(torch.int64) * coeffs).sum(dim=1)
+
+        global_keys = row_keys(global_hidden)
+        order = global_keys.argsort()
+        pos = torch.searchsorted(global_keys[order], row_keys(d_hidden[:n]))
+        src = order[pos.clamp(max=total_tokens - 1)]
+        torch.testing.assert_close(d_hidden[:n], global_hidden[src], atol=0, rtol=0)
+        assert routed_here[src].all()
+        assert src.unique().numel() == n
+        torch.testing.assert_close(d_probs[:n], global_probs[src], atol=0, rtol=0)
+        expected_local_ids = torch.where(local_hit[src], global_routing_map[src] - lo, -1)
+        torch.testing.assert_close(d_routing_map[:n], expected_local_ids, atol=0, rtol=0)
+
+        dest_ranks = global_routing_map[start:end] // num_local_experts
+        num_dest = (
+            torch.zeros(local_tokens, ep_size, device="cuda", dtype=torch.bool)
+            .scatter_(1, dest_ranks, True)
+            .sum(dim=1, keepdim=True)
+        )
+        expected_combined = (global_hidden[start:end].float() * num_dest).bfloat16()
+        torch.testing.assert_close(combined, expected_combined, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("shared_expert_overlap", [False, True])
+    def test_moe_layer_matches_nvl_a2a(self, shared_expert_overlap):
+        """An inference MoE layer gives the same output with DeepEP as with nvl_a2a.
+
+        Both run the same vLLM expert kernels on the same rows and sum the bf16 per-rank
+        partials in the same order, so the outputs match exactly. The DeepEP layer must also
+        replay from a CUDA graph with the eager result, for two different inputs.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            DeepEPDispatcher,
+            NVLAllToAllVDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
+
+        self._skip_unless_supported()
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("The nvl_a2a reference requires a power-of-two EP size.")
+        torch.manual_seed(2029)
+        torch.cuda.manual_seed(2029)
+
+        deepep_config = _deepep_config(moe_shared_expert_overlap=shared_expert_overlap)
+        a2a_config = _deepep_config(
+            moe_shared_expert_overlap=shared_expert_overlap,
+            inference_moe_token_dispatcher_type="nvl_a2a",
+        )
+        self._allocate(deepep_config)
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=a2a_config.moe_router_topk,
+            hidden_size=a2a_config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+            combine_dtype=torch.bfloat16,
+        )
+
+        deepep_layer = get_inference_optimized_moe_spec()(config=deepep_config).cuda().eval()
+        a2a_layer = get_inference_optimized_moe_spec()(config=a2a_config).cuda().eval()
+        a2a_layer.load_state_dict(deepep_layer.state_dict())
+        assert isinstance(deepep_layer._inference_token_dispatcher, DeepEPDispatcher)
+        assert isinstance(a2a_layer._inference_token_dispatcher, NVLAllToAllVDispatcher)
+
+        local_tokens = 9 + 4 * torch.distributed.get_rank()
+
+        def new_input():
+            return torch.randn(local_tokens, 1, _DEEPEP_HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        hidden_states = new_input()
+        with torch.no_grad(), InferenceMode.active():
+            a2a_output, _ = a2a_layer(hidden_states.clone())
+            deepep_output, _ = deepep_layer(hidden_states.clone())
+        torch.testing.assert_close(deepep_output, a2a_output, atol=0, rtol=0)
+
+        static_input = hidden_states.clone()
+        with torch.no_grad(), InferenceMode.active():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    deepep_layer(static_input)
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output, _ = deepep_layer(static_input)
+
+            for x in (hidden_states, new_input()):
+                static_input.copy_(x)
+                graph.replay()
+                eager_output, _ = deepep_layer(x.clone())
+                torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # symmetric-memory collective ordering (explicit barrier-before-reuse)
 # ──────────────────────────────────────────────────────────────────────
 
