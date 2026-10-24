@@ -26,6 +26,27 @@ source inference-bench/cluster.env
 sbatch reads the `SBATCH_*` variables from the environment; the scripts also source the file
 themselves (or `$INFERENCE_BENCH_CONFIG`) for the paths. The examples below assume it is sourced.
 
+## Run configs
+
+`configs/` holds the settings of the paper runs, one `KEY=value` file each; `run.sh` submits the
+server and its client sweep from one (the client waits for the server, sweeps, then shuts it down):
+
+```bash
+inference-bench/run.sh inference-bench/configs/ultrav3_wide_ep.env
+inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
+```
+
+| Config | Nodes | Layout | Experts / GPU | Concurrency per GPU |
+|---|---|---|---|---|
+| `superv3_narrow_ep` | 1 | TP4 x EP4 | 128 | 1-32 |
+| `superv3_wide_ep` | 16 | TP4 x EP64 | 8 | 1-32 |
+| `ultrav3_narrow_ep` | 2 | TP8 x EP8 | 64 | 1-16 |
+| `ultrav3_wide_ep` | 16 | TP8 x EP64 | 8 | 1-16 |
+
+All four use `nvls` with bf16 combine, the TRT-LLM BF16 routed MoE, `MAMBA_RATIO=0.4`, GSM8K
+prompts and 8192 output tokens (one timed batch after a warmup). Besides the knobs below, a config
+sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
+
 ## Serving
 
 The server listens on port 5000 (OpenAI API at `/v1`) until the 4 h time limit. The host is
