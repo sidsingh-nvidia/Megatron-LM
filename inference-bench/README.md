@@ -53,7 +53,7 @@ of the experts within every 8 GPUs (EP8, simulating 8-GPU NVLink domains); these
 independent, so the narrow configs run a single one at the same concurrency per GPU, which gives
 the same per-GPU throughput and per-user speed as 64 GPUs of them (`EP`/`SEGMENT` still allow that).
 
-All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling) plus bf16 combine and `MAMBA_RATIO=0.4`, with prefix caching off (`PREFIX_CACHING=0`: the short, distinct math prompts get no prefix hits). Ultra narrow EP also captures CUDA graphs only up to 512 tokens, for memory. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
+All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling) plus bf16 combine and `MAMBA_RATIO=0.4`, with prefix caching off (`PREFIX_CACHING=0`: the short, distinct math prompts get no prefix hits). Ultra narrow EP also captures CUDA graphs only up to 512 tokens, for memory. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), `QOS` (all math servers use `short`, leaving the interactive QoS's small per-user node cap to the 1-node clients) and `TIME`.
 
 The client is the steady-state MATH workflow below; `configs/nanov3p5_smoke.env` instead runs the
 GSM8K smoke sweep (`CLIENT=smoke`).
