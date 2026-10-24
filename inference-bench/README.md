@@ -41,12 +41,15 @@ inference-bench/run.sh inference-bench/configs/ultrav3_wide_ep.env
 inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
 ```
 
-| Config | Nodes | Layout | Experts / GPU | Concurrency per GPU |
-|---|---|---|---|---|
-| `superv3_narrow_ep` | 1 | TP4 x EP4 | 128 | 1-32 |
-| `superv3_wide_ep` | 16 | TP4 x EP64 | 8 | 1-32 |
-| `ultrav3_narrow_ep` | 2 | TP8 x EP8 | 64 | 1-16 |
-| `ultrav3_wide_ep` | 16 | TP8 x EP64 | 8 | 1-16 |
+| Config | Nodes | Non-expert TP x DP | Expert EP x DP | Experts / GPU | Concurrency per GPU |
+|---|---|---|---|---|---|
+| `superv3_narrow_ep` | 16 | 4 x 16 | 4 x 16 | 128 | 1-32 |
+| `superv3_wide_ep` | 16 | 4 x 16 | 64 x 1 | 8 | 1-32 |
+| `ultrav3_narrow_ep` | 16 | 8 x 8 | 8 x 8 | 64 | 1-16 |
+| `ultrav3_wide_ep` | 16 | 8 x 8 | 64 x 1 | 8 | 1-16 |
+
+All four run on 64 GPUs and differ only in the expert layers: narrow EP keeps a copy of the experts
+per TP replica (simulating 8-GPU NVLink domains), wide EP shards one copy over all 64 GPUs.
 
 All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
 
@@ -158,7 +161,8 @@ All knobs are environment variables passed with `sbatch --export=ALL,KNOB=value,
 | `EXP_NAME` | run label (experiment directory suffix) | `run` |
 | `MODEL` | `nanov3p5` \| `superv3` \| `ultrav3` | `nanov3p5` |
 | `TP` | tensor parallel size; data parallel = world / TP | 4 (`ultrav3`: 8) |
-| `ETP` | expert tensor parallel size; EP = world / ETP | 1 |
+| `ETP` | expert tensor parallel size | 1 |
+| `EP` | expert parallel size; below world / ETP the experts are replicated over world / (EP x ETP) copies (narrow EP) | world / ETP |
 | `DISPATCHER` | MoE EP dispatcher: `nccl` \| `nvls` \| `nvl_a2a` | `nvls` |
 | `COMBINE_PRECISION` | MoE combine buffer: `fp32` \| `bf16` (`nvl_a2a` needs `bf16`) | `fp32` |
 | `GEMM_BACKEND` | routed-expert grouped GEMM: `trtllm_bf16_routed` \| `vllm` \| `flashinfer` \| `torch` | `trtllm_bf16_routed` |

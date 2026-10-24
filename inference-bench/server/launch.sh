@@ -21,7 +21,10 @@
 #   EXP_NAME           run label                                    (default: run)
 #   MODEL              nanov3p5 | superv3 | ultrav3                 (default: nanov3p5)
 #   TP                 tensor parallel size; data parallel = world / TP   (default: 4; ultrav3: 8)
-#   ETP                expert tensor parallel size; EP = world / ETP     (default: 1)
+#   ETP                expert tensor parallel size                      (default: 1)
+#   EP                 expert parallel size; experts are replicated over world / (EP x ETP)
+#                      expert-data-parallel copies, so EP < world / ETP keeps a copy per group of
+#                      EP x ETP GPUs (narrow EP)                         (default: world / ETP)
 #   BUFFER_GB          dynamic-batching KV/state buffer per GPU   (default: 50; ultrav3: 25)
 #   MAMBA_RATIO        fraction of BUFFER_GB for live Mamba states; with ~100 MB of state per
 #                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
@@ -106,7 +109,11 @@ export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache_${RANK}
 # Ultra v3 runs TP8 x EP8 on 2 nodes; the others default to TP4.
 if [ "${MODEL:-nanov3p5}" == "ultrav3" ]; then TP=${TP:-8}; else TP=${TP:-4}; fi
 ETP=${ETP:-1}
-EP=$((WORLD_SIZE / ETP))
+EP=${EP:-$((WORLD_SIZE / ETP))}
+if (( WORLD_SIZE % (EP * ETP) )); then
+    echo "EP x ETP = $((EP * ETP)) must divide the world size ${WORLD_SIZE}"
+    exit 1
+fi
 
 ARGS=(
     --micro-batch-size 1 --bf16 --te-rng-tracker --inference-rng-tracker
