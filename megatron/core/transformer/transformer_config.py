@@ -1438,7 +1438,7 @@ class TransformerConfig(ModelParallelConfig):
     - 'deepep': DeepEP (>= 2.5) dispatch/combine over NVLink, in its non-expand layout:
       each rank receives a compact list of the tokens routed to it. Requires DeepEP and
       NCCL >= 2.32.3, an EP group inside one NVLink domain, inference_grouped_gemm_backend
-      'vllm' with BF16 experts, inference_moe_combine_precision='bf16', and an MoE hidden
+      'vllm' or 'trtllm_bf16_routed' with BF16 experts, inference_moe_combine_precision='bf16', and an MoE hidden
       size (moe_latent_size or hidden_size) that is a multiple of 256.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
@@ -2042,7 +2042,7 @@ class TransformerConfig(ModelParallelConfig):
                 if self.inference_moe_token_dispatcher_type == "nvl_a2a":
                     raise ValueError(
                         "inference_grouped_gemm_backend='trtllm_bf16_routed' supports the "
-                        "'nvls' and 'nccl' dispatchers, not 'nvl_a2a'."
+                        "'nvls', 'nccl' and 'deepep' dispatchers, not 'nvl_a2a'."
                     )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
@@ -2081,14 +2081,19 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.inference_moe_token_dispatcher_type == "deepep":
                 # The expert output must land token-major in the dispatcher's bf16 buffer,
-                # which only the vLLM BF16 path writes.
+                # which only the vLLM and TRT-LLM BF16 paths write.
                 if (
-                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM
+                    self.inference_grouped_gemm_backend
+                    not in (
+                        InferenceGroupedGemmBackend.VLLM,
+                        InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
+                    )
                     or mxfp8_enabled
                 ):
                     raise ValueError(
                         "inference_moe_token_dispatcher_type='deepep' supports only "
-                        "inference_grouped_gemm_backend='vllm' with BF16 experts."
+                        "inference_grouped_gemm_backend='vllm' or 'trtllm_bf16_routed' with "
+                        "BF16 experts."
                     )
                 if self.inference_moe_combine_precision != "bf16":
                     raise ValueError(

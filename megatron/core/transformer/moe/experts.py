@@ -1590,20 +1590,36 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # sum on eager ones); rows past it are never touched. Other dispatchers hand over
         # exactly the gathered tokens.
         rows = hidden_states.shape[0]
-        out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        num_experts = self.num_local_experts * self.ep_group.size()
+        local_expert_offset = self.ep_group.rank() * self.num_local_experts
+        real_token_count = None
+        deepep = self._deepep_dispatcher and DeepEPDispatcher._get_combine_input() is not None
+        if deepep:
+            # DeepEP: local expert ids (-1 elsewhere) on a receive buffer whose valid prefix
+            # is the GPU-side received count; bound it by the EP-wide token sum and mask the
+            # rest as expert -1. The output lands in the buffer DeepEP's combine reads.
+            num_experts, local_expert_offset = self.num_local_experts, 0
+            out = DeepEPDispatcher._get_combine_input()
+            real_token_count = InferenceAllGatherDispatcherBase._valid_tokens()
+        else:
+            out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
         if out is not None:
             rows = min(rows, InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate())
         # The NVLS dispatcher gathers routing already packed (pack_routing before the AGV);
-        # other dispatchers hand over int64 ids + fp32 probs for exactly the gathered tokens.
+        # other dispatchers hand over int64 ids + fp32 probs.
         if routing_map.dtype != torch.int32:
-            routing_map = pack_routing(routing_map.contiguous(), probs.contiguous())
+            routing_map = pack_routing(
+                routing_map[:rows].contiguous(),
+                probs[:rows].contiguous(),
+                real_token_count=real_token_count,
+            )
         output = trtllm_bf16_routed_moe_forward(
             hidden_states,
             routing_map,
             self._trtllm_fc1_weight,
             self._trtllm_fc2_weight,
-            num_experts=self.num_local_experts * self.ep_group.size(),
-            local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
             intermediate_size=self._trtllm_intermediate_size,
             activation_type=self._flashinfer_activation_type.value,
             rows=rows,

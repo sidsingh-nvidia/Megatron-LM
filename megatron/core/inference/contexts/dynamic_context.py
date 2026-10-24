@@ -813,8 +813,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # NCCL dispatcher's EP consensus plus an EP-wide token sum: decode-only steps share
         # the graph sized by the max (bound = local rows x EP), and when any rank prefills
         # (or no graph fits) every rank runs eager and the sum is the bound.
+        # DeepEP needs the same bound: a rank receives at most the EP-wide token sum.
         self._ep_moe_row_bound = (
-            self._nvls_dispatcher
+            (
+                self._nvls_dispatcher
+                or (
+                    get_pg_size(self.expert_model_parallel_group) > 1
+                    and model_config.inference_moe_token_dispatcher_type == 'deepep'
+                )
+            )
             and model_config.num_moe_experts is not None
             and InferenceGroupedGemmBackend.from_config(model_config.inference_grouped_gemm_backend)
             == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED

@@ -22,7 +22,7 @@ Four dispatchers are provided, selected via config.inference_moe_token_dispatche
   DeepEPDispatcher ('deepep')
     DeepEP (>= 2.5) dispatch/combine over NVLink in its non-expand layout: each rank receives
     a compact list of the tokens routed to it, and combine returns one bf16 partial per
-    token and rank. Requires the vLLM grouped-GEMM backend with BF16 experts.
+    token and rank. Requires the vLLM or TRT-LLM BF16 grouped-GEMM backend with BF16 experts.
 
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
@@ -914,7 +914,8 @@ class DeepEPDispatcher(NVLSAllGatherVDispatcher):
 
     Reuses the CUDA-graph padding mask, MTP token-count override and shared-expert overlap of
     NVLSAllGatherVDispatcher, but none of its symmetric buffers or step metadata. Requires an
-    EP group inside one NVLink domain, and the vLLM grouped-GEMM backend with BF16 experts.
+    EP group inside one NVLink domain, and the vLLM or TRT-LLM BF16 grouped-GEMM backend with
+    BF16 experts.
     """
 
     # Class-level state, allocated once at model init (allocate_buffers).
@@ -1036,8 +1037,14 @@ class DeepEPDispatcher(NVLSAllGatherVDispatcher):
 
         There is no per-step metadata kernel: DeepEP exchanges token counts inside every
         dispatch, because the number of tokens each rank receives depends on the routing.
+        A rank receives each token at most once, so the EP-wide token sum bounds its rows:
+        local rows x EP on graphed steps, the EP-consensus sum on eager TRT-LLM BF16 steps.
         """
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        host_rows = local_tokens * self.ep_size
+        if NVLSAllGatherVDispatcher._host_eager_rows_bound is not None:
+            host_rows = NVLSAllGatherVDispatcher._host_eager_rows_bound
+        host_rows = min(host_rows, DeepEPDispatcher._num_max_tokens_per_rank * self.ep_size)
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = host_rows
 
     def token_dispatch(self, hidden_states, probs):
         """Send each local token to the EP ranks holding one of its experts.
