@@ -10,8 +10,10 @@ and the in-flight requests carry over into the next level's steady state. Per le
   - warm up for --warmup seconds, then measure for --window seconds;
   - throughput: the server's /metrics generation-token counter (summed over engines), read at
     the start and end of the window; exact to an engine step;
-  - interactivity: output tokens / latency of each request that finished inside the window
-    (client side; TTFT included, which the short math prompts make negligible).
+  - interactivity: per request, end-to-end latency / output tokens (TPOT including TTFT, since
+    the user waits for the first token too) over the requests that finished inside the window;
+    reported as TPOT percentiles and tokens/s/user = 1000 / TPOT. Unlike InferenceX, TTFT is
+    not subtracted. The p90 / p99 TPOT (slowest requests) are the low end of tokens/s/user.
 
     python3 inference-bench/server/steady_client.py --server http://<host>:5000 \
         --concurrency 4 8 16 --out <exp dir>/steady.jsonl
@@ -108,7 +110,7 @@ def main():
         dt = t1 - t0
         with lock:
             done = [r for r in completed if t0 <= r[1] <= t1]
-        rates = [r[2] / (r[1] - r[0]) for r in done if r[1] > r[0]]
+        tpot_ms = [1000.0 * (r[1] - r[0]) / r[2] for r in done if r[2] > 0]
         rec = {
             "concurrency": c,
             "window_s": round(dt, 2),
@@ -120,18 +122,25 @@ def main():
             "running_at_end": int(m1["requests_running"]),
             "waiting_at_end": int(m1["requests_waiting"]),
             "client_finished": len(done),
-            "user_tok_s_p50": percentile(rates, 0.5),
-            "user_tok_s_mean": sum(rates) / len(rates) if rates else float("nan"),
+            "tpot_ms_p50": percentile(tpot_ms, 0.5),
+            "tpot_ms_mean": sum(tpot_ms) / len(tpot_ms) if tpot_ms else float("nan"),
+            "tpot_ms_p90": percentile(tpot_ms, 0.9),
+            "tpot_ms_p99": percentile(tpot_ms, 0.99),
             "output_tokens_p50": percentile([r[2] for r in done], 0.5),
             "truncated": sum(r[4] == "length" for r in done),
             "errors": errors[0],
         }
-        rec["output_tok_s_per_user"] = rec["output_tok_s"] / c
+        # Tokens/s/user = 1000 / TPOT, InferenceX style (median, and the slow tail at p90).
+        rec["user_tok_s_p50"] = 1000.0 / rec["tpot_ms_p50"]
+        rec["user_tok_s_p90_slow"] = 1000.0 / rec["tpot_ms_p90"]
+        # Cross-check only: equals the per-user rate only if every worker is always decoding.
+        rec["output_tok_s_over_c"] = rec["output_tok_s"] / c
         out.write(json.dumps(rec) + "\n")
         out.flush()
         print(f"c={c:5d}  output {rec['output_tok_s']:9.1f} tok/s  "
-              f"per user {rec['user_tok_s_p50']:7.1f} tok/s (p50 of {len(done)} finished; "
-              f"throughput/c {rec['output_tok_s_per_user']:.1f})  "
+              f"interactivity p50 {rec['user_tok_s_p50']:6.1f} tok/s/user "
+              f"(TPOT p50 {rec['tpot_ms_p50']:.2f} ms, p90 {rec['tpot_ms_p90']:.2f} ms; "
+              f"{len(done)} finished)  "
               f"running {rec['running_at_end']} waiting {rec['waiting_at_end']}  "
               f"truncated {rec['truncated']}  errors {errors[0]}", flush=True)
     stop.set()
