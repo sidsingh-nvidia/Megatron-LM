@@ -87,6 +87,11 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.trtllm_bf16 import (
+    build_trtllm_bf16_weights,
+    pack_routing,
+    trtllm_bf16_routed_moe_forward,
+)
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -1302,6 +1307,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # DeepEP delivers local expert ids and combines out of its own bf16 buffer.
         self._deepep_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+        # TRT-LLM BlockMajorK copies of the expert weights, built with the concatenated ones.
+        self._trtllm_fc1_weight: Optional[torch.Tensor] = None
+        self._trtllm_fc2_weight: Optional[torch.Tensor] = None
+        self._trtllm_intermediate_size: Optional[int] = None
+        # True once the canonical expert weights are freed after the TRT-LLM conversion.
+        self._canonical_expert_weights_consumed = False
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1309,6 +1320,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
+        if self.config.gated_linear_unit and func == F.silu:
+            return ActivationType.Swiglu
         if func == F.silu:
             return ActivationType.Silu
         elif func == F.gelu:
@@ -1557,6 +1570,64 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _free_canonical_expert_weights(self):
+        """Release the canonical expert weights and the TE param views that keep them alive."""
+        for linear in (self.linear_fc1, self.linear_fc2):
+            for i in range(self.num_local_experts):
+                param = getattr(linear, f"weight{i}")
+                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        self._fc1_weight = None
+        self._fc2_weight = None
+        self._canonical_expert_weights_consumed = True
+
+    def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
+        """FlashInfer TRT-LLM BF16 routed MoE on the host-known bound of gathered rows."""
+        assert self._activation_clamp_scale is None, (
+            "activation_func_tanh_clamp_scale is not supported by trtllm_bf16_routed."
+        )
+        assert routing_map is not None, "routing_map is required for trtllm_bf16_routed."
+        # NVLS: the dispatcher's bound (local rows x EP on graphed steps, the EP-consensus
+        # sum on eager ones); rows past it are never touched. Other dispatchers hand over
+        # exactly the gathered tokens.
+        rows = hidden_states.shape[0]
+        num_experts = self.num_local_experts * self.ep_group.size()
+        local_expert_offset = self.ep_group.rank() * self.num_local_experts
+        real_token_count = None
+        deepep = self._deepep_dispatcher and DeepEPDispatcher._get_combine_input() is not None
+        if deepep:
+            # DeepEP: local expert ids (-1 elsewhere) on a receive buffer whose valid prefix
+            # is the GPU-side received count; bound it by the EP-wide token sum and mask the
+            # rest as expert -1. The output lands in the buffer DeepEP's combine reads.
+            num_experts, local_expert_offset = self.num_local_experts, 0
+            out = DeepEPDispatcher._get_combine_input()
+            real_token_count = InferenceAllGatherDispatcherBase._valid_tokens()
+        else:
+            out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        if out is not None:
+            rows = min(rows, InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate())
+        # The NVLS dispatcher gathers routing already packed (pack_routing before the AGV);
+        # other dispatchers hand over int64 ids + fp32 probs.
+        if routing_map.dtype != torch.int32:
+            routing_map = pack_routing(
+                routing_map[:rows].contiguous(),
+                probs[:rows].contiguous(),
+                real_token_count=real_token_count,
+            )
+        output = trtllm_bf16_routed_moe_forward(
+            hidden_states,
+            routing_map,
+            self._trtllm_fc1_weight,
+            self._trtllm_fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            intermediate_size=self._trtllm_intermediate_size,
+            activation_type=self._flashinfer_activation_type.value,
+            rows=rows,
+            out=out,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+        )
+        return output, None
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1628,6 +1699,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
 
         if not InferenceMode.is_active():
+            assert not self._canonical_expert_weights_consumed, (
+                "The trtllm_bf16_routed backend freed the canonical expert weights after "
+                "converting them to TRT-LLM's layout; this module can no longer run training "
+                "or refit."
+            )
             assert (
                 not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -1639,6 +1715,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+                assert not self._uses_mxfp8_weights, "trtllm_bf16_routed requires BF16 experts"
+                (
+                    self._trtllm_fc1_weight,
+                    self._trtllm_fc2_weight,
+                    self._trtllm_intermediate_size,
+                ) = build_trtllm_bf16_weights(
+                    self._fc1_weight, self._fc2_weight, self.config.gated_linear_unit
+                )
+                # Keeping both layouts doubles expert memory (129 GB more per GPU for Ultra at
+                # EP8) and nothing on this backend reads the canonical one, so free it layer by
+                # layer. The TE weight params are views into these buffers; empty them too.
+                self._free_canonical_expert_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -1646,6 +1735,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
+            )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+            return self._trtllm_bf16_routed_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(

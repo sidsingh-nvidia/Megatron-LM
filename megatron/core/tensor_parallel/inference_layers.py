@@ -8,6 +8,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
     TELinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
@@ -34,6 +35,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 try:
+    import transformer_engine as te
     import transformer_engine.pytorch.cpp_extensions as tex
     from transformer_engine.pytorch.constants import TE_DType
     from transformer_engine.pytorch.distributed import (
@@ -45,9 +47,16 @@ try:
 except ImportError:
     HAVE_TE = False
 
+try:
+    from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
 
-def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
-    # Use the same RMSNorm kernel as the training recompute.
+    HAVE_FLASHINFER_RMSNORM = True
+except ImportError:
+    HAVE_FLASHINFER_RMSNORM = False
+
+
+def _rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    """Inference RMSNorm: FlashInfer when eligible, else the training recompute's TE kernel."""
     if is_batch_invariant_mode_enabled() and get_batch_invariant_backend() != "te_native":
         # te_native keeps the native TE RMSNorm: the 64-multiple alignment
         # discipline holds its M%32 reduction bit-class constant, so kernel
@@ -55,11 +64,65 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
+    # FlashInfer's RMSNorm is ~3x faster than TE's at decode-sized row counts (1.7 vs 5.6 us at
+    # 2 rows x 8192 on GB200) and no slower at prefill sizes. It needs 16-byte rows and a weight
+    # in the input dtype; anything else falls back to TE. Batch-invariant mode keeps TE (above).
+    if (
+        HAVE_FLASHINFER_RMSNORM
+        and not is_batch_invariant_mode_enabled()
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == x.dtype
+        and x.is_contiguous()
+        and x.size(-1) % 8 == 0
+    ):
+        return flashinfer_rmsnorm(x, weight, eps=eps).view(*x_shape[:-1], -1)
     out, _, _ = tex.rmsnorm_fwd(
         x, weight, eps, None, None, TE_DType[x.dtype], 16, False  # sm-margin  # zero centered gamma
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
+
+
+if HAVE_TE:
+
+    class _InferenceTERMSNorm(te.pytorch.RMSNorm):
+        """TE RMSNorm that runs _rms_norm_kernel outside training.
+
+        Only ever created by InferenceTENorm, which re-classes a constructed te.pytorch.RMSNorm,
+        so parameters and state dict are exactly TENorm's.
+        """
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Forward pass."""
+            if self.training:
+                return super().forward(x)
+            return _rms_norm_kernel(x, self.weight, self.inference_eps)
+
+
+class InferenceTENorm:
+    """TENorm whose plain RMSNorm uses the inference RMSNorm kernel outside training.
+
+    Builds the same module as TENorm. A plain (non-zero-centered, non-fused-residual) TE
+    RMSNorm is switched to _InferenceTERMSNorm; anything else is returned unchanged.
+    """
+
+    def __new__(
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        has_residual: bool = False,
+    ):
+        instance = TENorm(config=config, hidden_size=hidden_size, eps=eps, has_residual=has_residual)
+        if (
+            HAVE_TE
+            and type(instance) is te.pytorch.RMSNorm
+            and not config.layernorm_zero_centered_gamma
+            and not instance.returns_residual
+        ):
+            instance.__class__ = _InferenceTERMSNorm
+            instance.inference_eps = eps
+        return instance
 
 
 def _apply_linear(
@@ -257,7 +320,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            x = _rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
@@ -270,7 +333,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
         else:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            x = _rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
 
         x = _apply_linear(x, self.weight, self.config)
