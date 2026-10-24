@@ -175,7 +175,7 @@ All knobs are environment variables passed with `sbatch --export=ALL,KNOB=value,
 | `SAMPLING` | sampling backend: `flashinfer` \| `torch` | `flashinfer` |
 | `MAX_TOKENS` | max tokens per engine step (chunked-prefill budget) | 8192 |
 | `MAX_REQUESTS` | max concurrent requests; unset = derived from the buffer | unset |
-| `CUDA_GRAPH_MAX_TOKENS` | largest token count captured in CUDA graphs (prefill / mixed steps up to it are graphed); set to `MAX_TOKENS` to graph every prefill step | 512 |
+| `CUDA_GRAPH_MAX_TOKENS` | largest token count captured in CUDA graphs (prefill / mixed steps up to it are graphed); set to `MAX_TOKENS` to graph every prefill step | 2048 |
 | `BUFFER_GB` | dynamic-batching KV/state buffer per GPU | 50 (`ultrav3`: 25) |
 | `MAMBA_PREFIX_GB` | Mamba prefix-cache buffer per GPU (with `PREFIX_CACHING=1`) | 50 (`ultrav3`: 25) |
 | `EVAL_MODE` | 1 = chat responses do not echo prompt token ids | 1 |
@@ -196,7 +196,7 @@ Ultra v3 (~1.1 TB of bf16 weights) needs 2 nodes. At TP8 x EP8 the weights take 
 GPU's ~184 GiB, so memory is tight:
 
 - With prefix caching (the default), use `BUFFER_GB=20,MAMBA_PREFIX_GB=20` (25/25 runs out of memory
-  allocating the Mamba prefix cache), and keep `MAX_TOKENS=CUDA_GRAPH_MAX_TOKENS=2048`.
+  allocating the Mamba prefix cache), and keep `MAX_TOKENS=2048` (`CUDA_GRAPH_MAX_TOKENS` defaults to 2048).
 - `PROMPT_LOGPROBS=0` (the default) is required: materializing every prompt token's logits
   runs the TP8 logits all-gather out of memory.
 - At `BUFFER_GB=25` the engine admits at most 48 concurrent requests; larger batches queue and

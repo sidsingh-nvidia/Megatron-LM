@@ -40,7 +40,7 @@
 #   MAX_REQUESTS       --inference-dynamic-batching-max-requests    (default: unset)
 #   MAX_TOKENS         max tokens per engine step (chunked-prefill budget)  (default: 8192)
 #   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs, so prefill / mixed steps up
-#                      to it are graphed too (default: 512, the server's default)
+#                      to it are graphed too (default: 2048; the server's own default is 512)
 #   LOG_INTERVAL       engine step-log interval; 1 = log every step  (default: 1000)
 #   EVAL_MODE          1 = --eval-mode: chat responses skip echoing prompt token IDs, which
 #                      speeds up evals with long contexts             (default: 1)
@@ -214,7 +214,7 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 # The server returns log-probs by default, which materializes logits for every prompt token
 # (gathered across TP); skip prompt log-probs so only each request's last-token logits are kept.
 [ "${PROMPT_LOGPROBS:-0}" == "1" ] || ARGS+=(--skip-prompt-log-probs)
-ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-512}")
+ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
 
 # Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
 # Copied to EXP_DIR as server_rank<N>.log when the rank exits, including on failure.
@@ -229,7 +229,7 @@ SLURM_JOB_ID=${SLURM_JOB_ID}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
-ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-512}
+ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
