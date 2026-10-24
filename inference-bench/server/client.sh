@@ -19,7 +19,7 @@
 #
 # Knobs: SERVER_JOB (required: the launch.sh job id), CLIENT (steady | smoke; default steady),
 # STEADY_WARMUP / STEADY_WINDOW (seconds per level; default 60 / 300), MAX_GEN_TOKENS (steady
-# output cap; default 24576), KEEP_SERVER (1 = leave the server running
+# output cap; default 0 = none), KEEP_SERVER (1 = leave the server running
 # after the sweep; default 0), PROFILE (1 = bracket the first batch size's timed iterations with
 # /start_profile + /stop_profile; the server must also run with PROFILE=1) and the BENCH_* knobs of
 # launch.sh (BENCH, BENCH_DATASET,
@@ -73,13 +73,13 @@ EOF
 # One thread per in-flight request.
 ulimit -u unlimited 2>/dev/null
 if [ "${CLIENT:-steady}" == "steady" ]; then
-    echo "CLIENT=steady STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-24576}" >> "${EXP_DIR}/config.env"
+    echo "CLIENT=steady STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
     python3 -u inference-bench/server/steady_client.py \
         --server "${SERVER}" \
         --concurrency ${BENCH} \
         --warmup "${STEADY_WARMUP:-60}" \
         --window "${STEADY_WINDOW:-300}" \
-        --max-tokens "${MAX_GEN_TOKENS:-24576}" \
+        --max-tokens "${MAX_GEN_TOKENS:-0}" \
         --out "${EXP_DIR}/steady.jsonl" \
         2>&1 | tee "${EXP_DIR}/bench.log"
     status=${PIPESTATUS[0]}

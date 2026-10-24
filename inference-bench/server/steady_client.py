@@ -3,7 +3,9 @@
 At each concurrency level c, c workers each keep one chat request in flight on the math blend
 (AIME 2025 + HMMT Feb 2025 + BeyondAIME, see rollouts/collect_rollouts.py), sending the next
 problem as soon as the previous reply arrives. No artificial output lengths: the model stops at
-its own EOS, with server-default sampling; --max-tokens only caps the long tail.
+its own EOS, with server-default sampling, so long-running requests are part of the load. By
+default there is no output cap (the server allows up to its max sequence length); --max-tokens
+sets one.
 
 Levels ramp up (c sorted ascending) without draining: going from c1 to c2 adds c2 - c1 workers,
 and the in-flight requests carry over into the next level's steady state. Per level:
@@ -55,7 +57,7 @@ def main():
     ap.add_argument("--concurrency", type=int, nargs="+", required=True, help="total in-flight requests per level")
     ap.add_argument("--warmup", type=float, default=60.0, help="seconds before measuring each level")
     ap.add_argument("--window", type=float, default=300.0, help="measured seconds per level")
-    ap.add_argument("--max-tokens", type=int, default=24576, help="output cap (natural EOS otherwise)")
+    ap.add_argument("--max-tokens", type=int, default=0, help="output cap; 0 = none (natural EOS)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -73,8 +75,9 @@ def main():
             with lock:
                 row = rows[next_row[0] % len(rows)]
                 next_row[0] += 1
-            payload = {"messages": [{"role": "user", "content": row["problem"] + PROMPT_SUFFIX}],
-                       "max_tokens": args.max_tokens}
+            payload = {"messages": [{"role": "user", "content": row["problem"] + PROMPT_SUFFIX}]}
+            if args.max_tokens > 0:
+                payload["max_tokens"] = args.max_tokens
             req = urllib.request.Request(f"{args.server}/v1/chat/completions",
                                          data=json.dumps(payload).encode(),
                                          headers={"Content-Type": "application/json"})

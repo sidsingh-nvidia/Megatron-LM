@@ -48,7 +48,8 @@ All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, pr
 The client (`server/client.sh`, `CLIENT=steady` by default) runs `server/steady_client.py`: for each
 concurrency level in `BENCH` (ascending, no draining between levels), that many workers keep one
 request each in flight on the math blend (AIME 2025 + HMMT Feb 2025 + BeyondAIME), with natural EOS
-capped at `MAX_GEN_TOKENS` (24576) and server-default sampling. After `STEADY_WARMUP` (60 s) it
+(no output cap unless `MAX_GEN_TOKENS` is set, so long-running requests stay in the mix) and
+server-default sampling. After `STEADY_WARMUP` (60 s) it
 measures for `STEADY_WINDOW` (300 s): output throughput from the server's `/metrics` counters (exact
 to an engine step, summed over DP engines) and per-user tokens/s from the requests that finished in
 the window. Results: `<exp dir>/steady.jsonl`. `CLIENT=smoke` runs the old GSM8K sweep (`client.py`,
