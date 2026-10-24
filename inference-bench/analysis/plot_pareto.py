@@ -50,7 +50,8 @@ def load(spec):
             continue
         rows.append({"config": label, "c": r["concurrency"], "user_tok_s": r["user_tok_s_p50"],
                      "user_tok_s_p90": r["user_tok_s_p90_slow"],
-                     "tok_s_gpu": r["output_tok_s"] / gpus})
+                     "tok_s_gpu": r["output_tok_s"] / gpus, "c_per_gpu": r["concurrency"] / gpus,
+                     "tpot_p50": r["tpot_ms_p50"], "tpot_p90": r["tpot_ms_p90"]})
     return rows
 
 
@@ -70,6 +71,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--figsize", type=float, nargs=2, default=(5, 3.5))
     ap.add_argument("--label-c", action="store_true", help="label each point with its concurrency")
+    ap.add_argument("--tpot-out", default=None,
+                    help="also plot median TPOT (whisker to p90) vs concurrency per GPU to this file")
     args = ap.parse_args()
 
     df = pd.DataFrame([row for spec in args.runs for row in load(spec)])
@@ -95,14 +98,48 @@ def main():
         ax.set_ylabel("Throughput (tokens/s/GPU)")
         if args.title:
             ax.set_title(args.title)
-        ax.yaxis.grid(linestyle="dotted", zorder=0)
-        ax.spines["left"].set_color("#606060")
-        ax.spines["bottom"].set_color("#606060")
-        ax.tick_params(axis="both", direction="in", color="#606060")
+        style_axes(ax)
         ax.legend(loc="upper right", frameon=False, handlelength=3)
         fig.tight_layout()
         fig.savefig(args.out, dpi=200)
-    print(f"-> {args.out}")
+        print(f"-> {args.out}")
+        if args.tpot_out:
+            plot_tpot(df, labels, args)
+            print(f"-> {args.tpot_out}")
+
+
+def style_axes(ax):
+    """PSSG axis style, as pssgplot's LinePlot applies it."""
+    ax.yaxis.grid(linestyle="dotted", zorder=0)
+    ax.spines["left"].set_color("#606060")
+    ax.spines["bottom"].set_color("#606060")
+    ax.tick_params(axis="both", direction="in", color="#606060")
+
+
+def plot_tpot(df, labels, args):
+    """Median TPOT (TTFT included; whisker up to p90) vs concurrency per GPU, log2 x."""
+    fig, ax = plt.subplots(figsize=tuple(args.figsize))
+    for i, label in enumerate(labels):
+        sub = df[df["config"] == label].sort_values("c")
+        color, marker, ls, text = style_of(label, i)
+        ax.plot(sub["c_per_gpu"], sub["tpot_p50"], color=color, marker=marker, linestyle=ls,
+                markeredgewidth=0, label=text, zorder=3)
+        for _, r in sub.iterrows():
+            ax.plot([r["c_per_gpu"]] * 2, [r["tpot_p50"], r["tpot_p90"]], color=color,
+                    linewidth=1, alpha=0.6)
+    ax.set_xscale("log", base=2)
+    ticks = sorted(set(df["c_per_gpu"]))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{t:g}" for t in ticks])
+    ax.set_ylim(0, 1.12 * df["tpot_p90"].max())
+    ax.set_xlabel("Concurrency per GPU")
+    ax.set_ylabel("TPOT (ms), median")
+    if args.title:
+        ax.set_title(args.title)
+    style_axes(ax)
+    ax.legend(loc="upper left", frameon=False, handlelength=3)
+    fig.tight_layout()
+    fig.savefig(args.tpot_out, dpi=200)
 
 
 if __name__ == "__main__":
