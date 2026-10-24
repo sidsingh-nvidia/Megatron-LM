@@ -43,7 +43,7 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 
 | Config | Nodes | Non-expert TP x DP | Expert EP x DP | Experts / GPU | Concurrency per GPU |
 |---|---|---|---|---|---|
-| `superv3_narrow_ep` | 1 | 4 x 1 | 4 x 1 | 128 | 1-32 |
+| `superv3_narrow_ep` | 2 | 4 x 2 | 8 x 1 | 64 | 1-32 |
 | `superv3_wide_ep` | 16 | 4 x 16 | 64 x 1 | 8 | 1-32 |
 | `ultrav3_narrow_ep` | 2 | 8 x 1 | 8 x 1 | 64 | 1-16 |
 | `ultrav3_wide_ep` | 16 | 8 x 8 | 64 x 1 | 8 | 1-16 |
