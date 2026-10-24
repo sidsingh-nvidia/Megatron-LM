@@ -2,8 +2,8 @@
 # Submit a server (server/launch.sh) and its client sweep (server/client.sh) from a run config.
 #
 # Run from the Megatron-LM repo root:
-#   inference-bench/run.sh inference-bench/configs/ultrav3_wide_ep.env
-#   inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEND=vllm BENCH="4 8"
+#   inference-bench/run.sh inference-bench/configs/math/ultrav3_wide_ep.env
+#   inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env GEMM_BACKEND=vllm BENCH="4 8"
 #
 # A config is a KEY=value file of launch.sh / client.sh knobs plus:
 #   NODES  server nodes; multi-node servers also get --segment SEGMENT, keeping each SEGMENT

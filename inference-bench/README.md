@@ -33,12 +33,12 @@ themselves (or `$INFERENCE_BENCH_CONFIG`) for the paths. The examples below assu
 
 ## Run configs
 
-`configs/` holds the settings of the paper runs, one `KEY=value` file each; `run.sh` submits the
+`configs/math/` holds the settings of the paper's math-workload runs, one `KEY=value` file each; `run.sh` submits the
 server and its client sweep from one (the client waits for the server, sweeps, then shuts it down):
 
 ```bash
-inference-bench/run.sh inference-bench/configs/ultrav3_wide_ep.env
-inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
+inference-bench/run.sh inference-bench/configs/math/ultrav3_wide_ep.env
+inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
 ```
 
 | Config | Nodes | Non-expert TP x DP | Expert EP x DP | Experts / GPU | Concurrency per GPU |
@@ -48,12 +48,12 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 | `ultrav3_narrow_ep` | 2 | 8 x 1 | 8 x 1 | 64 | 1-16 |
 | `ultrav3_wide_ep` | 16 | 8 x 8 | 64 x 1 | 8 | 1-16 |
 
-Wide EP runs on 64 GPUs, sharding one copy of the experts over all of them. Narrow EP keeps a copy
-of the experts per TP replica (simulating 8-GPU NVLink domains); its replicas are independent, so
-the narrow configs run a single replica at the same concurrency per GPU, which gives the same
-per-GPU throughput and per-user speed as 64 GPUs of replicas (`EP`/`SEGMENT` still allow that).
+Wide EP runs on 64 GPUs, sharding one copy of the experts over all of them. Narrow EP shards a copy
+of the experts within every 8 GPUs (EP8, simulating 8-GPU NVLink domains); these groups are
+independent, so the narrow configs run a single one at the same concurrency per GPU, which gives
+the same per-GPU throughput and per-user speed as 64 GPUs of them (`EP`/`SEGMENT` still allow that).
 
-All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
+All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling) plus bf16 combine and `MAMBA_RATIO=0.4`, with prefix caching off (`PREFIX_CACHING=0`: the short, distinct math prompts get no prefix hits). Ultra narrow EP also captures CUDA graphs only up to 512 tokens, for memory. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
 
 The client is the steady-state MATH workflow below; `configs/nanov3p5_smoke.env` instead runs the
 GSM8K smoke sweep (`CLIENT=smoke`).
@@ -71,7 +71,7 @@ server-default sampling and no output cap, so 100k-token answers stay in the mix
 
 ```bash
 # a paper config: server + client, the client starts when the server is up
-inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env
+inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env
 # any model / knob from the command line; e.g. a quick nano Pareto
 inference-bench/run.sh inference-bench/configs/nanov3p5_smoke.env CLIENT=steady \
     BENCH="1 2 4 8 16 32 64 128 256" STEADY_WARMUP=30 STEADY_WINDOW=180 TIME=1:00:00 \
