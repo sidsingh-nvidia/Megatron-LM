@@ -43,13 +43,15 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 
 | Config | Nodes | Non-expert TP x DP | Expert EP x DP | Experts / GPU | Concurrency per GPU |
 |---|---|---|---|---|---|
-| `superv3_narrow_ep` | 16 | 4 x 16 | 4 x 16 | 128 | 1-32 |
+| `superv3_narrow_ep` | 1 | 4 x 1 | 4 x 1 | 128 | 1-32 |
 | `superv3_wide_ep` | 16 | 4 x 16 | 64 x 1 | 8 | 1-32 |
-| `ultrav3_narrow_ep` | 16 | 8 x 8 | 8 x 8 | 64 | 1-16 |
+| `ultrav3_narrow_ep` | 2 | 8 x 1 | 8 x 1 | 64 | 1-16 |
 | `ultrav3_wide_ep` | 16 | 8 x 8 | 64 x 1 | 8 | 1-16 |
 
-All four run on 64 GPUs and differ only in the expert layers: narrow EP keeps a copy of the experts
-per TP replica (simulating 8-GPU NVLink domains), wide EP shards one copy over all 64 GPUs.
+Wide EP runs on 64 GPUs, sharding one copy of the experts over all of them. Narrow EP keeps a copy
+of the experts per TP replica (simulating 8-GPU NVLink domains); its replicas are independent, so
+the narrow configs run a single replica at the same concurrency per GPU, which gives the same
+per-GPU throughput and per-user speed as 64 GPUs of replicas (`EP`/`SEGMENT` still allow that).
 
 All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
 
