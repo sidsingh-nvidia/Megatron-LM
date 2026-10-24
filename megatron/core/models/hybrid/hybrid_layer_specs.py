@@ -30,6 +30,7 @@ from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
+    InferenceTENorm,
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
@@ -541,7 +542,7 @@ hybrid_inference_stack_spec = ModuleSpec(
             # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=InferenceTENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=ModuleSpec(

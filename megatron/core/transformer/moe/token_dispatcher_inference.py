@@ -22,7 +22,7 @@ Four dispatchers are provided, selected via config.inference_moe_token_dispatche
   DeepEPDispatcher ('deepep')
     DeepEP (>= 2.5) dispatch/combine over NVLink in its non-expand layout: each rank receives
     a compact list of the tokens routed to it, and combine returns one bf16 partial per
-    token and rank. Requires the vLLM grouped-GEMM backend with BF16 experts.
+    token and rank. Requires the vLLM or TRT-LLM BF16 grouped-GEMM backend with BF16 experts.
 
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
@@ -42,11 +42,14 @@ import torch.distributed as dist
 from megatron.core.inference.communication.torch_symm_triton import (
     a2a_combine_v,
     a2a_dispatch_v,
+    a2a_dispatch_v_2tensor,
+    multimem_all_gatherv_2tensor,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
+from megatron.core.inference.moe.trtllm_bf16 import pack_routing
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -354,6 +357,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     # CUDA-graph padding tokens. Wired once by the context after gpu_view init.
     _real_token_count_tensor: Optional[torch.Tensor] = None
 
+    # Host-known bound on this step's gathered rows, set by the context's EP consensus when
+    # the grouped-GEMM backend needs one (TRT-LLM routed MoE): the EP-wide sum of local rows
+    # when every rank runs eager, or the largest CUDA-graph token count x EP on loose-bound
+    # graphs (ranks may run graphs of different sizes). None on tight-bound decode graphs,
+    # where every rank runs the same graph and local rows x EP is the bound.
+    _host_rows_bound: Optional[int] = None
+
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32,
     # rsv=fp32 or bf16 (config.inference_moe_combine_precision).
@@ -361,6 +371,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
+    # TRT-LLM BF16 only: gathered packed routing (expert id << 16 | bf16 prob), int32
+    # [global_max, topk], in place of agv_r + agv_p.
+    _symm_agv_packed: Optional[dict] = None
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
@@ -377,6 +390,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         each step by transfer_bookkeeping_to_gpu().
         """
         cls._real_token_count_tensor = tensor
+
+    @classmethod
+    def set_host_rows_bound(cls, rows: Optional[int]) -> None:
+        """Set this step's EP-wide gathered-row bound (None: local rows x EP)."""
+        cls._host_rows_bound = rows
 
     @classmethod
     def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
@@ -409,6 +427,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._symm_agv_routing = None
         cls._symm_agv_probs = None
         cls._symm_rsv = None
+        cls._symm_agv_packed = None
         cls._symm_metadata = None
         cls._real_token_count_tensor = None
 
@@ -420,6 +439,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         hidden_size: int,
         ep_group: torch.distributed.ProcessGroup,
         combine_dtype: torch.dtype = torch.float32,
+        packed_routing: bool = False,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -436,6 +456,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_group: Expert parallel process group.
             combine_dtype: Dtype of the RSV (combine) buffer, from
                 config.inference_moe_combine_precision.
+            packed_routing: also allocate the packed-routing AGV buffer (TRT-LLM BF16 backend).
         """
         ep_size = get_pg_size(ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
@@ -473,6 +494,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, combine_dtype)
         ).maybe_get_tensor(rsv_shape, dtype=combine_dtype)
 
+        named_buffers = [
+            ("ep_agv_h", cls._symm_agv_hidden),
+            ("ep_agv_r", cls._symm_agv_routing),
+            ("ep_agv_p", cls._symm_agv_probs),
+            ("ep_rsv", cls._symm_rsv),
+        ]
+        if packed_routing:
+            assert (topk * 4) % 8 == 0, f"packed routing rows ({topk} x int32) must be 8-byte aligned"
+            cls._symm_agv_packed = SymmetricMemoryManager.get_buffer(
+                "ep_agv_pk", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int32)
+            ).maybe_get_tensor(agv_r_shape, dtype=torch.int32)
+            named_buffers.append(("ep_agv_pk", cls._symm_agv_packed))
+            # Expert -1 in every row, once. No per-step fill is needed: the TRT-LLM kernel only
+            # reads [0, rows), and the EP consensus makes rows == valid_tokens every step, so
+            # it never sees a stale row; this covers anything read before the first gather.
+            if cls._symm_agv_packed["tensor"] is not None:
+                cls._symm_agv_packed["tensor"].fill_(-1 << 16)
+
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
             "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
@@ -480,13 +519,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         failed = [
             (name, SymmetricMemoryManager.get_buffer(name).init_failure_reason)
-            for name, buf in (
-                ("ep_agv_h", cls._symm_agv_hidden),
-                ("ep_agv_r", cls._symm_agv_routing),
-                ("ep_agv_p", cls._symm_agv_probs),
-                ("ep_rsv", cls._symm_rsv),
-                ("ep_meta", cls._symm_metadata),
-            )
+            for name, buf in named_buffers + [("ep_meta", cls._symm_metadata)]
             if buf["handle"] is None
         ]
         if failed:
@@ -511,6 +544,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
+        host_rows = local_tokens * self.ep_size
+        if cls._host_rows_bound is not None:
+            host_rows = cls._host_rows_bound
+        host_rows = min(host_rows, cls._per_rank_worst_case_token_count * self.ep_size)
+        # TRT-LLM BF16 gathers packed routing into its own buffer (no -1 fill; see allocate_buffers).
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
@@ -519,7 +557,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = host_rows
 
     def __init__(
         self,
@@ -537,6 +575,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # TRT-LLM BF16: pack routing locally before the dispatch and gather only the packed int32.
+        self._packed_routing = (
+            config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+        )
         # Rank inside pg_collection.tp — the *standard* TP group that SP shards
         # the routing map along. Base class self.tp_rank is the expt_tp rank,
         # which is not what we want for the SP padding offset.
@@ -605,6 +647,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # discarded downstream -- but it scales the MoE cost with the CUDA-graph
         # bucket rather than the live batch, which is most of the bucket
         # whenever the batch is draining.
+        if self._packed_routing:
+            return self._token_dispatch_packed(hidden_states, probs)
+
         if self.__class__._real_token_count_tensor is not None:
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
@@ -639,6 +684,52 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         probs = agv_p["tensor"].view(global_max, topk)
         hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
         return hidden_states, probs
+
+    def _token_dispatch_packed(self, hidden_states, probs):
+        """TRT-LLM BF16 path: pack routing locally, then AllGather-V hidden + packed int32.
+
+        pack_routing also masks CUDA-graph padding rows to expert -1 (mask_routing_padding's
+        job). Returns the gathered hidden states and the local probs, which the TRT-LLM experts
+        ignore; self.routing_map becomes the gathered packed routing [global_max, topk] int32.
+        """
+        local_tokens = hidden_states.shape[0]
+        packed = pack_routing(
+            self.routing_map,
+            probs,
+            self.__class__._real_token_count_tensor,
+            row_offset=self.sp_rank * local_tokens,
+        )
+        if self.ep_size == 1:
+            if self._runs_metadata_sync:
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(local_tokens)
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens
+            self.routing_map = packed
+            return hidden_states, probs
+
+        if self._runs_metadata_sync:
+            self.update_metadata(local_tokens)
+        cls = self.__class__
+        agv_h, agv_pk = cls._symm_agv_hidden, cls._symm_agv_packed
+        assert agv_pk is not None, "packed-routing AGV buffer not allocated"
+        self._dispatch_collective_packed(agv_h, agv_pk, hidden_states, packed)
+        global_max = self._per_rank_worst_case_token_count * self.ep_size
+        self.routing_map = agv_pk["tensor"].view(global_max, self.topk)
+        return agv_h["tensor"].view(global_max, hidden_states.shape[1]), probs
+
+    def _dispatch_collective_packed(self, agv_h, agv_pk, hidden_states, packed):
+        """AllGather-V the local hidden states and packed routing into the [global_max, *]
+        symmetric buffers."""
+        multimem_all_gatherv_2tensor(
+            agv_h["tensor"],
+            agv_pk["tensor"],
+            hidden_states,
+            packed,
+            agv_h["handle"],
+            agv_pk["handle"],
+            rank_token_offset=self._rank_token_offset(),
+            ep_max_tokens=self._ep_max_tokens(),
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
+        )
 
     def _dispatch_collective(self, agv_h, agv_r, agv_p, hidden_states, probs):
         """AllGather-V the local hidden states, routing map and probs into the
@@ -738,7 +829,8 @@ class NVLAllToAllVDispatcher(NVLSAllGatherVDispatcher):
 
     Same buffers, step metadata and token layout as NVLSAllGatherVDispatcher, but:
       - dispatch sends each hidden row only to the ranks that hold one of the token's
-        experts (routing ids and probs are still multicast to every rank), and
+        experts (routing ids and probs, or the packed TRT-LLM routing, are still multicast to
+        every rank), and
       - combine pulls each local token's bf16 partial outputs from those ranks and sums
         them in fp32 in a fixed order, instead of an NVLS in-switch reduce-scatter.
 
@@ -769,6 +861,26 @@ class NVLAllToAllVDispatcher(NVLSAllGatherVDispatcher):
             agv_h["handle"],
             agv_r["handle"],
             agv_p["handle"],
+            rank_token_offset=self._rank_token_offset(),
+            ep_max_tokens=self._ep_max_tokens(),
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            num_local_experts=self.num_local_experts,
+        )
+
+    def _dispatch_collective_packed(self, agv_h, agv_pk, hidden_states, packed):
+        """All-to-all-V the local hidden states; multicast the packed routing (TRT-LLM BF16).
+
+        Combine walks the packed routing too, so CUDA-graph padding rows (expert -1) pull
+        nothing.
+        """
+        self._local_routing_map = packed
+        a2a_dispatch_v_2tensor(
+            agv_h["tensor"],
+            agv_pk["tensor"],
+            hidden_states,
+            packed,
+            agv_h["handle"],
+            agv_pk["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
@@ -830,7 +942,8 @@ class DeepEPDispatcher(NVLSAllGatherVDispatcher):
 
     Reuses the CUDA-graph padding mask, MTP token-count override and shared-expert overlap of
     NVLSAllGatherVDispatcher, but none of its symmetric buffers or step metadata. Requires an
-    EP group inside one NVLink domain, and the vLLM grouped-GEMM backend with BF16 experts.
+    EP group inside one NVLink domain, and the vLLM or TRT-LLM BF16 grouped-GEMM backend with
+    BF16 experts.
     """
 
     # Class-level state, allocated once at model init (allocate_buffers).
@@ -952,8 +1065,14 @@ class DeepEPDispatcher(NVLSAllGatherVDispatcher):
 
         There is no per-step metadata kernel: DeepEP exchanges token counts inside every
         dispatch, because the number of tokens each rank receives depends on the routing.
+        A rank receives each token at most once, so the EP-wide token sum bounds its rows:
+        local rows x EP on tight-bound decode graphs, otherwise the context's override.
         """
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        host_rows = local_tokens * self.ep_size
+        if NVLSAllGatherVDispatcher._host_rows_bound is not None:
+            host_rows = NVLSAllGatherVDispatcher._host_rows_bound
+        host_rows = min(host_rows, DeepEPDispatcher._num_max_tokens_per_rank * self.ep_size)
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = host_rows
 
     def token_dispatch(self, hidden_states, probs):
         """Send each local token to the EP ranks holding one of its experts.

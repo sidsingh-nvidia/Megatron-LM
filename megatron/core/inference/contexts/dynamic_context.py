@@ -5,6 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -808,6 +809,30 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.expert_model_parallel_group
         ) > 1 and model_config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
 
+        # The TRT-LLM routed MoE kernel's cost scales with the rows it is handed, so under
+        # NVLS it needs a host-known bound on the gathered rows every step. One EP consensus
+        # per step picks it (see _match_graph_with_ep_moe_row_bound):
+        #   - every rank decodes: all share the decode graph sized by the EP-wide max token
+        #     count, bound = local rows x EP (tight);
+        #   - every rank has a CUDA graph, some prefill: each runs its own graph, captured
+        #     with bound = largest CUDA-graph token count x EP (loose);
+        #   - any rank has no graph: every rank runs eager, bound = EP-wide token sum.
+        # DeepEP needs the same bound: a rank receives at most the EP-wide token sum.
+        self._ep_moe_row_bound = (
+            (
+                self._nvls_dispatcher
+                or (
+                    get_pg_size(self.expert_model_parallel_group) > 1
+                    and model_config.inference_moe_token_dispatcher_type == 'deepep'
+                )
+            )
+            and model_config.num_moe_experts is not None
+            and InferenceGroupedGemmBackend.from_config(model_config.inference_grouped_gemm_backend)
+            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+        )
+        # The MoE dispatchers scatter each step's tokens over the TP group.
+        self._moe_sp_size = tp_size
+
         # are we using the DeepEP inference dispatcher? Like the NVLink dispatchers it takes
         # variable token counts per rank and masks CUDA-graph padding rows, but it has its
         # own buffers.
@@ -860,6 +885,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
+        if self._ep_moe_row_bound:
+            # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one.
+            graphs = []
+            for dims in self.cuda_graph_batch_dimensions_list:
+                if dims.prefill_req_count == 0:
+                    graphs.append(dims)
+                graphs.append(dataclasses.replace(dims, loose_moe_row_bound=True))
+            self.cuda_graph_batch_dimensions_list = graphs
+            # Loose bound: the largest graph's local (post-SP) rows on every EP rank.
+            self._moe_loose_rows_bound = (
+                max((dims.token_count for dims in graphs), default=0)
+                // self._moe_sp_size
+                * get_pg_size(self.expert_model_parallel_group)
+            )
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -891,6 +930,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+                packed_routing=self._ep_moe_row_bound,
                 combine_dtype=(
                     torch.bfloat16
                     if model_config.inference_moe_combine_precision == 'bf16'
@@ -1790,6 +1830,79 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
 
+    def _match_graph_with_ep_moe_row_bound(
+        self, batch_dimensions: InferenceBatchDimensions
+    ) -> Tuple[Optional[InferenceBatchDimensions], Optional[int]]:
+        """CUDA graph and MoE row bound for this step under the TRT-LLM routed MoE.
+
+        One EP consensus (see _ep_moe_row_bound in __init__) picks the regime:
+        every rank decoding -> the tight decode graph sized by the EP-wide max token count;
+        every rank with a graph -> its own loose graph; otherwise every rank runs eager.
+
+        Returns:
+            (graph or None for eager, EP-wide token sum when eager else None). The caller
+            derives the bound of a graph from its loose_moe_row_bound flag.
+        """
+        tight = [d for d in self.cuda_graph_batch_dimensions_list if not d.loose_moe_row_bound]
+        loose = [d for d in self.cuda_graph_batch_dimensions_list if d.loose_moe_row_bound]
+        local_loose_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            batch_dimensions, loose, strict=self.is_hybrid_model, match_ep_token_counts=False
+        )
+        max_token_count, any_non_decode, any_no_graph, eager_token_sum = (
+            InferenceBatchDimensions.sync_ep_moe_row_bound_state(
+                batch_dimensions,
+                local_has_graph=local_loose_graph is not None,
+                local_eager_token_count=self._eager_padded_batch_dimensions().token_count,
+                ep_group=self.expert_model_parallel_group,
+                ep_zmq_communicator=self._ep_zmq_communicator,
+            )
+        )
+        if not any_non_decode:
+            graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+                dataclasses.replace(batch_dimensions, token_count=max_token_count),
+                tight,
+                strict=self.is_hybrid_model,
+                match_ep_token_counts=False,
+            )
+            # Eager here only when the EP-wide max exceeds every decode graph, which every
+            # rank sees alike; a graphed rank's local rows x EP still bounds the sum.
+            return graph, (None if graph is not None else eager_token_sum // self._moe_sp_size)
+        if not any_no_graph:
+            return local_loose_graph, None
+        return None, eager_token_sum // self._moe_sp_size
+
+    def _eager_padded_batch_dimensions(self) -> InferenceBatchDimensions:
+        """Padded batch dimensions for this step if it runs eager (no CUDA graph).
+
+        Uses the local prefill count rather than is_decode_only(), which reads the
+        previous step's graph state until this step's graph is matched.
+        """
+        if not self.mtp_metadata.is_varlen_forward and self.num_prefill_requests == 0:
+            if self.num_speculative_tokens > 0:
+                padded_decode_req_count = min(
+                    self.max_requests, self.round_up_requests(self.num_decode_requests)
+                )
+                padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
+            else:
+                padded_token_count = min(
+                    self.max_tokens, self.max_requests, self.round_up_tokens(self.active_token_count)
+                )
+                padded_decode_req_count = padded_token_count
+            padded_prefill_req_count = 0
+        else:
+            padded_token_count = self.round_up_tokens(self.active_token_count)
+            target_padding_req_count = min(
+                self.max_requests,
+                self.round_up_requests(self.total_request_count - self.paused_request_count),
+            )
+            padded_decode_req_count = self.num_decode_requests
+            padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
+        return InferenceBatchDimensions(
+            token_count=padded_token_count,
+            prefill_req_count=padded_prefill_req_count,
+            decode_req_count=padded_decode_req_count,
+        )
+
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
@@ -2562,15 +2675,29 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions,
-            self.cuda_graph_batch_dimensions_list,
-            strict=self.is_hybrid_model,
-            ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
-            ep_zmq_communicator=self._ep_zmq_communicator,
-        )
+        moe_rows_bound = None
+        if self._ep_moe_row_bound and self.is_creating_cuda_graphs:
+            # Capture the requested graph itself: matching would pick the tight decode variant
+            # for a loose one.
+            best_graph = construct_graph_dimensions
+        elif self._ep_moe_row_bound:
+            best_graph, moe_rows_bound = self._match_graph_with_ep_moe_row_bound(batch_dimensions)
+        else:
+            best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+                batch_dimensions,
+                self.cuda_graph_batch_dimensions_list,
+                strict=self.is_hybrid_model,
+                ep_group=self.expert_model_parallel_group,
+                match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+                ep_zmq_communicator=self._ep_zmq_communicator,
+            )
         self._using_cuda_graph_this_step = best_graph is not None
+        if self._ep_moe_row_bound:
+            if best_graph is not None:
+                moe_rows_bound = (
+                    self._moe_loose_rows_bound if best_graph.loose_moe_row_bound else None
+                )
+            NVLSAllGatherVDispatcher.set_host_rows_bound(moe_rows_bound)
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
@@ -2578,33 +2705,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            if self.is_decode_only():
-                if self.num_speculative_tokens > 0:
-                    padded_decode_req_count = min(
-                        self.max_requests, self.round_up_requests(self.num_decode_requests)
-                    )
-                    padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
-                else:
-                    padded_token_count = min(
-                        self.max_tokens,
-                        self.max_requests,
-                        self.round_up_tokens(self.active_token_count),
-                    )
-                    padded_decode_req_count = padded_token_count
-                padded_prefill_req_count = 0
-            else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
-                target_padding_req_count = min(
-                    self.max_requests,
-                    self.round_up_requests(self.total_request_count - self.paused_request_count),
-                )
-                padded_decode_req_count = self.num_decode_requests
-                padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
-            self.padded_batch_dimensions = InferenceBatchDimensions(
-                token_count=padded_token_count,
-                prefill_req_count=padded_prefill_req_count,
-                decode_req_count=padded_decode_req_count,
-            )
+            self.padded_batch_dimensions = self._eager_padded_batch_dimensions()
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
@@ -3020,6 +3121,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.active_token_count = 0
         if not preserve_counters:
             self.lifetime_prefill_token_count = 0
+        # Lifetime counters for the engine's /metrics; never reset.
+        if not hasattr(self, "metrics_prompt_tokens_total"):
+            self.metrics_prompt_tokens_total = 0
+            self.metrics_prompt_tokens_cached_total = 0
             self.async_sched_step_count = 0
             self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
@@ -3772,7 +3877,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
+        self.metrics_prompt_tokens_total += effective_prefill_chunk_length
         if self.enable_prefix_caching:
+            self.metrics_prompt_tokens_cached_total += prefix_skip_tokens
             self.prefix_cache_prefill_computed_tokens += effective_prefill_chunk_length
             self.prefix_cache_prefill_skipped_tokens += prefix_skip_tokens
         self.total_request_count += 1

@@ -702,6 +702,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_counter = Counter()
         self.finished_request_count = 0
         self.evicted_request_count = 0
+        # Lifetime counters for /metrics (see _metrics_snapshot); never reset.
+        if not hasattr(self, "_metrics_counters"):
+            self._metrics_counters = {
+                "generation_tokens_total": 0,
+                "requests_finished_total": 0,
+                "engine_steps_total": 0,
+            }
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -2535,6 +2542,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_requests: list[DynamicInferenceRequest] = []
         self.finished_request_count += len(finished_request_ids)
+        self._metrics_counters["requests_finished_total"] += len(finished_request_ids)
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
 
@@ -2634,6 +2642,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
+                    self._metrics_counters["generation_tokens_total"] += len(tokens)
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:
@@ -3785,6 +3794,22 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._partial_emit_lengths.update(emit_lengths)
 
+    def _metrics_snapshot(self) -> Dict[str, int]:
+        """This engine's lifetime counters and current gauges, for /metrics.
+
+        Counters only grow, so a client reads them at the start and end of a window and
+        divides the difference by its length.
+        """
+        context = self.context
+        return {
+            **self._metrics_counters,
+            "prompt_tokens_total": context.metrics_prompt_tokens_total,
+            "prompt_tokens_cached_total": context.metrics_prompt_tokens_cached_total,
+            "requests_running": context.total_request_count - context.paused_request_count,
+            "requests_paused": context.paused_request_count,
+            "requests_waiting": len(self.waiting_request_ids),
+        }
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ) -> DynamicInferenceEngineStepResult:
@@ -3808,6 +3833,7 @@ class DynamicInferenceEngine(AbstractEngine):
         cuda_graph_request_count = None
 
         if step_result is not None:
+            self._metrics_counters["engine_steps_total"] += 1
             active_request_ids = step_result["active_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
@@ -4398,6 +4424,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 torch.cuda.cudart().cudaProfilerStart()
             elif header == Headers.STOP_CUDA_PROFILER:
                 torch.cuda.cudart().cudaProfilerStop()
+            elif header == Headers.GET_METRICS:
+                # Every MP rank has the same counters; the MP coordinator answers for them.
+                if self.is_mp_coordinator:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb(
+                            [Headers.ENGINE_METRICS.value, data[1], self._metrics_snapshot()],
+                            use_bin_type=True,
+                        )
+                    )
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)

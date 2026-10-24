@@ -17,6 +17,7 @@ class InferenceGroupedGemmBackend(enum.Enum):
     FLASHINFER = "flashinfer"
     TORCH = "torch"
     VLLM = "vllm"
+    TRTLLM_BF16_ROUTED = "trtllm_bf16_routed"
 
     @classmethod
     def from_config(cls, value: str | InferenceGroupedGemmBackend) -> InferenceGroupedGemmBackend:

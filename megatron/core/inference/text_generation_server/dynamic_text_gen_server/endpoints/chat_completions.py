@@ -1559,11 +1559,11 @@ try:
                     ]
 
             choices.append(choice_data)
-            if not payload_offloaded and result.get("generated_log_probs") is None:
-                logger.warning(
-                    "Generation log probs is None for request:\n%s",
-                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
-                )
+            # if not payload_offloaded and result.get("generated_log_probs") is None:
+            #     logger.warning(
+            #         "Generation log probs is None for request:\n%s",
+            #         json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
+            #     )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
