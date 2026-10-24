@@ -43,9 +43,21 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 | `ultrav3_narrow_ep` | 2 | TP8 x EP8 | 64 | 1-16 |
 | `ultrav3_wide_ep` | 16 | TP8 x EP64 | 8 | 1-16 |
 
-All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`, GSM8K
-prompts and 8192 output tokens (one timed batch after a warmup). Besides the knobs below, a config
-sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
+All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
+
+The client (`server/client.sh`, `CLIENT=steady` by default) runs `server/steady_client.py`: for each
+concurrency level in `BENCH` (ascending, no draining between levels), that many workers keep one
+request each in flight on the math blend (AIME 2025 + HMMT Feb 2025 + BeyondAIME), with natural EOS
+capped at `MAX_GEN_TOKENS` (24576) and server-default sampling. After `STEADY_WARMUP` (60 s) it
+measures for `STEADY_WINDOW` (300 s): output throughput from the server's `/metrics` counters (exact
+to an engine step, summed over DP engines) and per-user tokens/s from the requests that finished in
+the window. Results: `<exp dir>/steady.jsonl`. `CLIENT=smoke` runs the old GSM8K sweep (`client.py`,
+fixed `BENCH_OSL` with `ignore_eos`), as `configs/nanov3p5_smoke.env` does.
+
+The server exposes `GET /metrics` (Prometheus text): lifetime counters `mcore:generation_tokens_total`,
+`mcore:prompt_tokens_total`, `mcore:prompt_tokens_cached_total`, `mcore:requests_finished_total`,
+`mcore:engine_steps_total`, and gauges `mcore:requests_{running,paused,waiting}`, per DP engine and
+summed.
 
 ## Serving
 
