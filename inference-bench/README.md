@@ -43,7 +43,7 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 | `ultrav3_narrow_ep` | 2 | TP8 x EP8 | 64 | 1-16 |
 | `ultrav3_wide_ep` | 16 | TP8 x EP64 | 8 | 1-16 |
 
-All four use `nvls` with bf16 combine, the TRT-LLM BF16 routed MoE, `MAMBA_RATIO=0.4`, GSM8K
+All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`, GSM8K
 prompts and 8192 output tokens (one timed batch after a warmup). Besides the knobs below, a config
 sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
 
@@ -54,8 +54,8 @@ printed in the slurm log and written to `<exp dir>/host`.
 
 ```bash
 sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch.sh
-# Super v3, for evals: prefix caching, and chat responses without prompt token ids
-sbatch --export=ALL,EXP_NAME=eval,MODEL=superv3,PREFIX_CACHING=1,EVAL_MODE=1 inference-bench/server/launch.sh
+# Super v3, for evals: chat responses without prompt token ids
+sbatch --export=ALL,EXP_NAME=eval,MODEL=superv3,EVAL_MODE=1 inference-bench/server/launch.sh
 # Ultra v3 (~1.1 TB of weights) on 2 nodes, TP8 x EP8; --segment keeps both nodes in one NVLink
 # domain, which the cross-node TP8 multicast collectives need
 sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra,MODEL=ultrav3 inference-bench/server/launch.sh
@@ -76,8 +76,9 @@ All knobs are environment variables passed with `sbatch --export=ALL,KNOB=value,
 | `ETP` | expert tensor parallel size; EP = world / ETP | 1 |
 | `DISPATCHER` | MoE EP dispatcher: `nccl` \| `nvls` \| `nvl_a2a` | `nvls` |
 | `COMBINE_PRECISION` | MoE combine buffer: `fp32` \| `bf16` (`nvl_a2a` needs `bf16`) | `fp32` |
+| `GEMM_BACKEND` | routed-expert grouped GEMM: `trtllm_bf16_routed` \| `vllm` \| `flashinfer` \| `torch` | `trtllm_bf16_routed` |
 | `ASYNC` | 1 = async scheduling | 1 |
-| `PREFIX_CACHING` | 1 = prefix caching with LRU eviction | 0 |
+| `PREFIX_CACHING` | 1 = prefix caching with LRU eviction | 1 |
 | `SAMPLING` | sampling backend: `flashinfer` \| `torch` | `flashinfer` |
 | `MAX_TOKENS` | max tokens per engine step (chunked-prefill budget) | 8192 |
 | `MAX_REQUESTS` | max concurrent requests; unset = derived from the buffer | unset |
@@ -101,7 +102,7 @@ All knobs are environment variables passed with `sbatch --export=ALL,KNOB=value,
 Ultra v3 (~1.1 TB of bf16 weights) needs 2 nodes. At TP8 x EP8 the weights take ~140 GB of each
 GPU's ~184 GiB, so memory is tight:
 
-- With `PREFIX_CACHING=1`, use `BUFFER_GB=20,MAMBA_PREFIX_GB=20` (25/25 runs out of memory
+- With prefix caching (the default), use `BUFFER_GB=20,MAMBA_PREFIX_GB=20` (25/25 runs out of memory
   allocating the Mamba prefix cache), and keep `MAX_TOKENS=CUDA_GRAPH_MAX_TOKENS=2048`.
 - `PROMPT_LOGPROBS=0` (the default) is required: materializing every prompt token's logits
   runs the TP8 logits all-gather out of memory.
@@ -109,8 +110,8 @@ GPU's ~184 GiB, so memory is tight:
   run in waves, so decode sweeps above batch 48 do not measure a single batch.
 
 ```bash
-# serve (evals): prefix caching on
-sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_eval,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,CUDA_GRAPH_MAX_TOKENS=2048,PREFIX_CACHING=1,BUFFER_GB=20,MAMBA_PREFIX_GB=20 inference-bench/server/launch.sh
+# serve (evals)
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_eval,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,CUDA_GRAPH_MAX_TOKENS=2048,BUFFER_GB=20,MAMBA_PREFIX_GB=20 inference-bench/server/launch.sh
 
 # prefill sweep: one request per step, exact prompt lengths up to the 2048-token step budget
 sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_prefill,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,CUDA_GRAPH_MAX_TOKENS=2048,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS="512 1024 2048",BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=5 inference-bench/server/launch.sh

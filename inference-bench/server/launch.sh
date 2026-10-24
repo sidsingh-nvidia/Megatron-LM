@@ -30,9 +30,9 @@
 #   DISPATCHER         MoE EP dispatcher: nccl | nvls | nvl_a2a     (default: nvls)
 #   COMBINE_PRECISION  MoE combine precision: fp32 | bf16           (default: fp32)
 #   GEMM_BACKEND       routed-expert grouped GEMM: vllm | trtllm_bf16_routed | flashinfer | torch
-#                      (default: vllm)
+#                      (default: trtllm_bf16_routed)
 #   ASYNC              1 = async scheduling                         (default: 1)
-#   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 0)
+#   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 1)
 #   SAMPLING           sampling backend: flashinfer | torch         (default: flashinfer)
 #   MAX_REQUESTS       --inference-dynamic-batching-max-requests    (default: unset)
 #   MAX_TOKENS         max tokens per engine step (chunked-prefill budget)  (default: 8192)
@@ -129,7 +129,7 @@ ARGS=(
     --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
     --moe-grouped-gemm --moe-shared-expert-overlap
-    --inference-grouped-gemm-backend "${GEMM_BACKEND:-vllm}"
+    --inference-grouped-gemm-backend "${GEMM_BACKEND:-trtllm_bf16_routed}"
     --inference-use-synchronous-zmq-collectives
     --model-provider mamba
     --dist-ckpt-strictness log_unexpected
@@ -197,7 +197,7 @@ superv3)
 esac
 ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}}")
 [ "${ASYNC:-1}" == "1" ] && ARGS+=(--inference-dynamic-batching-async-sched-mode async)
-[ "${PREFIX_CACHING:-0}" == "1" ] && ARGS+=(
+[ "${PREFIX_CACHING:-1}" == "1" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching
     --inference-dynamic-batching-prefix-caching-eviction-policy lru
     --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}"
@@ -221,8 +221,8 @@ EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
-DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-vllm}
-ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-0} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-}
+DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
+ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
