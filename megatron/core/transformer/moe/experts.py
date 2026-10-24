@@ -48,6 +48,7 @@ from megatron.core.transformer.moe.paged_stash import (
     paged_stash_group_start,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    DeepEPDispatcher,
     InferenceAllGatherDispatcherBase,
     NVLSAllGatherVDispatcher,
 )
@@ -1303,6 +1304,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         # Both NVLink dispatchers combine out of the shared NVLS RSV buffer.
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
+        # DeepEP delivers local expert ids and combines out of its own bf16 buffer.
+        self._deepep_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
         # TRT-LLM BlockMajorK copies of the expert weights, built with the concatenated ones.
         self._trtllm_fc1_weight: Optional[torch.Tensor] = None
@@ -1630,7 +1633,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
-        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        if self._deepep_dispatcher:
+            # DeepEP's routing map holds local expert ids, and its combine reads the output
+            # from the dispatcher's bf16 buffer (None at EP=1).
+            local_expert_start = 0
+            out = DeepEPDispatcher._get_combine_input()
+        else:
+            local_expert_start = self.ep_group.rank() * self.num_local_experts
+            out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
         output = vllm_fused_moe(
             hidden_states,
             probs,
@@ -1641,7 +1651,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             local_expert_start=local_expert_start,
             valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
-            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            out=out,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
         )

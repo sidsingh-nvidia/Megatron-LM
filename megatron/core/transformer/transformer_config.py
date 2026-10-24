@@ -1424,7 +1424,7 @@ class TransformerConfig(ModelParallelConfig):
     the NVLS inference dispatcher and EP > 1.
     """
 
-    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls', 'nvl_a2a'] = 'nvls'
+    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls', 'nvl_a2a', 'deepep'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
       decode-only CUDA graphs (forced automatically).
@@ -1435,14 +1435,24 @@ class TransformerConfig(ModelParallelConfig):
       outputs from those ranks. Needs the same hardware as 'nvls' (routing ids and probs
       are still multicast), but uses no in-switch reduction. Requires
       inference_moe_combine_precision='bf16' and expert_tensor_parallel_size == 1.
+    - 'deepep': DeepEP (>= 2.5) dispatch/combine over NVLink, in its non-expand layout:
+      each rank receives a compact list of the tokens routed to it. Requires DeepEP and
+      NCCL >= 2.32.3, an EP group inside one NVLink domain, inference_grouped_gemm_backend
+      'vllm' with BF16 experts, inference_moe_combine_precision='bf16', and an MoE hidden
+      size (moe_latent_size or hidden_size) that is a multiple of 256.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     inference_moe_combine_precision: Literal['fp32', 'bf16'] = 'fp32'
-    """Precision of the expert outputs that the 'nvls' and 'nvl_a2a' dispatchers sum across
-    EP ranks. 'bf16' halves the combine traffic and symmetric-buffer memory, at the cost of
-    rounding each rank's partial output to bf16 before the cross-rank sum. 'bf16' is
-    required by 'nvl_a2a', and is not supported by the torch grouped-GEMM backend, by MXFP8
-    experts on the vLLM backend, or in batch_invariant_mode."""
+    """Precision of the expert outputs that the 'nvls', 'nvl_a2a' and 'deepep' dispatchers
+    sum across EP ranks. 'bf16' halves the combine traffic and symmetric-buffer memory, at
+    the cost of rounding each rank's partial output to bf16 before the cross-rank sum. 'bf16'
+    is required by 'nvl_a2a' and 'deepep', and is not supported by the torch grouped-GEMM
+    backend, by MXFP8 experts on the vLLM backend, or in batch_invariant_mode."""
+
+    inference_deepep_num_sms: Optional[int] = None
+    """SMs used by DeepEP's dispatch and combine kernels with
+    inference_moe_token_dispatcher_type='deepep'. None uses DeepEP's bandwidth-based
+    estimate. Each distinct value JIT-compiles its own kernels."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -2069,11 +2079,54 @@ class TransformerConfig(ModelParallelConfig):
                         "expert tensor parallelism; set expert_tensor_parallel_size=1."
                     )
 
+            if self.inference_moe_token_dispatcher_type == "deepep":
+                # The expert output must land token-major in the dispatcher's bf16 buffer,
+                # which only the vLLM BF16 path writes.
+                if (
+                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM
+                    or mxfp8_enabled
+                ):
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='deepep' supports only "
+                        "inference_grouped_gemm_backend='vllm' with BF16 experts."
+                    )
+                if self.inference_moe_combine_precision != "bf16":
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='deepep' requires "
+                        "inference_moe_combine_precision='bf16': DeepEP sums bf16 per-rank "
+                        "partial outputs."
+                    )
+                moe_hidden_size = self.moe_latent_size or self.hidden_size
+                if moe_hidden_size % 256 != 0:
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='deepep' requires the MoE hidden "
+                        "size (moe_latent_size or hidden_size) to be a multiple of 256, as "
+                        f"DeepEP's combine kernels do; got {moe_hidden_size}."
+                    )
+                if self.moe_router_topk > 32:
+                    raise ValueError(
+                        "inference_moe_token_dispatcher_type='deepep' supports "
+                        f"moe_router_topk <= 32, got {self.moe_router_topk}."
+                    )
+
+            if self.inference_deepep_num_sms is not None:
+                if self.inference_moe_token_dispatcher_type != "deepep":
+                    raise ValueError(
+                        "inference_deepep_num_sms applies only to "
+                        "inference_moe_token_dispatcher_type='deepep'."
+                    )
+                if self.inference_deepep_num_sms <= 0:
+                    raise ValueError(
+                        "inference_deepep_num_sms must be > 0, got "
+                        f"{self.inference_deepep_num_sms}."
+                    )
+
             if self.inference_moe_combine_precision == "bf16":
                 if self.inference_moe_token_dispatcher_type == "nccl":
                     raise ValueError(
-                        "inference_moe_combine_precision='bf16' applies only to the 'nvls' and "
-                        "'nvl_a2a' dispatchers, got inference_moe_token_dispatcher_type='nccl'."
+                        "inference_moe_combine_precision='bf16' applies only to the 'nvls', "
+                        "'nvl_a2a' and 'deepep' dispatchers, got "
+                        "inference_moe_token_dispatcher_type='nccl'."
                     )
                 # These run mcore_fused_moe, which accumulates the combine buffer with fp32
                 # atomics.

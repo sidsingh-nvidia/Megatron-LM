@@ -51,6 +51,7 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    DeepEPDispatcher,
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
@@ -821,6 +822,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The MoE dispatchers scatter each step's tokens over the TP group.
         self._moe_sp_size = tp_size
 
+        # are we using the DeepEP inference dispatcher? Like the NVLink dispatchers it takes
+        # variable token counts per rank and masks CUDA-graph padding rows, but it has its
+        # own buffers.
+        self._deepep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.inference_moe_token_dispatcher_type == 'deepep'
+        )
+
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
@@ -903,6 +912,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     else torch.float32
                 ),
             )
+        elif self._deepep_dispatcher:
+            DeepEPDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                topk=model_config.moe_router_topk,
+                hidden_size=model_config.moe_latent_size or model_config.hidden_size,
+                num_experts=model_config.num_moe_experts,
+                ep_group=self.expert_model_parallel_group,
+                num_sms=model_config.inference_deepep_num_sms,
+            )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
         # inside CUDA graph capture; one buffer set is shared by all MoE layers
@@ -914,7 +932,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-            # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
+            # Worst-case rows entering the MoE: the fixed NVLS AGV / DeepEP receive height
             # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
             moe_max_rows = max(
                 self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
@@ -967,9 +985,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
         # so it can mask out CUDA-graph padding tokens during routing. The
         # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
+        # each step by transfer_bookkeeping_to_gpu(). NVLS/DeepEP only — the NCCL
+        # dispatcher requires equal token counts across ranks already. DeepEPDispatcher
+        # inherits the tensor from the NVLS class.
+        if self._nvls_dispatcher or self._deepep_dispatcher:
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
