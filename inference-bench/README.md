@@ -5,7 +5,12 @@ Nemotron MoE models, built to compare the MoE expert-parallel dispatchers (`nvls
 
 - `server/launch.sh`: one sbatch script that serves nano-3.5 or Super v3 on one 4-GPU node (Ultra v3
   on two) and, optionally, runs a throughput sweep or an nsys profile inside the same job.
-- `server/client.py`: the in-job sweep client (stdlib HTTP plus HF `datasets` / `transformers`).
+- `run.sh` + `configs/`: submit a server and its client from one run config (see "Run configs").
+- `server/steady_client.py`: the steady-state MATH client (closed-loop load at fixed concurrency,
+  throughput from the server's `/metrics`); see "Steady-state MATH workflow".
+- `server/client.py`: the GSM8K smoke sweep (fixed output length with `ignore_eos`).
+- `server/sanity.py`: greedy prompts with checkable answers against a running server.
+- `analysis/plot_pareto.py`: throughput vs interactivity Pareto plot from `steady.jsonl`.
 - `convert/convert_ultra_tp8ep8.sh`: Megatron Bridge HF -> mcore conversion of Nemotron 3 Ultra
   (2 nodes, TP8 x EP8).
 
@@ -45,20 +50,87 @@ inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env GEMM_BACKEN
 
 All four use the defaults (`nvls`, TRT-LLM BF16 routed MoE, async scheduling, prefix caching) plus bf16 combine and `MAMBA_RATIO=0.4`. Besides the knobs below, a config sets `NODES` (multi-node servers also get `--segment NODES`), and optionally `QOS` and `TIME`.
 
-The client (`server/client.sh`, `CLIENT=steady` by default) runs `server/steady_client.py`: for each
-concurrency level in `BENCH` (ascending, no draining between levels), that many workers keep one
-request each in flight on the math blend (AIME 2025 + HMMT Feb 2025 + BeyondAIME), with natural EOS
-(no output cap unless `MAX_GEN_TOKENS` is set, so long-running requests stay in the mix) and
-server-default sampling. After `STEADY_WARMUP` (60 s) it
-measures for `STEADY_WINDOW` (300 s): output throughput from the server's `/metrics` counters (exact
-to an engine step, summed over DP engines) and per-user tokens/s from the requests that finished in
-the window. Results: `<exp dir>/steady.jsonl`. `CLIENT=smoke` runs the old GSM8K sweep (`client.py`,
-fixed `BENCH_OSL` with `ignore_eos`), as `configs/nanov3p5_smoke.env` does.
+The client is the steady-state MATH workflow below; `configs/nanov3p5_smoke.env` instead runs the
+GSM8K smoke sweep (`CLIENT=smoke`).
 
-The server exposes `GET /metrics` (Prometheus text): lifetime counters `mcore:generation_tokens_total`,
-`mcore:prompt_tokens_total`, `mcore:prompt_tokens_cached_total`, `mcore:requests_finished_total`,
-`mcore:engine_steps_total`, and gauges `mcore:requests_{running,paused,waiting}`, per DP engine and
-summed.
+## Steady-state MATH workflow
+
+Measures a throughput vs interactivity Pareto under realistic reasoning load: at each concurrency
+level `c`, `c` closed-loop users each keep one request in flight, sending the next problem as soon as
+the previous answer arrives. Prompts are the math blend (AIME 2025 + HMMT Feb 2025 + BeyondAIME, 160
+competition problems, chat template with reasoning on); outputs end at the model's own EOS with
+server-default sampling and no output cap, so 100k-token answers stay in the mix (Super v3: median
+~19k, p90 ~100k output tokens; see `REPORT.md`).
+
+**1. Run.** From the repo root, with `cluster.env` filled in (see "Setup"):
+
+```bash
+# a paper config: server + client, the client starts when the server is up
+inference-bench/run.sh inference-bench/configs/superv3_narrow_ep.env
+# any model / knob from the command line; e.g. a quick nano Pareto
+inference-bench/run.sh inference-bench/configs/nanov3p5_smoke.env CLIENT=steady \
+    BENCH="1 2 4 8 16 32 64 128 256" STEADY_WARMUP=30 STEADY_WINDOW=180 TIME=1:00:00 \
+    EXP_NAME=nano_steady_pareto
+```
+
+`run.sh` prints the server and client job ids. The client waits for the server (`<exp dir>/host`),
+runs every level, writes the results and then touches `<exp dir>/done`, which shuts the server down.
+
+**2. What each level does.** Levels run in ascending order without draining: going from `c1` to
+`c2` starts `c2 - c1` more users, and requests in flight carry over. Each level warms up for
+`STEADY_WARMUP` seconds, then measures for `STEADY_WINDOW` seconds:
+- output (and prompt / prefix-cached prompt) throughput: the difference of two `GET /metrics`
+  scrapes at the window edges, divided by its length. The counters are summed over every DP engine
+  and exact to an engine step;
+- interactivity: per request, TPOT = end-to-end latency / output tokens over the requests that
+  finished inside the window; time to first token is included, since the user waits for it.
+  Tokens/s/user = 1000 / TPOT, reported at the median and at p90 TPOT (the slow tail).
+
+The server's `GET /metrics` (Prometheus text) has lifetime counters
+`mcore:generation_tokens_total`, `mcore:prompt_tokens_total`, `mcore:prompt_tokens_cached_total`,
+`mcore:requests_finished_total`, `mcore:engine_steps_total` and gauges
+`mcore:requests_{running,paused,waiting}`, per DP engine (`engine=` label) and summed; any client
+can scrape it, e.g. `curl http://<host>:5000/metrics`.
+
+**3. Results.** `<exp dir>/steady.jsonl`, one line per level: `output_tok_s`, `prompt_tok_s`,
+`cached_prompt_tok_s`, `tpot_ms_{p50,mean,p90,p99}`, `user_tok_s_p50`, `user_tok_s_p90_slow`,
+`client_finished`, `output_tokens_p50`, `requests_finished`, `engine_steps`, `running_at_end`,
+`waiting_at_end`, `truncated`, `errors`, and `output_tok_s_over_c` (a cross-check: close to the
+median per-user rate when every user is always decoding). `bench.log` has the same per level.
+
+**4. Plot.**
+
+```bash
+python3 inference-bench/analysis/plot_pareto.py \
+    "nvls=inference-bench/experiments/<run A>" "DeepEP=inference-bench/experiments/<run B>" \
+    --title "Super v3, TP4 x EP4" --out inference-bench/analysis/pareto.png
+```
+
+x = median tokens/s per user (whisker to p90), y = output tokens/s per GPU (GPU count from the run's
+`NODES`, or `label=run:gpus`); one point per level, labelled with `c`.
+
+**Knobs** (environment, or `KEY=VALUE` after the config on the `run.sh` line):
+
+| Knob | Meaning | Default |
+|---|---|---|
+| `BENCH` | concurrency levels (total in-flight requests across all GPUs) | per config |
+| `STEADY_WARMUP` | seconds per level before measuring | 60 |
+| `STEADY_WINDOW` | measured seconds per level | 300 |
+| `MAX_GEN_TOKENS` | output cap; 0 = none (natural EOS) | 0 |
+| `CLIENT` | `steady` (this workflow) or `smoke` (GSM8K sweep) | `steady` |
+
+**Things to check and tune:**
+- Total time is about levels x (warmup + window) plus server startup (~6 min on Super with
+  2048-token CUDA graphs); set `TIME` to cover it.
+- Low levels finish few requests per window, because each answer takes minutes: if
+  `client_finished` is in the single digits, lengthen `STEADY_WINDOW`. Throughput does not depend
+  on finished requests.
+- Interactivity only sees requests that finish inside the window, which leans toward shorter
+  answers; throughput counts every token.
+- `waiting_at_end > 0` means the level exceeds the engine's request capacity (`max_requests`, or the
+  KV / Mamba buffers), so users queue and interactivity includes queueing time.
+- The client is closed-loop with one thread per user; it runs on its own node so it does not share
+  CPUs with the server.
 
 ## Serving
 
