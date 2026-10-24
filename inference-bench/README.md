@@ -101,7 +101,9 @@ can scrape it, e.g. `curl http://<host>:5000/metrics`.
 `waiting_at_end`, `truncated`, `errors`, and `output_tok_s_over_c` (a cross-check: close to the
 median per-user rate when every user is always decoding). `bench.log` has the same per level.
 
-**4. Plot.**
+**4. Plot.** Plots use the PSSG style library
+([pssgplot](https://github.com/hpcgroup/pssg-plots)); install a clone in editable mode so it finds
+its bundled Gill Sans font: `git clone https://github.com/hpcgroup/pssg-plots && pip install -e pssg-plots/`.
 
 ```bash
 python3 inference-bench/analysis/plot_pareto.py \
