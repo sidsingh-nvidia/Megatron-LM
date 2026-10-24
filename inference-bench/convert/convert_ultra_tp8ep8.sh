@@ -4,11 +4,11 @@
 # TP=8, EP=8, PP=1, ETP=1 over 2 GB200 nodes x 4 GPUs.
 #
 # Cluster-specific settings (slurm account/partition/QoS, container image, HF cache and output
-# paths) come from moe-bench/cluster.env; copy cluster.env.example and fill it in.
+# paths) come from inference-bench/cluster.env; copy cluster.env.example and fill it in.
 #
 # Submit from the repo root:
-#   source moe-bench/cluster.env
-#   sbatch moe-bench/convert/convert_ultra_tp8ep8.sh
+#   source inference-bench/cluster.env
+#   sbatch inference-bench/convert/convert_ultra_tp8ep8.sh
 #
 #SBATCH -J convert-ultra-tp8ep8
 #SBATCH -N 2
@@ -17,14 +17,14 @@
 #SBATCH -t 4:00:00
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH -o moe-bench/convert/convert_ultra_tp8ep8_%j.log
-#SBATCH -e moe-bench/convert/convert_ultra_tp8ep8_%j.log
+#SBATCH -o inference-bench/convert/convert_ultra_tp8ep8_%j.log
+#SBATCH -e inference-bench/convert/convert_ultra_tp8ep8_%j.log
 
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
-source "${MOE_BENCH_CONFIG:-moe-bench/cluster.env}"
-CONTAINER=${MOE_BENCH_CONVERT_IMAGE:?set in cluster.env}
+source "${INFERENCE_BENCH_CONFIG:-inference-bench/cluster.env}"
+CONTAINER=${INFERENCE_BENCH_CONVERT_IMAGE:?set in cluster.env}
 OUT=${ULTRA_MCORE_OUT:?set in cluster.env}
 # The cached snapshot of the HF checkpoint (download it into HF_HOME first).
 HF_REPO=${HF_HOME:?set in cluster.env}/hub/models--nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
@@ -55,7 +55,7 @@ echo "dst=${OUT}"
 # the Bridge worker uses them directly (it calls torch.cuda.set_device(LOCAL_RANK)
 # and init_process_group(backend="nccl") with env:// rendezvous).
 srun --container-image="${CONTAINER}" \
-     --container-mounts="${MOE_BENCH_MOUNTS:?set in cluster.env}" \
+     --container-mounts="${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
      --kill-on-bad-exit=1 \
      bash -c '
 set -euo pipefail
