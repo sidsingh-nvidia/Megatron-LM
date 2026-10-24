@@ -357,11 +357,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     # CUDA-graph padding tokens. Wired once by the context after gpu_view init.
     _real_token_count_tensor: Optional[torch.Tensor] = None
 
-    # Host-known bound on this step's gathered rows when the step runs eager on every EP
-    # rank: the EP-wide sum of local rows from the context's EP consensus. None on graphed
-    # steps, where every rank runs the same graph and local rows x EP is the bound. Only
-    # set when the grouped-GEMM backend needs a tight bound (TRT-LLM routed MoE).
-    _host_eager_rows_bound: Optional[int] = None
+    # Host-known bound on this step's gathered rows, set by the context's EP consensus when
+    # the grouped-GEMM backend needs one (TRT-LLM routed MoE): the EP-wide sum of local rows
+    # when every rank runs eager, or the largest CUDA-graph token count x EP on loose-bound
+    # graphs (ranks may run graphs of different sizes). None on tight-bound decode graphs,
+    # where every rank runs the same graph and local rows x EP is the bound.
+    _host_rows_bound: Optional[int] = None
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32,
@@ -391,9 +392,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._real_token_count_tensor = tensor
 
     @classmethod
-    def set_host_eager_rows_bound(cls, rows: Optional[int]) -> None:
-        """Set the EP-wide gathered-row bound for an eager step (None for graphed steps)."""
-        cls._host_eager_rows_bound = rows
+    def set_host_rows_bound(cls, rows: Optional[int]) -> None:
+        """Set this step's EP-wide gathered-row bound (None: local rows x EP)."""
+        cls._host_rows_bound = rows
 
     @classmethod
     def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
@@ -544,8 +545,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """
         cls = NVLSAllGatherVDispatcher
         host_rows = local_tokens * self.ep_size
-        if cls._host_eager_rows_bound is not None:
-            host_rows = cls._host_eager_rows_bound
+        if cls._host_rows_bound is not None:
+            host_rows = cls._host_rows_bound
         host_rows = min(host_rows, cls._per_rank_worst_case_token_count * self.ep_size)
         # TRT-LLM BF16 gathers packed routing into its own buffer (no -1 fill; see allocate_buffers).
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -1065,11 +1066,11 @@ class DeepEPDispatcher(NVLSAllGatherVDispatcher):
         There is no per-step metadata kernel: DeepEP exchanges token counts inside every
         dispatch, because the number of tokens each rank receives depends on the routing.
         A rank receives each token at most once, so the EP-wide token sum bounds its rows:
-        local rows x EP on graphed steps, the EP-consensus sum on eager TRT-LLM BF16 steps.
+        local rows x EP on tight-bound decode graphs, otherwise the context's override.
         """
         host_rows = local_tokens * self.ep_size
-        if NVLSAllGatherVDispatcher._host_eager_rows_bound is not None:
-            host_rows = NVLSAllGatherVDispatcher._host_eager_rows_bound
+        if NVLSAllGatherVDispatcher._host_rows_bound is not None:
+            host_rows = NVLSAllGatherVDispatcher._host_rows_bound
         host_rows = min(host_rows, DeepEPDispatcher._num_max_tokens_per_rank * self.ep_size)
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = host_rows
 

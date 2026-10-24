@@ -33,6 +33,11 @@ class InferenceBatchDimensions:
         token_count : number of total input tokens
         prefill_req_count : number of prefill requests
         decode_req_count : number of decode requests
+        loose_moe_row_bound : CUDA graphs of the TRT-LLM BF16 routed MoE under EP only. The
+            graph bounds the MoE's gathered rows by the largest CUDA-graph token count x EP,
+            which holds whatever graph each EP rank runs, instead of by its own token count
+            x EP, which holds only when every rank runs a graph of the same size. Decode
+            graphs are captured with both bounds, mixed and prefill graphs with the loose one.
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
@@ -42,12 +47,16 @@ class InferenceBatchDimensions:
     token_count: int = 0
     prefill_req_count: int = 0
     decode_req_count: int = 0
+    loose_moe_row_bound: bool = False
 
     def __str__(self):
         """
         Returns a string representation of the batch dimensions.
         """
-        return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
+        loose = " (loose MoE bound)" if self.loose_moe_row_bound else ""
+        return (
+            f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D{loose}"
+        )
 
     def is_applicable_for_batch_dim(
         self, real_batch_dim: "InferenceBatchDimensions", strict: bool = False
@@ -126,7 +135,14 @@ class InferenceBatchDimensions:
         Returns a hash of the batch dimension.
         In cuda graph quick matching, the batch dimension is used as a key in a dictionary.
         """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
+        return hash(
+            (
+                self.token_count,
+                self.prefill_req_count,
+                self.decode_req_count,
+                self.loose_moe_row_bound,
+            )
+        )
 
     def __eq__(self, other: "InferenceBatchDimensions") -> bool:
         """
@@ -134,10 +150,16 @@ class InferenceBatchDimensions:
         """
         if other is None:
             return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
+        return (
+            self.token_count,
+            self.prefill_req_count,
+            self.decode_req_count,
+            self.loose_moe_row_bound,
+        ) == (
             other.token_count,
             other.prefill_req_count,
             other.decode_req_count,
+            other.loose_moe_row_bound,
         )
 
     @property
@@ -213,38 +235,52 @@ class InferenceBatchDimensions:
         return adjusted_batch_dim
 
     @staticmethod
-    def sync_ep_batch_dims_with_token_sum(
+    def sync_ep_moe_row_bound_state(
         local_batch_dims,
+        local_has_graph: bool,
         local_eager_token_count: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
-    ) -> Tuple[Optional["InferenceBatchDimensions"], int]:
-        """adjust_batch_dims_for_expert_parallelism plus an EP-wide token SUM.
+    ) -> Tuple[int, bool, bool, int]:
+        """EP consensus for the TRT-LLM BF16 routed MoE, whose kernel needs a host-side bound
+        on the rows the dispatcher gathers. One round trip reduces:
 
-        Same MAX consensus (None when any EP rank has a prefill, i.e. all ranks run
-        eager), and in the same round trip SUMs each rank's local_eager_token_count:
-        the tokens the rank would pad to if this step runs eager. When the step runs
-        eager on every rank, that sum bounds the rows the MoE dispatcher gathers,
-        which a decode-only rank cannot know from its own token count.
+        - MAX token count: the decode graph every rank pads to when all ranks decode;
+        - whether any rank has a prefill (non-decode) step;
+        - whether any rank has no CUDA graph for its step (it would run eager);
+        - SUM of the tokens each rank pads to if eager: the bound when every rank runs eager.
+
+        Args:
+            local_batch_dims: this rank's real batch dimensions.
+            local_has_graph: whether a loose-bound CUDA graph fits this rank's step.
+            local_eager_token_count: tokens this rank pads to if the step runs eager.
 
         Returns:
-            (adjusted batch dims or None, EP-wide sum of local_eager_token_count).
+            (max token count, any rank non-decode, any rank without a graph, eager token sum).
         """
-        ep_size = get_pg_size(ep_group)
-        if ep_size <= 1:
-            return local_batch_dims, local_eager_token_count
-
         is_non_decode = int(local_batch_dims.prefill_req_count > 0)
+        no_graph = int(not local_has_graph)
+        if get_pg_size(ep_group) <= 1:
+            return (
+                local_batch_dims.token_count,
+                bool(is_non_decode),
+                bool(no_graph),
+                local_eager_token_count,
+            )
+
         if ep_zmq_communicator is not None:
-            (max_token_count, max_is_non_decode), (eager_token_sum,) = (
+            (max_token_count, any_non_decode, any_no_graph), (eager_token_sum,) = (
                 ep_zmq_communicator.sync_all_reduce_max_and_sum(
-                    (local_batch_dims.token_count, is_non_decode), (local_eager_token_count,)
+                    (local_batch_dims.token_count, is_non_decode, no_graph),
+                    (local_eager_token_count,),
                 )
             )
         else:
             device = torch.cuda.current_device()
             max_tensor = torch.tensor(
-                [local_batch_dims.token_count, is_non_decode], dtype=torch.int32, device=device
+                [local_batch_dims.token_count, is_non_decode, no_graph],
+                dtype=torch.int32,
+                device=device,
             )
             sum_tensor = torch.tensor([local_eager_token_count], dtype=torch.int64, device=device)
             torch.distributed.all_reduce(
@@ -253,17 +289,9 @@ class InferenceBatchDimensions:
             torch.distributed.all_reduce(
                 sum_tensor, op=torch.distributed.ReduceOp.SUM, group=ep_group
             )
-            max_token_count, max_is_non_decode = max_tensor.tolist()
+            max_token_count, any_non_decode, any_no_graph = max_tensor.tolist()
             eager_token_sum = int(sum_tensor.item())
-
-        if max_is_non_decode == 1:
-            return None, eager_token_sum
-        adjusted_batch_dim = InferenceBatchDimensions(
-            token_count=max_token_count,
-            prefill_req_count=local_batch_dims.prefill_req_count,
-            decode_req_count=local_batch_dims.decode_req_count,
-        )
-        return adjusted_batch_dim, eager_token_sum
+        return max_token_count, bool(any_non_decode), bool(any_no_graph), eager_token_sum
 
 
 def _batch_invariant_token_align(token_count: int) -> int:

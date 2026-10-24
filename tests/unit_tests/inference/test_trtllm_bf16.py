@@ -107,17 +107,14 @@ class _FakeZmq:
     """Reduces the local values with fixed peer values, like the EP leader would."""
 
     def __init__(self, peers):
-        self.peers = peers  # list of (token_count, is_non_decode, eager_tokens)
+        self.peers = peers  # list of (token_count, is_non_decode, no_graph, eager_tokens)
 
     def sync_all_reduce_max_and_sum(self, max_vals, sum_vals):
         rows = [(*max_vals, *sum_vals)] + self.peers
-        return (
-            (max(r[0] for r in rows), max(r[1] for r in rows)),
-            (sum(r[2] for r in rows),),
-        )
+        return tuple(max(r[i] for r in rows) for i in range(3)), (sum(r[3] for r in rows),)
 
 
-class TestEpTokenSumConsensus:
+class TestEpMoeRowBoundConsensus:
 
     @pytest.fixture(autouse=True)
     def _group_size(self, monkeypatch):
@@ -126,25 +123,33 @@ class TestEpTokenSumConsensus:
 
         monkeypatch.setattr(batch_dimensions_utils, "get_pg_size", lambda g: g.size())
 
-    def test_all_decode_uses_max_and_sums(self):
+    def test_all_decode_reduces_max_and_sum(self):
         local = InferenceBatchDimensions(token_count=5, prefill_req_count=0, decode_req_count=5)
-        zmq = _FakeZmq([(9, 0, 64), (3, 0, 64), (1, 0, 64)])
-        dims, total = InferenceBatchDimensions.sync_ep_batch_dims_with_token_sum(
-            local, 64, ep_group=_FakeGroup(4), ep_zmq_communicator=zmq
+        zmq = _FakeZmq([(9, 0, 0, 64), (3, 0, 0, 64), (1, 0, 0, 64)])
+        state = InferenceBatchDimensions.sync_ep_moe_row_bound_state(
+            local, True, 64, ep_group=_FakeGroup(4), ep_zmq_communicator=zmq
         )
-        assert dims.token_count == 9 and dims.decode_req_count == 5 and total == 256
+        assert state == (9, False, False, 256)
 
-    def test_any_prefill_goes_eager_with_sum(self):
+    def test_prefill_with_graphs_everywhere(self):
         local = InferenceBatchDimensions(token_count=5, prefill_req_count=0, decode_req_count=5)
-        zmq = _FakeZmq([(4096, 1, 4096), (3, 0, 64)])
-        dims, total = InferenceBatchDimensions.sync_ep_batch_dims_with_token_sum(
-            local, 64, ep_group=_FakeGroup(3), ep_zmq_communicator=zmq
+        zmq = _FakeZmq([(256, 1, 0, 256), (3, 0, 0, 64)])
+        state = InferenceBatchDimensions.sync_ep_moe_row_bound_state(
+            local, True, 64, ep_group=_FakeGroup(3), ep_zmq_communicator=zmq
         )
-        assert dims is None and total == 4096 + 128
+        assert state == (256, True, False, 256 + 128)
+
+    def test_any_rank_without_graph(self):
+        local = InferenceBatchDimensions(token_count=5, prefill_req_count=0, decode_req_count=5)
+        zmq = _FakeZmq([(4096, 1, 1, 4096), (3, 0, 0, 64)])
+        state = InferenceBatchDimensions.sync_ep_moe_row_bound_state(
+            local, True, 64, ep_group=_FakeGroup(3), ep_zmq_communicator=zmq
+        )
+        assert state == (4096, True, True, 4096 + 128)
 
     def test_ep1_is_local(self):
         local = InferenceBatchDimensions(token_count=5, prefill_req_count=1, decode_req_count=4)
-        dims, total = InferenceBatchDimensions.sync_ep_batch_dims_with_token_sum(
-            local, 64, ep_group=_FakeGroup(1)
+        state = InferenceBatchDimensions.sync_ep_moe_row_bound_state(
+            local, False, 64, ep_group=_FakeGroup(1)
         )
-        assert dims is local and total == 64
+        assert state == (5, True, True, 64)
