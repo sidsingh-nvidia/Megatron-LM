@@ -42,6 +42,7 @@ import torch.distributed as dist
 from megatron.core.inference.communication.torch_symm_triton import (
     a2a_combine_v,
     a2a_dispatch_v,
+    a2a_dispatch_v_2tensor,
     multimem_all_gatherv_2tensor,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
@@ -709,6 +710,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls = self.__class__
         agv_h, agv_pk = cls._symm_agv_hidden, cls._symm_agv_packed
         assert agv_pk is not None, "packed-routing AGV buffer not allocated"
+        self._dispatch_collective_packed(agv_h, agv_pk, hidden_states, packed)
+        global_max = self._per_rank_worst_case_token_count * self.ep_size
+        self.routing_map = agv_pk["tensor"].view(global_max, self.topk)
+        return agv_h["tensor"].view(global_max, hidden_states.shape[1]), probs
+
+    def _dispatch_collective_packed(self, agv_h, agv_pk, hidden_states, packed):
+        """AllGather-V the local hidden states and packed routing into the [global_max, *]
+        symmetric buffers."""
         multimem_all_gatherv_2tensor(
             agv_h["tensor"],
             agv_pk["tensor"],
@@ -720,9 +729,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
         )
-        global_max = self._per_rank_worst_case_token_count * self.ep_size
-        self.routing_map = agv_pk["tensor"].view(global_max, self.topk)
-        return agv_h["tensor"].view(global_max, hidden_states.shape[1]), probs
 
     def _dispatch_collective(self, agv_h, agv_r, agv_p, hidden_states, probs):
         """AllGather-V the local hidden states, routing map and probs into the
@@ -822,7 +828,8 @@ class NVLAllToAllVDispatcher(NVLSAllGatherVDispatcher):
 
     Same buffers, step metadata and token layout as NVLSAllGatherVDispatcher, but:
       - dispatch sends each hidden row only to the ranks that hold one of the token's
-        experts (routing ids and probs are still multicast to every rank), and
+        experts (routing ids and probs, or the packed TRT-LLM routing, are still multicast to
+        every rank), and
       - combine pulls each local token's bf16 partial outputs from those ranks and sums
         them in fp32 in a fixed order, instead of an NVLS in-switch reduce-scatter.
 
@@ -853,6 +860,26 @@ class NVLAllToAllVDispatcher(NVLSAllGatherVDispatcher):
             agv_h["handle"],
             agv_r["handle"],
             agv_p["handle"],
+            rank_token_offset=self._rank_token_offset(),
+            ep_max_tokens=self._ep_max_tokens(),
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            num_local_experts=self.num_local_experts,
+        )
+
+    def _dispatch_collective_packed(self, agv_h, agv_pk, hidden_states, packed):
+        """All-to-all-V the local hidden states; multicast the packed routing (TRT-LLM BF16).
+
+        Combine walks the packed routing too, so CUDA-graph padding rows (expert -1) pull
+        nothing.
+        """
+        self._local_routing_map = packed
+        a2a_dispatch_v_2tensor(
+            agv_h["tensor"],
+            agv_pk["tensor"],
+            hidden_states,
+            packed,
+            agv_h["handle"],
+            agv_pk["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,

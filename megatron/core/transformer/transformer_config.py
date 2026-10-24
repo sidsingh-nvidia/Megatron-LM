@@ -2039,11 +2039,6 @@ class TransformerConfig(ModelParallelConfig):
                         "inference_grouped_gemm_backend='trtllm_bf16_routed' supports BF16 "
                         "experts only; use 'flashinfer' for MXFP8."
                     )
-                if self.inference_moe_token_dispatcher_type == "nvl_a2a":
-                    raise ValueError(
-                        "inference_grouped_gemm_backend='trtllm_bf16_routed' supports the "
-                        "'nvls', 'nccl' and 'deepep' dispatchers, not 'nvl_a2a'."
-                    )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:

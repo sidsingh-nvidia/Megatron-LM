@@ -35,6 +35,8 @@ cannot overwrite its partials before every source finished pulling (next dispatc
 
 from unittest.mock import MagicMock
 
+from typing import Optional
+
 import torch
 
 from megatron.core.utils import null_decorator
@@ -118,13 +120,17 @@ def _f32_to_bf16x2(lo, hi):
 @triton.jit
 def _next_destination(
     routing_ids, token_offset, sent, K: tl.constexpr, TOPK: tl.constexpr,
-    NUM_LOCAL_EXPERTS: tl.constexpr,
+    NUM_LOCAL_EXPERTS: tl.constexpr, PACKED: tl.constexpr,
 ):
     """Top-k entry K of a token -> (dst_rank, first_entry_for_dst, updated sent bitmask).
 
-    The -1 test must be on the expert id: -1 // NUM_LOCAL_EXPERTS truncates to 0 (rank 0).
+    With PACKED, routing_ids holds TRT-LLM's int32 (expert id << 16 | bf16 prob); the
+    arithmetic shift keeps expert -1 negative. The -1 test must be on the expert id:
+    -1 // NUM_LOCAL_EXPERTS truncates to 0 (rank 0).
     """
     expert = tl.load(routing_ids + token_offset * TOPK + K)
+    if PACKED:
+        expert = expert >> 16
     valid = expert >= 0
     dst = tl.where(valid, expert // NUM_LOCAL_EXPERTS, 0)
     first = valid & (((sent >> dst) & 1) == 0)
@@ -184,6 +190,7 @@ def _a2a_dispatch_v_kernel(
     ROUTING_BITS: tl.constexpr,
     PROBS_PACKS: tl.constexpr,
     PROBS_BITS: tl.constexpr,
+    PACKED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -202,6 +209,8 @@ def _a2a_dispatch_v_kernel(
         rank_token_offset_ptr / ep_max_tokens_ptr: per-step metadata (see AGV-V).
         HIDDEN_PACKS: 16-byte packs per hidden row.
         ROUTING_PACKS / PROBS_PACKS: packs per routing / probs row, of ROUTING_BITS / PROBS_BITS.
+        PACKED: routing is TRT-LLM's packed int32 (id << 16 | bf16 prob), which carries the
+            probs, so there is no probs tensor to multicast.
         BLOCK_SIZE: threads per CTA (>= every *_PACKS up to the 1024 cap; wider rows loop).
     """
     pid = tl.program_id(axis=0)
@@ -221,7 +230,10 @@ def _a2a_dispatch_v_kernel(
 
     hidden_u64 = hidden_ptr.to(tl.pointer_type(tl.uint64))
     peer_table = hidden_peer_ptrs.to(tl.pointer_type(tl.uint64))
-    routing_ids = routing_ptr.to(tl.pointer_type(tl.int64))
+    if PACKED:
+        routing_ids = routing_ptr.to(tl.pointer_type(tl.int32))
+    else:
+        routing_ids = routing_ptr.to(tl.pointer_type(tl.int64))
 
     tid = tl.arange(0, BLOCK_SIZE)
     rank_token_offset = tl.load(rank_token_offset_ptr)
@@ -240,7 +252,7 @@ def _a2a_dispatch_v_kernel(
             sent = tl.full((), 0, tl.int64)
             for k in tl.static_range(TOPK):
                 dst, first, sent = _next_destination(
-                    routing_ids, token_offset, sent, k, TOPK, NUM_LOCAL_EXPERTS
+                    routing_ids, token_offset, sent, k, TOPK, NUM_LOCAL_EXPERTS, PACKED
                 )
                 peer = tl.load(peer_table + dst).to(tl.pointer_type(tl.uint64))
                 st_128(
@@ -256,10 +268,11 @@ def _a2a_dispatch_v_kernel(
             routing_ptr, routing_mc_ptr, routing_byte_offset, token_offset, global_row, tid,
             ROUTING_PACKS, ROUTING_BITS, BLOCK_SIZE,
         )
-        _multicast_row(
-            probs_ptr, probs_mc_ptr, probs_byte_offset, token_offset, global_row, tid,
-            PROBS_PACKS, PROBS_BITS, BLOCK_SIZE,
-        )
+        if not PACKED:
+            _multicast_row(
+                probs_ptr, probs_mc_ptr, probs_byte_offset, token_offset, global_row, tid,
+                PROBS_PACKS, PROBS_BITS, BLOCK_SIZE,
+            )
 
     # The release in the barrier covers this CTA's unicast and multicast stores.
     sync_threads()
@@ -286,6 +299,7 @@ def _a2a_combine_v_kernel(
     HIDDEN_PACKS: tl.constexpr,
     TOPK: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
+    PACKED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -297,8 +311,9 @@ def _a2a_combine_v_kernel(
         partial_peer_ptrs: device array of WORLD_SIZE uint64 base addresses of every rank's bf16
             partial-output buffer [global_max, HIDDEN_PACKS * 8] (the handle's buffer_ptrs_dev).
         partial_byte_offset: byte offset of the partial tensor inside its symmetric buffer.
-        routing_ptr: this rank's LOCAL routing [local_tokens, TOPK] int64, used to recompute
-            which ranks each token was dispatched to.
+        routing_ptr: this rank's LOCAL routing [local_tokens, TOPK] as passed to dispatch
+            (int64 ids, or packed int32 with PACKED), used to recompute which ranks each token
+            was dispatched to.
         signal_pad_ptrs: signal pads of the partial buffer.
         HIDDEN_PACKS: 16-byte packs (8 bf16) per row.
     """
@@ -327,7 +342,10 @@ def _a2a_combine_v_kernel(
 
     output_u64 = output_ptr.to(tl.pointer_type(tl.uint64))
     peer_table = partial_peer_ptrs.to(tl.pointer_type(tl.uint64))
-    routing_ids = routing_ptr.to(tl.pointer_type(tl.int64))
+    if PACKED:
+        routing_ids = routing_ptr.to(tl.pointer_type(tl.int32))
+    else:
+        routing_ids = routing_ptr.to(tl.pointer_type(tl.int64))
 
     tid = tl.arange(0, BLOCK_SIZE)
     rank_token_offset = tl.load(rank_token_offset_ptr)
@@ -351,7 +369,7 @@ def _a2a_combine_v_kernel(
             # Fixed per-token order (top-k entry order of first occurrences): deterministic.
             for k in tl.static_range(TOPK):
                 dst, first, sent = _next_destination(
-                    routing_ids, token_offset, sent, k, TOPK, NUM_LOCAL_EXPERTS
+                    routing_ids, token_offset, sent, k, TOPK, NUM_LOCAL_EXPERTS, PACKED
                 )
                 peer = tl.load(peer_table + dst).to(tl.pointer_type(tl.uint64))
                 (x, y, z, w) = _ld_128_or_zero(
@@ -391,13 +409,13 @@ def _row_params(t: torch.Tensor):
 def a2a_dispatch_v(
     output_hidden: torch.Tensor,
     output_routing: torch.Tensor,
-    output_probs: torch.Tensor,
+    output_probs: Optional[torch.Tensor],
     input_hidden: torch.Tensor,
     input_routing: torch.Tensor,
-    input_probs: torch.Tensor,
+    input_probs: Optional[torch.Tensor],
     symm_mem_hdl_hidden: _SymmetricMemory,
     symm_mem_hdl_routing: _SymmetricMemory,
-    symm_mem_hdl_probs: _SymmetricMemory,
+    symm_mem_hdl_probs: Optional[_SymmetricMemory],
     rank_token_offset: torch.Tensor,
     ep_max_tokens: torch.Tensor,
     per_rank_max_tokens: int,
@@ -414,14 +432,24 @@ def a2a_dispatch_v(
         output_hidden / output_routing / output_probs: symmetric receive buffers
             [global_tokens, *]. Hidden rows with no local expert are left untouched (holes).
         input_hidden: local [local_tokens, hidden] (16-byte rows, e.g. bf16 with hidden % 8 == 0).
-        input_routing: local [local_tokens, topk] int64 expert ids (-1 = no expert).
-        input_probs: local [local_tokens, topk] probs.
+        input_routing: local [local_tokens, topk] int64 expert ids (-1 = no expert), or TRT-LLM's
+            packed int32 (id << 16 | bf16 prob) when there are no probs.
+        input_probs: local [local_tokens, topk] probs; None (with output_probs and
+            symm_mem_hdl_probs) for packed routing.
         symm_mem_hdl_*: symmetric memory handles of the three receive buffers (same EP group).
         rank_token_offset / ep_max_tokens: per-step metadata tensors (see AGV-V).
         per_rank_max_tokens: static; grid = min(per_rank_max_tokens, max_num_blocks).
         num_local_experts: experts per rank; dst rank = expert_id // num_local_experts.
     """
     assert HAVE_TRITON, "Triton is required for a2a_dispatch_v."
+    packed = input_probs is None
+    if packed:
+        # The probs arguments of the kernel are unused; alias the routing ones.
+        output_probs, input_probs, symm_mem_hdl_probs = (
+            output_routing,
+            input_routing,
+            symm_mem_hdl_routing,
+        )
     for name, inp, out in (
         ("hidden", input_hidden, output_hidden),
         ("routing", input_routing, output_routing),
@@ -432,7 +460,9 @@ def a2a_dispatch_v(
         assert inp.is_contiguous(), f"{name}: input must be contiguous"
     local_tokens = input_hidden.shape[0]
     assert input_routing.shape[0] == local_tokens and input_probs.shape[0] == local_tokens
-    assert input_routing.dtype == torch.int64, "routing ids must be int64"
+    assert input_routing.dtype == (
+        torch.int32 if packed else torch.int64
+    ), "routing must be int64 ids, or packed int32 without probs"
     assert input_routing.shape == input_probs.shape, "routing and probs must both be [n, topk]"
     assert is_device_nvls_capable(input_hidden.device), "needs a Hopper+ GPU with NVLink"
     assert (
@@ -480,12 +510,47 @@ def a2a_dispatch_v(
         ROUTING_BITS=routing_bits,
         PROBS_PACKS=probs_packs,
         PROBS_BITS=probs_bits,
+        PACKED=packed,
         BLOCK_SIZE=block_size,
         RANK=symm_mem_hdl_hidden.rank,
         WORLD_SIZE=world_size,
         num_warps=num_warps,
     )
-    return output_hidden, output_routing, output_probs
+    return output_hidden, output_routing, (None if packed else output_probs)
+
+
+def a2a_dispatch_v_2tensor(
+    output_hidden: torch.Tensor,
+    output_packed: torch.Tensor,
+    input_hidden: torch.Tensor,
+    input_packed: torch.Tensor,
+    symm_mem_hdl_hidden: _SymmetricMemory,
+    symm_mem_hdl_packed: _SymmetricMemory,
+    rank_token_offset: torch.Tensor,
+    ep_max_tokens: torch.Tensor,
+    per_rank_max_tokens: int,
+    num_local_experts: int,
+    **kwargs,
+):
+    """a2a_dispatch_v for the TRT-LLM BF16 path: unicast hidden rows, multicast the packed
+    int32 routing (expert id << 16 | bf16 prob; see pack_routing), which carries the probs."""
+    output_hidden, output_packed, _ = a2a_dispatch_v(
+        output_hidden,
+        output_packed,
+        None,
+        input_hidden,
+        input_packed,
+        None,
+        symm_mem_hdl_hidden,
+        symm_mem_hdl_packed,
+        None,
+        rank_token_offset,
+        ep_max_tokens,
+        per_rank_max_tokens,
+        num_local_experts,
+        **kwargs,
+    )
+    return output_hidden, output_packed
 
 
 def a2a_combine_v(
@@ -508,7 +573,8 @@ def a2a_combine_v(
         partial: symmetric [global_tokens, hidden] bf16 partial-output buffer; on each rank only
             rows with a local expert are read.
         symm_mem_hdl_partial: symmetric memory handle of `partial`.
-        routing: this rank's local [local_tokens, topk] int64 routing (as passed to dispatch).
+        routing: this rank's local [local_tokens, topk] routing as passed to dispatch: int64
+            ids, or packed int32 (a2a_dispatch_v_2tensor).
         rank_token_offset / ep_max_tokens / per_rank_max_tokens / num_local_experts: as dispatch.
     """
     assert HAVE_TRITON, "Triton is required for a2a_combine_v."
@@ -516,7 +582,7 @@ def a2a_combine_v(
     assert output.dtype == partial.dtype == torch.bfloat16, "combine supports bf16 partials only"
     assert output.shape[1] == partial.shape[1], "output / partial hidden mismatch"
     assert output.is_contiguous() and routing.is_contiguous()
-    assert routing.dtype == torch.int64 and routing.shape[0] == output.shape[0]
+    assert routing.dtype in (torch.int64, torch.int32) and routing.shape[0] == output.shape[0]
     assert is_device_nvls_capable(output.device), "needs a Hopper+ GPU with NVLink"
     world_size = symm_mem_hdl_partial.world_size
     assert world_size <= _MAX_WORLD_SIZE, f"world size {world_size} > {_MAX_WORLD_SIZE}"
@@ -541,6 +607,7 @@ def a2a_combine_v(
         HIDDEN_PACKS=hidden_packs,
         TOPK=routing.shape[1],
         NUM_LOCAL_EXPERTS=num_local_experts,
+        PACKED=routing.dtype == torch.int32,
         BLOCK_SIZE=block_size,
         RANK=symm_mem_hdl_partial.rank,
         WORLD_SIZE=world_size,
