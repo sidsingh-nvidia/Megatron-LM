@@ -5,39 +5,51 @@
 #
 # Serve Nemotron nano-3.5, Super v3 or Ultra v3 with the mcore dynamic inference server
 # (4 GPUs per node). nano-3.5 and Super v3 fit on one node; Ultra v3 needs `sbatch -N 2`.
+# Multi-node jobs must sit in one NVLink (NVL72) domain for the NVLS / symmetric-memory dispatch:
+# pass `--segment <N>` with `-N <N>` (otherwise Slurm may split the nodes across racks and the
+# symmetric-memory init fails with "CUDA driver error: invalid resource handle").
 #
 # Cluster-specific settings (slurm account/partition/QoS, container image, checkpoint and HF
-# cache paths) come from moe-bench/cluster.env; copy cluster.env.example and fill it in.
+# cache paths) come from inference-bench/cluster.env; copy cluster.env.example and fill it in.
 #
 # Run from the Megatron-LM repo root:
-#   source moe-bench/cluster.env
-#   sbatch moe-bench/server/launch.sh
-#   sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 moe-bench/server/launch.sh
+#   source inference-bench/cluster.env
+#   sbatch inference-bench/server/launch.sh
+#   sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch.sh
 #
 # Knobs (environment variables):
 #   EXP_NAME           run label                                    (default: run)
 #   MODEL              nanov3p5 | superv3 | ultrav3                 (default: nanov3p5)
 #   TP                 tensor parallel size; data parallel = world / TP   (default: 4; ultrav3: 8)
-#   ETP                expert tensor parallel size; EP = world / ETP     (default: 1)
+#   ETP                expert tensor parallel size                      (default: 1)
+#   EP                 expert parallel size; experts are replicated over world / (EP x ETP)
+#                      expert-data-parallel copies, so EP < world / ETP keeps a copy per group of
+#                      EP x ETP GPUs (narrow EP)                         (default: world / ETP)
 #   BUFFER_GB          dynamic-batching KV/state buffer per GPU   (default: 50; ultrav3: 25)
+#   MAMBA_RATIO        fraction of BUFFER_GB for live Mamba states; with ~100 MB of state per
+#                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
 #   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1
 #                      (default: 50; ultrav3: 25)
 #   DISPATCHER         MoE EP dispatcher: nccl | nvls | nvl_a2a     (default: nvls)
 #   COMBINE_PRECISION  MoE combine precision: fp32 | bf16           (default: fp32)
+#   GEMM_BACKEND       routed-expert grouped GEMM: vllm | trtllm_bf16_routed | flashinfer | torch
+#                      (default: trtllm_bf16_routed)
 #   ASYNC              1 = async scheduling                         (default: 1)
-#   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 0)
+#   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 1)
 #   SAMPLING           sampling backend: flashinfer | torch         (default: flashinfer)
 #   MAX_REQUESTS       --inference-dynamic-batching-max-requests    (default: unset)
 #   MAX_TOKENS         max tokens per engine step (chunked-prefill budget)  (default: 8192)
-#   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs (server default: 512;
-#                      set it to MAX_TOKENS so prefill steps are graphed too)
+#   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs, so prefill / mixed steps up
+#                      to it are graphed too (default: 2048; the server's own default is 512)
 #   LOG_INTERVAL       engine step-log interval; 1 = log every step  (default: 1000)
 #   EVAL_MODE          1 = --eval-mode: chat responses skip echoing prompt token IDs, which
 #                      speeds up evals with long contexts             (default: 1)
 #   PROMPT_LOGPROBS    1 = materialize logits for every prompt token so /v1/completions can
 #                      return prompt log-probs (echo + logprobs); costs memory (default: 0)
 #   BENCH              batch sizes for the in-job client, e.g. "1 16 64". When set, the job
-#                      runs the sweep and exits; when unset, it serves until the time limit.
+#                      runs the sweep and exits; when unset, it serves until the time limit or
+#                      until <exp dir>/done appears. The in-job client shares rank 0's CPUs with
+#                      the server; for clean timings run the sweep from server/client.sh instead.
 #   BENCH_DATASET      gsm8k (~100-token questions) | sharegpt (repo-root
 #                      sharegpt_filtered_benchmark.json, <= 1024 tokens)   (default: gsm8k)
 #   BENCH_MIN_ISL      sharegpt only: keep prompts with >= this many tokens (default: 0)
@@ -50,25 +62,28 @@
 #                      client wrap the timed iterations of the first BENCH batch size in
 #                      /start_profile + /stop_profile; the server exits when profiling stops.
 #                      Traces: <exp dir>/trace_rank<r>.nsys-rep            (default: 0)
+#   PROFILE_ALL        with PROFILE=1: warm every BENCH batch size first, then profile the timed
+#                      iterations of ALL batch sizes in one capture              (default: 0)
+#   BENCH_PAUSE        seconds idle between batch sizes, to tell them apart in a trace (default: 0)
 #   Prefill-heavy runs: BENCH_OSL=1 with BENCH_DATASET=sharegpt BENCH_MIN_ISL=512, or BENCH_ISL=2048.
 #
-# Output: moe-bench/experiments/<timestamp>_<EXP_NAME>/ with config.env, server_rank*.log and,
+# Output: inference-bench/experiments/<timestamp>_<EXP_NAME>/ with config.env, server_rank*.log and,
 # with BENCH, bench.log + bench.json. The server listens on port 5000 (OpenAI API at /v1).
 
-SCRIPT=moe-bench/server/launch.sh
+SCRIPT=inference-bench/server/launch.sh
 
 # ── Outer: inside sbatch, launch one task per GPU in the container ─────────────
-if [ -z "${MOE_BENCH_INNER:-}" ]; then
+if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     cd "${SLURM_SUBMIT_DIR:-$PWD}"
     # Exported settings reach the ranks through srun's environment.
-    source "${MOE_BENCH_CONFIG:-moe-bench/cluster.env}"
-    export EXP_DIR="moe-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}"
+    source "${INFERENCE_BENCH_CONFIG:-inference-bench/cluster.env}"
+    export EXP_DIR="inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}"
     mkdir -p "${EXP_DIR}"
     echo "Experiment directory: ${EXP_DIR}"
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
     cp "${SCRIPT}" "${EXP_DIR}/launch.sh"
-    export MOE_BENCH_INNER=1
+    export INFERENCE_BENCH_INNER=1
     NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
     if [ "${MODEL:-nanov3p5}" == "ultrav3" ] && [ "${NUM_NODES}" -lt 2 ]; then
         echo "MODEL=ultrav3 needs at least 2 nodes (sbatch -N 2)"
@@ -76,8 +91,9 @@ if [ -z "${MOE_BENCH_INNER:-}" ]; then
     fi
     # One task per GPU on every node; global rank 0 hosts the HTTP server.
     srun -l -N "${NUM_NODES}" -n $((4 * NUM_NODES)) --ntasks-per-node 4 --cpus-per-task 36 \
-        --container-image "${MOE_BENCH_SERVE_IMAGE:?set in cluster.env}" \
-        --container-mounts "${MOE_BENCH_MOUNTS:?set in cluster.env}" \
+        --container-image "${INFERENCE_BENCH_SERVE_IMAGE:?set in cluster.env}" \
+        --container-name "inference_bench_${SLURM_JOB_ID}" \
+        --container-mounts "${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
         --container-workdir="${PWD}" bash "${EXP_DIR}/launch.sh"
     exit $?
 fi
@@ -93,14 +109,18 @@ export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache_${RANK}
 # Ultra v3 runs TP8 x EP8 on 2 nodes; the others default to TP4.
 if [ "${MODEL:-nanov3p5}" == "ultrav3" ]; then TP=${TP:-8}; else TP=${TP:-4}; fi
 ETP=${ETP:-1}
-EP=$((WORLD_SIZE / ETP))
+EP=${EP:-$((WORLD_SIZE / ETP))}
+if (( WORLD_SIZE % (EP * ETP) )); then
+    echo "EP x ETP = $((EP * ETP)) must divide the world size ${WORLD_SIZE}"
+    exit 1
+fi
 
 ARGS=(
     --micro-batch-size 1 --bf16 --te-rng-tracker --inference-rng-tracker
     --inference-dynamic-batching
     --inference-dynamic-batching-unified-memory-level 0
     --inference-dynamic-batching-max-tokens "${MAX_TOKENS:-8192}"
-    --inference-dynamic-batching-mamba-memory-ratio 0.1
+    --inference-dynamic-batching-mamba-memory-ratio "${MAMBA_RATIO:-0.1}"
     --inference-dynamic-batching-num-cuda-graphs -1
     --inference-dynamic-batching-sampling-backend "${SAMPLING:-flashinfer}"
     --inference-logging-step-interval "${LOG_INTERVAL:-1000}"
@@ -116,7 +136,7 @@ ARGS=(
     --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
     --moe-grouped-gemm --moe-shared-expert-overlap
-    --inference-grouped-gemm-backend vllm
+    --inference-grouped-gemm-backend "${GEMM_BACKEND:-trtllm_bf16_routed}"
     --inference-use-synchronous-zmq-collectives
     --model-provider mamba
     --dist-ckpt-strictness log_unexpected
@@ -184,7 +204,7 @@ superv3)
 esac
 ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}}")
 [ "${ASYNC:-1}" == "1" ] && ARGS+=(--inference-dynamic-batching-async-sched-mode async)
-[ "${PREFIX_CACHING:-0}" == "1" ] && ARGS+=(
+[ "${PREFIX_CACHING:-1}" == "1" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching
     --inference-dynamic-batching-prefix-caching-eviction-policy lru
     --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}"
@@ -194,16 +214,22 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 # The server returns log-probs by default, which materializes logits for every prompt token
 # (gathered across TP); skip prompt log-probs so only each request's last-token logits are kept.
 [ "${PROMPT_LOGPROBS:-0}" == "1" ] || ARGS+=(--skip-prompt-log-probs)
-[ -n "${CUDA_GRAPH_MAX_TOKENS:-}" ] && ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS}")
+ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
 
-LOG="${EXP_DIR}/server_rank${RANK}.log"
+# Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
+# Copied to EXP_DIR as server_rank<N>.log when the rank exits, including on failure.
+# The log lives in the container's /tmp; to follow it live:
+#   srun --jobid <id> --overlap --container-name inference_bench_<id> tail -f /tmp/inference_bench_server_rank0_<id>.log
+LOG="/tmp/inference_bench_server_rank${RANK}_${SLURM_JOB_ID:-local}.log"
+trap 'cp "${LOG}" "${EXP_DIR}/server_rank${RANK}.log" 2>/dev/null' EXIT
 if [ "${RANK}" == "0" ]; then
     cat > "${EXP_DIR}/config.env" <<EOF
 EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
-MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}
-DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32}
-ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-0} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-}
+TOKENIZER=${TOKENIZER}
+MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
+DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
+ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
@@ -219,19 +245,22 @@ fi
 "${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
-if [ "${RANK}" != "0" ]; then
-    # Under PROFILE the server shuts itself down when profiling stops; killing it early would
-    # cut off nsys while it writes the report.
-    if [ -n "${BENCH:-}" ] && [ "${PROFILE:-0}" != "1" ]; then
-        # Exit when rank 0 finishes the sweep (or the server dies).
-        while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
-        kill "${SERVER_PID}" 2>/dev/null
+# Serve until <exp dir>/done appears (written by the in-job sweep or by client.sh) or the server
+# dies. Under PROFILE the server shuts itself down when profiling stops; killing it early would
+# cut off nsys while it writes the report.
+serve_until_done() {
+    if [ "${PROFILE:-0}" == "1" ]; then
         wait "${SERVER_PID}"
         exit 0
     fi
+    while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
+    kill "${SERVER_PID}" 2>/dev/null
+    # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
     wait "${SERVER_PID}"
     exit 0
-fi
+}
+
+[ "${RANK}" != "0" ] && serve_until_done
 
 # Rank 0: wait for the server, then either run the client sweep or keep serving.
 until grep -q "Running on http://0.0.0.0:5000" "${LOG}" 2>/dev/null; do
@@ -247,7 +276,7 @@ echo "Server reachable at: http://$(hostname):5000/v1"
 hostname > "${EXP_DIR}/host"
 
 if [ -n "${BENCH:-}" ]; then
-    python3 -u moe-bench/server/client.py \
+    python3 -u inference-bench/server/client.py \
         --server http://localhost:5000 \
         --batch-sizes ${BENCH} \
         --dataset "${BENCH_DATASET:-gsm8k}" \
@@ -258,15 +287,9 @@ if [ -n "${BENCH:-}" ]; then
         --iters "${BENCH_ITERS:-3}" \
         --warmup "${BENCH_WARMUP:-1}" \
         --out "${EXP_DIR}/bench.json" \
-        $([ "${PROFILE:-0}" == "1" ] && echo --profile) 2>&1 | tee "${EXP_DIR}/bench.log"
+        --pause "${BENCH_PAUSE:-0}" \
+        $([ "${PROFILE:-0}" == "1" ] && { [ "${PROFILE_ALL:-0}" == "1" ] && echo --profile-all || echo --profile; }) \
+        2>&1 | tee "${EXP_DIR}/bench.log"
     touch "${EXP_DIR}/done"
-    if [ "${PROFILE:-0}" == "1" ]; then
-        wait "${SERVER_PID}"
-        exit 0
-    fi
-    kill "${SERVER_PID}"
-    # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
-    wait "${SERVER_PID}"
-    exit 0
 fi
-wait "${SERVER_PID}"
+serve_until_done

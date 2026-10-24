@@ -20,7 +20,7 @@ Prefill-heavy runs: combine a long prompt setting with --osl 1.
 /stop_profile (for a server launched under nsys with --capture-range=cudaProfilerApi), then
 stops: with --capture-range-end=stop-shutdown the server exits once profiling stops.
 
-    python3 moe-bench/server/client.py --server http://localhost:5000 \
+    python3 inference-bench/server/client.py --server http://localhost:5000 \
         --batch-sizes 1 16 64 --osl 1024 --iters 3 --warmup 1 --out bench.json
 """
 
@@ -85,8 +85,9 @@ def complete(server, prompt, osl, timeout):
     start = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read())
+    end = time.time()
     usage = body["usage"]
-    return time.time() - start, usage["prompt_tokens"], usage["completion_tokens"]
+    return end - start, usage["prompt_tokens"], usage["completion_tokens"], start, end
 
 
 def post(server, path):
@@ -112,6 +113,9 @@ def run_batch(server, prompts, osl, timeout):
         "ms_per_output_token": 1000 * wall / osl,
         "p50_latency_s": statistics.median(latencies),
         "p99_latency_s": latencies[int(0.99 * (len(latencies) - 1))],
+        # Absolute (epoch) batch and per-request send/receive times, to line up with server logs.
+        "start_time": start,
+        "requests": [[round(r[3], 3), round(r[4], 3)] for r in results],
     }
 
 
@@ -131,6 +135,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--out", required=True)
     parser.add_argument("--profile", action="store_true", help="profile the first batch size only")
+    parser.add_argument(
+        "--profile-all",
+        action="store_true",
+        help="run every batch size's warmup first, then profile all timed iterations in one "
+        "capture, with --pause seconds of idle between batch sizes to tell them apart",
+    )
+    parser.add_argument("--pause", type=float, default=0.0, help="seconds idle between batch sizes")
     args = parser.parse_args()
 
     questions = load_prompts(args.dataset, args.isl, args.min_isl, args.sharegpt_path)
@@ -145,20 +156,40 @@ def main():
     cursor = 0
     summary = []
     done = False
+
+    def next_prompts(isl, bs):
+        nonlocal cursor
+        if isl is None:
+            prompts = [questions[(cursor + j) % len(questions)] for j in range(bs)]
+            cursor += bs
+        else:
+            prompts = [stream[cursor + j * isl : cursor + (j + 1) * isl] for j in range(bs)]
+            cursor += bs * isl
+        return prompts
+
+    if args.profile_all:
+        # Warm every batch size up front so the capture holds only timed iterations.
+        for isl in isls:
+            for bs in args.batch_sizes:
+                for _ in range(args.warmup):
+                    run_batch(args.server, next_prompts(isl, bs), args.osl, args.timeout)
+        time.sleep(args.pause)
+        print(f"start_profile: {post(args.server, '/start_profile')}", flush=True)
+        time.sleep(2)  # the start signal reaches the engines asynchronously
+    first = True
     for isl in isls:
         for bs in args.batch_sizes:
+            if args.profile_all and not first:
+                time.sleep(args.pause)
+            first = False
+            print(f"{time.time():.3f} start isl={isl} bs={bs}", flush=True)
             timed = []
-            for i in range(args.warmup + args.iters):
+            # --profile-all already ran the warmups up front.
+            for i in range(args.warmup if args.profile_all else 0, args.warmup + args.iters):
                 if args.profile and i == args.warmup:
                     print(f"start_profile: {post(args.server, '/start_profile')}", flush=True)
                     time.sleep(2)  # the start signal reaches the engines asynchronously
-                if isl is None:
-                    prompts = [questions[(cursor + j) % len(questions)] for j in range(bs)]
-                    cursor += bs
-                else:
-                    prompts = [stream[cursor + j * isl : cursor + (j + 1) * isl] for j in range(bs)]
-                    cursor += bs * isl
-                stats = run_batch(args.server, prompts, args.osl, args.timeout)
+                stats = run_batch(args.server, next_prompts(isl, bs), args.osl, args.timeout)
                 if i >= args.warmup:
                     timed.append(stats)
             if args.profile:
@@ -192,6 +223,9 @@ def main():
                 break
         if done:
             break
+    if args.profile_all:
+        time.sleep(1)
+        print(f"stop_profile: {post(args.server, '/stop_profile')}", flush=True)
     with open(args.out, "w") as f:
         json.dump(summary, f, indent=2)
 
