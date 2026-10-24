@@ -2,7 +2,7 @@
 
 One point per concurrency level: x = median tokens/s per user (1000 / median TPOT, TTFT
 included), y = output tokens/s per GPU (from the server's /metrics over the window). A thin
-whisker reaches left to the p90 TPOT (the slow tail). Up and to the right is better. GPUs per
+whisker reaches left to the p90 TPOT (the slow tail); --label-c labels points with c. Up and to the right is better. GPUs per
 run come from NODES in the run's config.env (4 GPUs per node) unless given as label=run:gpus.
 
 Needs pssgplot (https://github.com/hpcgroup/pssg-plots); install a clone in editable mode so it
@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--figsize", type=float, nargs=2, default=(5, 3.5))
+    ap.add_argument("--label-c", action="store_true", help="label each point with its concurrency")
     args = ap.parse_args()
 
     df = pd.DataFrame([row for spec in args.runs for row in load(spec)])
@@ -81,11 +82,12 @@ def main():
             ax.plot(sub["user_tok_s"], sub["tok_s_gpu"], color=color, marker=marker, linestyle=ls,
                     markeredgewidth=0, label=text, zorder=3)
             for _, r in sub.iterrows():
-                # Whisker to the p90 TPOT (the slow tail), and the concurrency.
+                # Whisker to the p90 TPOT (the slow tail), and optionally the concurrency.
                 ax.plot([r["user_tok_s_p90"], r["user_tok_s"]], [r["tok_s_gpu"]] * 2,
                         color=color, linewidth=1, alpha=0.6)
-                ax.annotate(f"{r['c']}", (r["user_tok_s"], r["tok_s_gpu"]), textcoords="offset points",
-                            xytext=(5, 4), fontsize=7, color=color)
+                if args.label_c:
+                    ax.annotate(f"{r['c']}", (r["user_tok_s"], r["tok_s_gpu"]),
+                                textcoords="offset points", xytext=(5, 4), fontsize=7, color=color)
         # PSSG axis style (as pssgplot's LinePlot), with headroom so edge points are not clipped.
         ax.set_xlim(0, 1.1 * df["user_tok_s"].max())
         ax.set_ylim(0, 1.12 * df["tok_s_gpu"].max())
