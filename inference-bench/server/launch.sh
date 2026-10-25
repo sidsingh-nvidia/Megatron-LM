@@ -242,8 +242,18 @@ if [ "${PROFILE:-0}" == "1" ]; then
          --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown
          --force-overwrite true -o "${EXP_DIR}/trace_rank${RANK}")
 fi
-"${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
+# Own process group: the server spawns its HTTP frontends as separate processes, which a
+# signal to the server alone leaves running (still bound to port 5000, where they would take
+# a share of the next server's requests and forward them to a coordinator that is gone).
+setsid "${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
+# For external cleanup (e.g. a wrapper that times the rank out): kill -- -<pid> stops it all.
+echo "${SERVER_PID}" > "${EXP_DIR}/server_pid_${RANK}"
+stop_server() {
+    kill -TERM -- "-${SERVER_PID}" 2>/dev/null
+    wait "${SERVER_PID}" 2>/dev/null
+}
+trap 'stop_server; cp "${LOG}" "${EXP_DIR}/server_rank${RANK}.log" 2>/dev/null' EXIT
 
 # Serve until <exp dir>/done appears (written by the in-job sweep or by client.sh) or the server
 # dies. Under PROFILE the server shuts itself down when profiling stops; killing it early would
@@ -254,16 +264,22 @@ serve_until_done() {
         exit 0
     fi
     while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
-    kill "${SERVER_PID}" 2>/dev/null
     # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
-    wait "${SERVER_PID}"
+    stop_server
     exit 0
 }
 
 [ "${RANK}" != "0" ] && serve_until_done
 
-# Rank 0: wait for the server, then either run the client sweep or keep serving.
-until grep -q "Running on http://0.0.0.0:5000" "${LOG}" 2>/dev/null; do
+# Rank 0: wait for the server, then either run the client sweep or keep serving. The server
+# starts several HTTP frontend replicas one after another; wait for all of them, since a
+# request sent while later replicas are still starting can stall or be lost.
+server_ready() {
+    local want
+    want=$(grep -o "Starting [0-9]* HTTP frontend replica" "${LOG}" 2>/dev/null | grep -o "[0-9]*")
+    [ -n "${want}" ] && [ "$(grep -c "\[INFO\] Running on http://0.0.0.0:5000" "${LOG}")" -ge "${want}" ]
+}
+until server_ready; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         echo "Server exited during startup; see ${LOG}"
         touch "${EXP_DIR}/done"
