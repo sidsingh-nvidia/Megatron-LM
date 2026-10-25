@@ -205,6 +205,65 @@ class TestComputeLocalTokensPerExpert:
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         assert result.sum().item() == local_mask.sum().item()
 
+    @staticmethod
+    def _bincount_ref(routing_map, valid, start, num_local):
+        ids = routing_map[:valid].flatten() - start
+        ids = ids[(ids >= 0) & (ids < num_local)]
+        return torch.bincount(ids, minlength=num_local).to(torch.int32)
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    @pytest.mark.parametrize(
+        "num_local,start",
+        [(512, 0), (128, 256), (32, 64), (8, 504), (1, 7)],  # EP=1, 4, 16, 64 and 512
+    )
+    @pytest.mark.parametrize("compact", [False, True])
+    def test_large_layouts(self, persistent, num_local, start, compact):
+        """e2e-sized inputs: every global row with global ids (AG/RS, A2A), or only the rows
+        with a local expert, local ids and -1 elsewhere (DeepEP); padding rows all -1."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        torch.manual_seed(0)
+        max_tokens, topk, num_experts, valid = 20000, 22, 512, 19113
+        routing_map = torch.rand(max_tokens, num_experts, device="cuda").topk(topk).indices
+        routing_map[::9] = -1
+        if compact:
+            is_local = (routing_map >= start) & (routing_map < start + num_local)
+            rows = routing_map[is_local.any(dim=1)]
+            rows = torch.where((rows >= start) & (rows < start + num_local), rows - start, -1)
+            routing_map = torch.full_like(routing_map, -1)
+            routing_map[: rows.shape[0]] = rows
+            valid, start = min(valid, rows.shape[0]), 0
+        result = compute_local_tokens_per_expert(
+            routing_map, start, num_local, _vt(valid), persistent=persistent
+        )
+        assert torch.equal(result, self._bincount_ref(routing_map, valid, start, num_local))
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"BLOCK_SIZE": 256, "programs_per_sm": 1, "num_warps": 4},
+            {"BLOCK_SIZE": 4096, "programs_per_sm": 16, "num_warps": 8},
+        ],
+    )
+    def test_persistent_counts_independent_of_launch_config(self, config):
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        torch.manual_seed(1)
+        routing_map = torch.randint(-1, 512, (7777, 22), device="cuda")
+        args = (routing_map, 40, 8, _vt(7000))
+        default = compute_local_tokens_per_expert(*args, persistent=True)
+        tuned = compute_local_tokens_per_expert(*args, persistent=True, config=config)
+        assert torch.equal(default, tuned)
+        assert torch.equal(default, self._bincount_ref(routing_map, 7000, 40, 8))
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_zero_valid_tokens(self, persistent):
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        routing_map = torch.randint(0, 64, (128, 22), device="cuda")
+        result = compute_local_tokens_per_expert(routing_map, 0, 8, _vt(0), persistent=persistent)
+        assert result.sum().item() == 0
+
 
 @pytest.mark.internal
 class TestComputeExpertOffsets:

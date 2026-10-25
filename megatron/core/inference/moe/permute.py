@@ -80,6 +80,12 @@ def _count_local_tokens_kernel(
     tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
+# Launch config of _count_local_tokens_kernel_persistent (tuned on GB200). Each program counts
+# BLOCK_SIZE (token, topk) pairs per iteration in an on-chip histogram, and the programs per
+# SM hide the latency of the routing loads.
+_COUNT_LOCAL_TOKENS_CONFIG = {"BLOCK_SIZE": 1024, "programs_per_sm": 4, "num_warps": 8}
+
+
 @triton.jit
 def _count_local_tokens_kernel_persistent(
     routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
@@ -88,32 +94,31 @@ def _count_local_tokens_kernel_persistent(
     topk,  # number of expert choices per token
     local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
-    num_sms,  # number of SMs (grid size for persistent kernel)
     BLOCK_SIZE: tl.constexpr,  # number of pairs processed per iteration
+    NUM_BINS: tl.constexpr,  # next_pow2(num_local_experts + 1); the last bin(s) take non-local pairs
 ):
     """Count tokens routed to local experts using a persistent grid.
 
-    Launches num_sms CTAs. Each CTA loops over its share of BLOCK_SIZE-sized
-    chunks, with total work determined device-side from valid_tokens.
+    Each program walks BLOCK_SIZE-pair chunks with a grid stride (the chunk count is
+    determined device-side from valid_tokens), counts them in an on-chip histogram, and adds
+    its counts to the global counters once at the end: one atomic per local expert per
+    program, instead of one per local pair, which on a few counters serialize in L2.
     """
-    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
     valid_pairs = valid_tokens * topk
-
-    total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
-    blocks_per_cta = tl.cdiv(total_blocks, num_sms)
-    block_start = pid * blocks_per_cta
-
-    if block_start < total_blocks:
-        block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
-
-        for block_id in tl.range(block_start, block_end):
-            offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < valid_pairs
-            expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
-            local_ids = expert_ids - local_expert_start
-            is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-            tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
+    counts = tl.zeros([NUM_BINS], dtype=tl.int32)
+    for block_id in tl.range(tl.program_id(0), tl.cdiv(valid_pairs, BLOCK_SIZE), tl.num_programs(0)):
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < valid_pairs
+        expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+        local_ids = expert_ids - local_expert_start
+        is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+        bins = tl.where(is_local, local_ids, num_local_experts).to(tl.int32)
+        counts += tl.histogram(bins, NUM_BINS)
+    experts = tl.arange(0, NUM_BINS)
+    tl.atomic_add(
+        tokens_per_expert_ptr + experts, counts, mask=(experts < num_local_experts) & (counts > 0)
+    )
 
 
 def compute_local_tokens_per_expert(
@@ -122,6 +127,7 @@ def compute_local_tokens_per_expert(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     persistent: bool = False,
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     """Count tokens routed to each local expert.
 
@@ -132,23 +138,32 @@ def compute_local_tokens_per_expert(
         num_local_experts: number of experts on this rank.
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
             this iteration. Fixed address; value updated each step before graph replay.
-        persistent: use persistent-grid kernel variant (fewer CTAs, looped).
+        persistent: use persistent-grid kernel variant (fewer CTAs, looped, counts
+            accumulated on chip).
+        config: persistent variant only: overrides of _COUNT_LOCAL_TOKENS_CONFIG (for
+            tuning; the counts do not depend on it).
     """
     max_pairs = routing_map.numel()
     topk = routing_map.shape[1]
     tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
     BLOCK = 1024
     if persistent:
-        num_sms = _get_num_sms(routing_map.device)
-        _count_local_tokens_kernel_persistent[(num_sms,)](
+        cfg = {**_COUNT_LOCAL_TOKENS_CONFIG, **(config or {})}
+        # Static grid (CUDA graphs): programs_per_sm per SM, but no more than max_pairs has chunks.
+        num_programs = min(
+            _ceil_div(max_pairs, cfg["BLOCK_SIZE"]),
+            cfg["programs_per_sm"] * _get_num_sms(routing_map.device),
+        )
+        _count_local_tokens_kernel_persistent[(max(1, num_programs),)](
             routing_map,
             tokens_per_expert,
             valid_tokens,
             topk,
             local_expert_start,
             num_local_experts,
-            num_sms,
-            BLOCK_SIZE=BLOCK,
+            BLOCK_SIZE=cfg["BLOCK_SIZE"],
+            NUM_BINS=triton.next_power_of_2(num_local_experts + 1),
+            num_warps=cfg["num_warps"],
         )
     else:
         _count_local_tokens_kernel[(_ceil_div(max_pairs, BLOCK),)](
