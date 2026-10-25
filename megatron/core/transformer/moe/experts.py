@@ -1598,7 +1598,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # DeepEP: local expert ids (-1 elsewhere) on a receive buffer whose valid prefix
             # is the GPU-side received count; bound it by the EP-wide token sum and mask the
             # rest as expert -1. The output lands in the buffer DeepEP's combine reads.
-            num_experts, local_expert_offset = self.num_local_experts, 0
+            # The local ids index experts [0, num_local_experts) of the global range; keep
+            # num_experts global, since the kernel requires top_k <= num_experts and top_k
+            # can exceed the local expert count (e.g. top-22 over 8 local experts).
+            local_expert_offset = 0
             out = DeepEPDispatcher._get_combine_input()
             real_token_count = InferenceAllGatherDispatcherBase._valid_tokens()
         else:
