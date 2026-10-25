@@ -562,50 +562,6 @@ _MOE_SUM_CONFIG = {"BLOCK_T": 4, "BLOCK_K": 512, "programs_per_sm": 8, "num_warp
 
 
 @triton.jit
-def _moe_sum_add_slot(
-    acc,
-    input_ptr,
-    topk_weights_ptr,
-    routing_map_ptr,
-    tok,
-    tok_mask,
-    offs_k,
-    k_mask,
-    t: tl.constexpr,
-    local_expert_start,
-    num_local_experts: tl.constexpr,
-    K,
-    topk: tl.constexpr,
-    APPLY_WEIGHTS: tl.constexpr,
-    ACC_FP64: tl.constexpr,
-):
-    """Add slot t's local-expert rows of a token tile to acc."""
-    lid = tl.load(routing_map_ptr + tok * topk + t, mask=tok_mask, other=-1) - local_expert_start
-    is_local = (lid >= 0) & (lid < num_local_experts) & tok_mask
-    # Masked lanes load 0 and add nothing; they cost no memory traffic.
-    v = tl.load(
-        input_ptr + (tok * topk + t)[:, None] * K + offs_k[None, :],
-        mask=is_local[:, None] & k_mask[None, :],
-        other=0.0,
-    )
-    if APPLY_WEIGHTS:
-        w = tl.load(topk_weights_ptr + tok * topk + t, mask=is_local, other=0.0)
-        # Explicit fused multiply-add: left to the compiler, `acc += v * w` is fused or not
-        # depending on the output dtype and tile shape, which changes the rounding of these
-        # heavily cancelling sums.
-        if ACC_FP64:
-            acc = tl.fma(v.to(tl.float64), w.to(tl.float64)[:, None], acc)
-        else:
-            acc = tl.fma(v.to(tl.float32), w[:, None], acc)
-    else:
-        if ACC_FP64:
-            acc += v.to(tl.float64)
-        else:
-            acc += v.to(tl.float32)
-    return acc
-
-
-@triton.jit
 def _moe_sum_kernel(
     input_ptr,
     output_ptr,
@@ -675,23 +631,31 @@ def _moe_sum_kernel(
         for t in tl.static_range(topk):
             # Skipping a slot adds nothing, exactly like loading it fully masked.
             if ((used_bits >> t) & 1) != 0:
-                acc = _moe_sum_add_slot(
-                    acc,
-                    input_ptr,
-                    topk_weights_ptr,
-                    routing_map_ptr,
-                    tok,
-                    tok_mask,
-                    offs_k,
-                    k_mask,
-                    t,
-                    local_expert_start,
-                    num_local_experts,
-                    K,
-                    topk,
-                    APPLY_WEIGHTS,
-                    ACC_FP64,
+                lid = (
+                    tl.load(routing_map_ptr + tok * topk + t, mask=tok_mask, other=-1)
+                    - local_expert_start
                 )
+                is_local = (lid >= 0) & (lid < num_local_experts) & tok_mask
+                # Masked lanes load 0 and add nothing; they cost no memory traffic.
+                v = tl.load(
+                    input_ptr + (tok * topk + t)[:, None] * K + offs_k[None, :],
+                    mask=is_local[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                if APPLY_WEIGHTS:
+                    w = tl.load(topk_weights_ptr + tok * topk + t, mask=is_local, other=0.0)
+                    # Explicit fused multiply-add: left to the compiler, `acc += v * w` is
+                    # fused or not depending on the output dtype and tile shape, which changes
+                    # the rounding of these heavily cancelling sums.
+                    if ACC_FP64:
+                        acc = tl.fma(v.to(tl.float64), w.to(tl.float64)[:, None], acc)
+                    else:
+                        acc = tl.fma(v.to(tl.float32), w[:, None], acc)
+                else:
+                    if ACC_FP64:
+                        acc += v.to(tl.float64)
+                    else:
+                        acc += v.to(tl.float32)
 
         if WRITE_UNROUTED:
             row_mask = tok_mask
