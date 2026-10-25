@@ -1194,14 +1194,19 @@ class TestDeepEPDispatcher:
         expected_combined = (global_hidden[start:end].float() * num_dest).bfloat16()
         torch.testing.assert_close(combined, expected_combined, atol=0, rtol=0)
 
+    @pytest.mark.parametrize("backend", ["vllm", "trtllm_bf16_routed"])
     @pytest.mark.parametrize("shared_expert_overlap", [False, True])
-    def test_moe_layer_matches_nvl_a2a(self, shared_expert_overlap):
+    def test_moe_layer_matches_nvl_a2a(self, shared_expert_overlap, backend, monkeypatch):
         """An inference MoE layer gives the same output with DeepEP as with nvl_a2a.
 
-        Both run the same vLLM expert kernels on the same rows and sum the bf16 per-rank
-        partials in the same order, so the outputs match exactly. The DeepEP layer must also
-        replay from a CUDA graph with the eager result, for two different inputs.
+        With the vLLM backend both run the same expert kernels on the same rows and sum the
+        bf16 per-rank partials in the same order, so the outputs match exactly. TRT-LLM picks
+        its kernels by row count, which differs between the two dispatchers, so its outputs
+        match to bf16 rounding. The base config's top-k (6) exceeds the local expert count
+        (2 at EP=4), as Ultra's top-22 over 8 local experts does at EP=64. The DeepEP layer
+        must also replay from a CUDA graph with the eager result, for two different inputs.
         """
+        from megatron.core.inference.moe import trtllm_bf16
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -1213,12 +1218,18 @@ class TestDeepEPDispatcher:
         self._skip_unless_supported()
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("The nvl_a2a reference requires a power-of-two EP size.")
+        trtllm = backend == "trtllm_bf16_routed"
+        if trtllm and not trtllm_bf16.HAVE_FLASHINFER_TRTLLM_BF16:
+            pytest.skip("Requires FlashInfer trtllm_bf16_routed_moe.")
         torch.manual_seed(2029)
         torch.cuda.manual_seed(2029)
 
-        deepep_config = _deepep_config(moe_shared_expert_overlap=shared_expert_overlap)
+        deepep_config = _deepep_config(
+            moe_shared_expert_overlap=shared_expert_overlap, inference_grouped_gemm_backend=backend
+        )
         a2a_config = _deepep_config(
             moe_shared_expert_overlap=shared_expert_overlap,
+            inference_grouped_gemm_backend=backend,
             inference_moe_token_dispatcher_type="nvl_a2a",
         )
         self._allocate(deepep_config)
@@ -1228,6 +1239,7 @@ class TestDeepEPDispatcher:
             hidden_size=a2a_config.hidden_size,
             ep_group=get_expert_model_parallel_group(),
             combine_dtype=torch.bfloat16,
+            packed_routing=trtllm,
         )
 
         deepep_layer = get_inference_optimized_moe_spec()(config=deepep_config).cuda().eval()
@@ -1237,6 +1249,14 @@ class TestDeepEPDispatcher:
         assert isinstance(a2a_layer._inference_token_dispatcher, NVLAllToAllVDispatcher)
 
         local_tokens = 9 + 4 * torch.distributed.get_rank()
+        # TRT-LLM runs only the first host-bound rows: local rows x EP unless the context sets
+        # an EP-wide bound. The ranks hold uneven token counts here, so set the EP-wide token
+        # sum, as the context does on eager steps.
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher,
+            "_host_rows_bound",
+            sum(9 + 4 * r for r in range(Utils.world_size)),
+        )
 
         def new_input():
             return torch.randn(local_tokens, 1, _DEEPEP_HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -1245,7 +1265,10 @@ class TestDeepEPDispatcher:
         with torch.no_grad(), InferenceMode.active():
             a2a_output, _ = a2a_layer(hidden_states.clone())
             deepep_output, _ = deepep_layer(hidden_states.clone())
-        torch.testing.assert_close(deepep_output, a2a_output, atol=0, rtol=0)
+        # TRT-LLM: allow a few bf16 ulps of the largest output.
+        atol = 2**-6 * a2a_output.abs().max().item() if trtllm else 0
+        rtol = 2**-7 if trtllm else 0
+        torch.testing.assert_close(deepep_output, a2a_output, atol=atol, rtol=rtol)
 
         static_input = hidden_states.clone()
         with torch.no_grad(), InferenceMode.active():
