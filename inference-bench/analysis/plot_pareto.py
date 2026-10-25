@@ -101,7 +101,7 @@ def main():
         if args.title:
             ax.set_title(args.title)
         style_axes(ax)
-        ax.legend(loc="upper right", frameon=False, handlelength=3)
+        ax.legend(loc="best", frameon=False, handlelength=3)
         fig.tight_layout()
         fig.savefig(args.out, dpi=200)
         print(f"-> {args.out}")
