@@ -19,6 +19,91 @@ os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(tempfile.gettempdir(), "t
 import pytest
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _one_token_per_program_moe_sum_kernel(
+        input_ptr,
+        output_ptr,
+        topk_weights_ptr,
+        valid_tokens_ptr,
+        routing_map_ptr,
+        local_expert_start,
+        num_local_experts: tl.constexpr,
+        K,
+        topk: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_K_BLOCKS: tl.constexpr,
+        APPLY_WEIGHTS: tl.constexpr,
+        ACC_FP64: tl.constexpr,
+    ):
+        """The previous _moe_sum kernel (one token per program, branch per slot), kept as
+        the bit-exact reference for the tiled kernel."""
+        pid = tl.program_id(0)
+        valid_tokens = tl.load(valid_tokens_ptr)
+        for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+            token_id_i64 = token_id.to(tl.int64)
+            base = token_id_i64 * topk * K
+            for k_idx in range(NUM_K_BLOCKS):
+                offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
+                acc = tl.zeros([BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
+                for t in range(topk):
+                    eid = tl.load(routing_map_ptr + token_id * topk + t)
+                    lid = eid - local_expert_start
+                    if lid >= 0 and lid < num_local_experts:
+                        v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
+                        if APPLY_WEIGHTS:
+                            w = tl.load(topk_weights_ptr + token_id * topk + t)
+                            if ACC_FP64:
+                                acc += v.to(tl.float64) * w.to(tl.float64)
+                            else:
+                                acc += v.to(tl.float32) * w
+                        else:
+                            if ACC_FP64:
+                                acc += v.to(tl.float64)
+                            else:
+                                acc += v.to(tl.float32)
+                tl.store(
+                    output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask
+                )
+
+
+def _one_token_per_program_moe_sum(
+    input, topk_weights, K, valid, routing_map, local_start, num_local, out, apply_w, fp64
+):
+    """Launch the reference kernel the way the previous _moe_sum did."""
+    topk = routing_map.shape[1]
+    BLOCK_K = min(triton.next_power_of_2(K), 1024)
+    BLOCK_M = torch.cuda.get_device_properties(input.device).multi_processor_count
+    _one_token_per_program_moe_sum_kernel[(BLOCK_M,)](
+        input,
+        out,
+        topk_weights,
+        valid,
+        routing_map,
+        local_start,
+        num_local,
+        K,
+        topk=topk,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        NUM_K_BLOCKS=triton.cdiv(K, BLOCK_K),
+        APPLY_WEIGHTS=apply_w,
+        ACC_FP64=fp64,
+    )
+    return out
+
 
 def _vt(n):
     """Create a valid_tokens scalar int32 CUDA tensor."""
@@ -446,6 +531,143 @@ class TestMoeSum:
         )
 
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("K", [128, 2688])
+    @pytest.mark.parametrize("apply_weights,acc_fp64", [(True, False), (False, True)])
+    def test_skip_unrouted_rows(self, K, apply_weights, acc_fp64):
+        """write_unrouted_rows=False leaves rows with no local expert untouched and writes
+        every other valid row bit-identically to the default."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        max_tokens, topk, num_experts, local_start, num_local = 64, 3, 16, 4, 2
+        valid = 56
+        torch.manual_seed(42)
+        input = torch.randn(max_tokens * topk, K, device="cuda", dtype=torch.bfloat16)
+        topk_weights = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
+        routing_map = torch.randint(0, num_experts, (max_tokens, topk), device="cuda")
+        routing_map[::7] = -1  # padding tokens route nowhere
+        local = (routing_map >= local_start) & (routing_map < local_start + num_local)
+        routed = local.any(dim=1)
+        routed[valid:] = False
+        assert routed.any() and not routed[:valid].all()
+
+        def run(write_unrouted_rows):
+            out = torch.full((max_tokens, K), float("nan"), device="cuda", dtype=torch.float32)
+            return _moe_sum(
+                input,
+                topk_weights,
+                max_tokens,
+                topk,
+                K,
+                _vt(valid),
+                routing_map,
+                local_start,
+                num_local,
+                out=out,
+                apply_weights=apply_weights,
+                acc_fp64=acc_fp64,
+                write_unrouted_rows=write_unrouted_rows,
+            )
+
+        full, skipped = run(True), run(False)
+        assert torch.equal(skipped[routed], full[routed])
+        assert torch.isnan(skipped[~routed]).all()
+        assert not torch.isnan(full[:valid]).any()
+
+
+    @staticmethod
+    def _bit_exact_inputs(max_tokens, topk, K, num_experts, padding_every=0):
+        torch.manual_seed(1234)
+        input = torch.randn(max_tokens * topk, K, device="cuda", dtype=torch.bfloat16)
+        topk_weights = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
+        # Distinct experts per token, as the router produces.
+        routing_map = torch.rand(max_tokens, num_experts, device="cuda").topk(topk).indices
+        if padding_every:
+            routing_map[::padding_every] = -1
+        return input, topk_weights, routing_map
+
+    @pytest.mark.parametrize("K", [128, 1000, 2688])
+    @pytest.mark.parametrize(
+        "local_start,num_local,padding_every", [(0, 64, 0), (8, 8, 0), (24, 8, 5)]
+    )
+    @pytest.mark.parametrize(
+        "apply_weights,acc_fp64", [(True, False), (False, False), (False, True)]
+    )
+    @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+    def test_bit_exact_vs_one_token_per_program(
+        self, K, local_start, num_local, padding_every, apply_weights, acc_fp64, out_dtype
+    ):
+        """The tiled kernel sums the same slots in the same order as the previous kernel,
+        so every written element is bit-identical; rows >= valid_tokens stay untouched."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        max_tokens, topk, num_experts, valid = 300, 22, 64, 287
+        input, topk_weights, routing_map = self._bit_exact_inputs(
+            max_tokens, topk, K, num_experts, padding_every
+        )
+
+        def fresh_out():
+            return torch.full((max_tokens, K), float("nan"), device="cuda", dtype=out_dtype)
+
+        expected = _one_token_per_program_moe_sum(
+            input,
+            topk_weights,
+            K,
+            _vt(valid),
+            routing_map,
+            local_start,
+            num_local,
+            fresh_out(),
+            apply_weights,
+            acc_fp64,
+        )
+        result = _moe_sum(
+            input,
+            topk_weights,
+            max_tokens,
+            topk,
+            K,
+            _vt(valid),
+            routing_map,
+            local_start,
+            num_local,
+            out=fresh_out(),
+            apply_weights=apply_weights,
+            acc_fp64=acc_fp64,
+        )
+        assert torch.equal(result[:valid], expected[:valid])
+        assert torch.isnan(result[valid:]).all()
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"BLOCK_T": 2, "BLOCK_K": 1024, "programs_per_sm": 1, "num_warps": 4},
+            {"BLOCK_T": 8, "BLOCK_K": 128, "programs_per_sm": 16, "num_warps": 4},
+            {"BLOCK_T": 32, "BLOCK_K": 512, "programs_per_sm": 2, "num_warps": 8},
+            {"BLOCK_T": 8, "BLOCK_K": 256, "programs_per_sm": 8, "num_warps": 8},
+        ],
+    )
+    def test_result_independent_of_launch_config(self, config):
+        """Tile sizes and program counts change only who computes an element, not how."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        max_tokens, topk, K, num_experts, valid = 300, 22, 1000, 64, 291
+        input, topk_weights, routing_map = self._bit_exact_inputs(
+            max_tokens, topk, K, num_experts, padding_every=7
+        )
+        args = (input, topk_weights, max_tokens, topk, K, _vt(valid), routing_map, 8, 8)
+        default = _moe_sum(*args, out=torch.zeros(max_tokens, K, device="cuda"))
+        tuned = _moe_sum(*args, out=torch.zeros(max_tokens, K, device="cuda"), config=config)
+        assert torch.equal(default, tuned)
+
+    def test_zero_valid_tokens_writes_nothing(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        max_tokens, topk, K, num_experts = 64, 22, 256, 64
+        input, topk_weights, routing_map = self._bit_exact_inputs(max_tokens, topk, K, num_experts)
+        out = torch.full((max_tokens, K), float("nan"), device="cuda")
+        _moe_sum(input, topk_weights, max_tokens, topk, K, _vt(0), routing_map, 0, 8, out=out)
+        assert torch.isnan(out).all()
 
 
 # ──────────────────────────────────────────────────────────────────────

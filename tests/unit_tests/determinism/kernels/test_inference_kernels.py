@@ -526,6 +526,34 @@ def test_vllm_fused_moe_and_moe_sum_replay():
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
 
+    # all-to-all-v variant: rows of tokens with no local expert (experts 4.. here) are skipped.
+    out_buf = torch.empty(max_tokens, 2688, device="cuda", dtype=torch.float32)
+
+    def moe_sum_skip_unrouted(inp, p):
+        out_buf.zero_()
+        _moe_sum(
+            inp,
+            p,
+            max_tokens,
+            topk,
+            2688,
+            valid,
+            routing_map,
+            0,
+            4,
+            out=out_buf,
+            write_unrouted_rows=False,
+        )
+        return out_buf[: max_tokens - 100].clone()
+
+    assert_replays_bit_exact(
+        moe_sum_skip_unrouted,
+        (inp, probs),
+        replays=4,
+        backward=False,
+        what="_moe_sum(write_unrouted_rows=False)",
+    )
+
 
 # --- batch-invariant kernels -----------------------------------------------------------------
 
