@@ -64,7 +64,8 @@
 #                      examples/inference/launch_inference_server.py on upstream main)
 #   INFERENCE_SHARDS   --inference-shards spec; role=prefill|decode shards enable disaggregated
 #                      serving (upstream main's launcher), e.g.
-#                      "tp=4,ep=4,role=prefill+tp=4,ep=4,role=decode"
+#                      "tp=4,ep=4,expt_tp=1,role=prefill+tp=4,ep=4,expt_tp=1,role=decode"
+#                      (expt_tp defaults to the shard's tp; set it to 1 for TP x EP layouts)
 #   DISAGG_BACKEND     --disagg-kv-transport-backend: nccl | nixl
 #   PROFILE            1 = run every rank under nsys (capture range = cudaProfilerApi) and have the
 #                      client wrap the timed iterations of the first BENCH batch size in
