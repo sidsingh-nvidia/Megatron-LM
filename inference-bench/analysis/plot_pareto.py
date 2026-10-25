@@ -71,6 +71,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--figsize", type=float, nargs=2, default=(5, 3.5))
     ap.add_argument("--label-c", action="store_true", help="label each point with its concurrency")
+    ap.add_argument("--drop", nargs="*", default=[], metavar="LABEL:C",
+                    help="drop a series' point at total concurrency C (e.g. a warmup outlier)")
     ap.add_argument("--tpot-out", default=None,
                     help="also plot median TPOT (whisker to p90) vs concurrency per GPU to this file")
     ap.add_argument("--interactivity-out", default=None,
@@ -78,6 +80,9 @@ def main():
     args = ap.parse_args()
 
     df = pd.DataFrame([row for spec in args.runs for row in load(spec)])
+    for item in args.drop:
+        label, _, c = item.rpartition(":")
+        df = df[~((df["config"] == label) & (df["c"] == int(c)))]
     labels = list(dict.fromkeys(df["config"]))
     with PlotEnvironment():
         fig, ax = plt.subplots(figsize=tuple(args.figsize))
