@@ -543,13 +543,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
+            "megatron/core/inference/moe/trtllm_bf16.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. trtllm_bf16.py: the finalize and "
+        "routing-pack Triton kernels are replayed; the FlashInfer TRT-LLM routed MoE it dispatches to "
+        "needs FlashInfer on Blackwell and is not.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
