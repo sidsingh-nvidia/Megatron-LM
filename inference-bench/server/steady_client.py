@@ -68,7 +68,11 @@ def main():
     next_row = [0]
     completed = []  # (start, end, completion_tokens, prompt_tokens, finish_reason)
     errors = [0]
+    consecutive_errors = [0]
     stop = threading.Event()
+    # This many request errors in a row with no success means the server is gone: stop instead
+    # of hammering it (a dead server refuses connections instantly).
+    max_consecutive_errors = 50
 
     def worker():
         while not stop.is_set():
@@ -90,11 +94,21 @@ def main():
                        usage.get("prompt_tokens", 0), body["choices"][0].get("finish_reason"))
                 with lock:
                     completed.append(rec)
+                    consecutive_errors[0] = 0
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors[0] += 1
+                    consecutive_errors[0] += 1
+                    if consecutive_errors[0] >= max_consecutive_errors:
+                        stop.set()
                 print(f"request error: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                time.sleep(1)
 
+    # Fail fast if the server is not up (e.g. its job ended before this client started).
+    try:
+        urllib.request.urlopen(f"{args.server}/health", timeout=30).close()
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"server {args.server} is not reachable: {type(e).__name__}: {e}")
     print(f"{len(rows)} problems; levels {sorted(args.concurrency)}; warmup {args.warmup:.0f} s, "
           f"window {args.window:.0f} s, max_tokens {args.max_tokens}", flush=True)
     threads = []
@@ -106,9 +120,11 @@ def main():
             threads.append(t)
         level_start = time.time()
         print(f"{level_start:.3f} level c={c}: warming up", flush=True)
-        time.sleep(args.warmup)
+        if stop.wait(args.warmup):
+            break
         m0, t0 = read_metrics(args.server), time.time()
-        time.sleep(args.window)
+        if stop.wait(args.window):
+            break
         m1, t1 = read_metrics(args.server), time.time()
         dt = t1 - t0
         with lock:
@@ -146,8 +162,11 @@ def main():
               f"{len(done)} finished)  "
               f"running {rec['running_at_end']} waiting {rec['waiting_at_end']}  "
               f"truncated {rec['truncated']}  errors {errors[0]}", flush=True)
+    failed = stop.is_set()
     stop.set()
     out.close()
+    if failed:
+        sys.exit(f"stopped after {max_consecutive_errors} consecutive request errors; is the server up?")
     print("done", flush=True)
 
 
