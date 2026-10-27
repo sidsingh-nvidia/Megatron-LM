@@ -28,10 +28,10 @@
 #   BUFFER_GB          dynamic-batching KV/state buffer per GPU   (default: 50; ultrav3: 25)
 #   MAMBA_RATIO        fraction of BUFFER_GB for live Mamba states; with ~100 MB of state per
 #                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
-#   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1; 0 leaves it unset
+#   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1
 #                      (default: 50; ultrav3: 25)
 #   DISPATCHER         MoE EP dispatcher: nccl | nvls | nvl_a2a     (default: nvls)
-#   COMBINE_PRECISION  MoE combine precision: fp32 | bf16 | none (omit the flag)  (default: fp32)
+#   COMBINE_PRECISION  MoE combine precision: fp32 | bf16           (default: fp32)
 #   GEMM_BACKEND       routed-expert grouped GEMM: vllm | trtllm_bf16_routed | flashinfer | torch
 #                      (default: trtllm_bf16_routed)
 #   ASYNC              1 = async scheduling                         (default: 1)
@@ -58,15 +58,6 @@
 #                      With BENCH=1 each request is a single prefill step (keep <= 8192).
 #   BENCH_OSL / BENCH_ITERS / BENCH_WARMUP   output tokens / timed / warmup iterations
 #                                             (default: 1024 / 3 / 1)
-#   MEGATRON_DIR       Megatron-LM checkout the server runs from (default: this one), e.g. an
-#                      upstream-main worktree for features this branch lacks
-#   SERVER_ENTRY       server entry point (default: -m tools.run_dynamic_text_generation_server;
-#                      examples/inference/launch_inference_server.py on upstream main)
-#   INFERENCE_SHARDS   --inference-shards spec; role=prefill|decode shards enable disaggregated
-#                      serving (upstream main's launcher), e.g.
-#                      "tp=4,ep=4,expt_tp=1,role=prefill+tp=4,ep=4,expt_tp=1,role=decode"
-#                      (expt_tp defaults to the shard's tp; set it to 1 for TP x EP layouts)
-#   DISAGG_BACKEND     --disagg-kv-transport-backend: nccl | nixl
 #   PROFILE            1 = run every rank under nsys (capture range = cudaProfilerApi) and have the
 #                      client wrap the timed iterations of the first BENCH batch size in
 #                      /start_profile + /stop_profile; the server exits when profiling stops.
@@ -86,8 +77,7 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     cd "${SLURM_SUBMIT_DIR:-$PWD}"
     # Exported settings reach the ranks through srun's environment.
     source "${INFERENCE_BENCH_CONFIG:-inference-bench/cluster.env}"
-    # Absolute, so it stays valid when the server runs from another checkout (MEGATRON_DIR).
-    export EXP_DIR="${PWD}/inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}"
+    export EXP_DIR="inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}"
     mkdir -p "${EXP_DIR}"
     echo "Experiment directory: ${EXP_DIR}"
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
@@ -143,6 +133,7 @@ ARGS=(
     --expert-model-parallel-size "${EP}"
     --expert-tensor-parallel-size "${ETP}"
     --inference-moe-token-dispatcher-type "${DISPATCHER:-nvls}"
+    --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
     --moe-grouped-gemm --moe-shared-expert-overlap
     --inference-grouped-gemm-backend "${GEMM_BACKEND:-trtllm_bf16_routed}"
@@ -216,19 +207,8 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 [ "${PREFIX_CACHING:-1}" == "1" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching
     --inference-dynamic-batching-prefix-caching-eviction-policy lru
+    --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}"
 )
-# MAMBA_PREFIX_GB=0 leaves the Mamba prefix cache unset (required by disaggregated serving).
-MAMBA_PREFIX=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}
-[ "${PREFIX_CACHING:-1}" == "1" ] && [ "${MAMBA_PREFIX}" != "0" ] && ARGS+=(
-    --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX}"
-)
-# COMBINE_PRECISION=none omits the flag (checkouts without it, e.g. upstream main).
-[ "${COMBINE_PRECISION:-fp32}" != "none" ] && ARGS+=(
-    --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
-)
-# Disaggregated prefill / decode (upstream main's launcher): role-tagged shards, KV transport.
-[ -n "${INFERENCE_SHARDS:-}" ] && ARGS+=(--inference-shards "${INFERENCE_SHARDS}")
-[ -n "${DISAGG_BACKEND:-}" ] && ARGS+=(--disagg-kv-transport-backend "${DISAGG_BACKEND}")
 [ -n "${MAX_REQUESTS:-}" ] && ARGS+=(--inference-dynamic-batching-max-requests "${MAX_REQUESTS}")
 [ "${EVAL_MODE:-1}" == "1" ] && ARGS+=(--eval-mode)
 # The server returns log-probs by default, which materializes logits for every prompt token
@@ -252,8 +232,7 @@ DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM
 ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
-MEGATRON_DIR=${MEGATRON_DIR:-.}
-CMD=python ${SERVER_ENTRY:--m tools.run_dynamic_text_generation_server} ${ARGS[*]}
+CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
 EOF
 fi
 
@@ -263,8 +242,7 @@ if [ "${PROFILE:-0}" == "1" ]; then
          --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown
          --force-overwrite true -o "${EXP_DIR}/trace_rank${RANK}")
 fi
-# The server runs from MEGATRON_DIR (default: this checkout) through SERVER_ENTRY.
-( cd "${MEGATRON_DIR:-.}" && exec "${PRE[@]}" python ${SERVER_ENTRY:--m tools.run_dynamic_text_generation_server} "${ARGS[@]}" ) > "${LOG}" 2>&1 &
+"${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
 # Serve until <exp dir>/done appears (written by the in-job sweep or by client.sh) or the server
