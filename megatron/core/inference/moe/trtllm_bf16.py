@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import torch
 import torch.nn.functional as F
 
+from megatron.core.inference.moe.permute import _get_num_sms
 from megatron.core.utils import null_decorator
 
 try:
@@ -113,6 +114,14 @@ def build_trtllm_bf16_weights(
     return out1.view(torch.bfloat16), out2.view(torch.bfloat16), intermediate_size
 
 
+# Launch config of _finalize_kernel, tuned on GB200 for Ultra (top-22 of 512 experts, hidden
+# 2048) at EP=64. Each program reduces a [BLOCK_T tokens, BLOCK_H columns] tile. The kernel is
+# latency-bound (a token's top-k slots are mostly not local, so it moves little data), so many
+# small programs per SM pay most: a one-token tile skips exactly that token's non-local slots,
+# and a full-width tile reads the token's routing once rather than once per column block.
+_FINALIZE_CONFIG = {"BLOCK_T": 1, "BLOCK_H": 2048, "programs_per_sm": 64, "num_warps": 2}
+
+
 @triton.jit
 def _finalize_kernel(
     gemm2_ptr,
@@ -123,50 +132,76 @@ def _finalize_kernel(
     hidden_size,
     gemm2_rows,
     TOP_K: tl.constexpr,
-    BLOCK_TOP_K: tl.constexpr,
+    TOP_K_POW2: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    NUM_TOKEN_BLOCKS: tl.constexpr,
-    NUM_H_BLOCKS: tl.constexpr,
+    WRITE_UNROUTED: tl.constexpr,
 ):
-    """Sum each valid token's local expert outputs, weighted by its routing probs."""
-    token_pid = tl.program_id(0)
-    hidden_pid = tl.program_id(1)
-    # The grid is fixed for CUDA graph replay; the device scalar bounds the live prefix.
-    valid_tokens = tl.load(valid_tokens_ptr).to(tl.int32)
-    top_k_offsets = tl.arange(0, BLOCK_TOP_K)
-    top_k_mask = top_k_offsets < TOP_K
+    """Sum each valid token's local expert outputs, weighted by its routing probs.
 
-    for token in tl.range(token_pid, valid_tokens, NUM_TOKEN_BLOCKS):
+    Grid: (persistent programs over BLOCK_T-token tiles, BLOCK_H column blocks). A tile first
+    reads its whole [BLOCK_T, TOP_K] inverse-map block and skips, with a branch uniform across
+    the tile, the slots none of its tokens has on this rank. Within a used slot, tokens whose
+    slot is not local are masked rather than branched on. Every element sums its local slots in
+    slot order with fused multiply-adds, whatever the launch config.
+
+    A token with no local expert gets an explicit zero row, since the combine buffer persists
+    across steps; with WRITE_UNROUTED=False its row is not written, for consumers that never
+    read it (the all-to-all-v combine). The grid is fixed for CUDA graph replay; the device
+    scalar bounds the live prefix.
+    """
+    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    offsets_mask = offsets < hidden_size
+    valid_tokens = tl.load(valid_tokens_ptr)
+    slots = tl.arange(0, TOP_K_POW2)
+
+    for tile in tl.range(tl.program_id(0), tl.cdiv(valid_tokens, BLOCK_T), tl.num_programs(0)):
+        tokens = (tile * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
+        token_mask = tokens < valid_tokens
+        # The tile's [BLOCK_T, TOP_K] inverse-map block in one load.
         mapped_rows = tl.load(
-            inverse_map_ptr + token * TOP_K + top_k_offsets, mask=top_k_mask, other=-1
-        ).to(tl.int32)
-        local_mask = top_k_mask & (mapped_rows >= 0) & (mapped_rows < gemm2_rows)
-        has_local_expert = tl.sum(local_mask.to(tl.int32), axis=0) > 0
-        for hidden_offset in tl.range(hidden_pid * BLOCK_H, hidden_size, NUM_H_BLOCKS * BLOCK_H):
-            offsets = hidden_offset + tl.arange(0, BLOCK_H)
-            offsets_mask = offsets < hidden_size
-            accumulator = tl.zeros([BLOCK_H], dtype=tl.float32)
-            # A token with no local expert still gets an explicit zero: the combine buffer
-            # persists across steps.
-            if has_local_expert:
-                for top_k_idx in range(TOP_K):
-                    mapped_row = tl.load(inverse_map_ptr + token * TOP_K + top_k_idx).to(tl.int32)
-                    is_local = (mapped_row >= 0) & (mapped_row < gemm2_rows)
-                    safe_row = tl.maximum(mapped_row, 0).to(tl.int64)
-                    weight = tl.load(
-                        weights_ptr + token * TOP_K + top_k_idx, mask=is_local, other=0.0
-                    ).to(tl.float32)
-                    value = tl.load(
-                        gemm2_ptr + safe_row * hidden_size + offsets,
-                        mask=is_local & offsets_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    accumulator += value * weight
-            tl.store(
-                output_ptr + token * hidden_size + offsets,
-                accumulator.to(output_ptr.dtype.element_ty),
-                mask=offsets_mask,
-            )
+            inverse_map_ptr + tokens[:, None] * TOP_K + slots[None, :],
+            mask=token_mask[:, None] & (slots[None, :] < TOP_K),
+            other=-1,
+        )
+        local = (mapped_rows >= 0) & (mapped_rows < gemm2_rows)
+        # Bit s set: some token of the tile has slot s on this rank.
+        slot_used = tl.max(local.to(tl.int64), axis=0)
+        used_bits = tl.sum(slot_used << slots.to(tl.int64), axis=0)
+        accumulator = tl.zeros([BLOCK_T, BLOCK_H], dtype=tl.float32)
+        for slot in tl.static_range(TOP_K):
+            # Skipping a slot adds nothing, exactly like loading it fully masked.
+            if ((used_bits >> slot) & 1) != 0:
+                mapped_row = tl.load(
+                    inverse_map_ptr + tokens * TOP_K + slot, mask=token_mask, other=-1
+                )
+                is_local = (mapped_row >= 0) & (mapped_row < gemm2_rows)
+                weight = tl.load(weights_ptr + tokens * TOP_K + slot, mask=is_local, other=0.0)
+                # Masked lanes load 0 and add nothing; they cost no memory traffic.
+                value = tl.load(
+                    gemm2_ptr
+                    + tl.maximum(mapped_row, 0).to(tl.int64)[:, None] * hidden_size
+                    + offsets[None, :],
+                    mask=is_local[:, None] & offsets_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                # Explicit fused multiply-add: left to the compiler, `acc += value * weight` is
+                # fused or not depending on the output dtype and tile shape.
+                accumulator = tl.fma(value, weight.to(tl.float32)[:, None], accumulator)
+
+        if WRITE_UNROUTED:
+            row_mask = token_mask
+        elif BLOCK_T == 1:
+            # The token has a local expert iff it uses a slot: a scalar, which the store
+            # broadcasts without converting the routing block's layout.
+            row_mask = token_mask & (used_bits != 0)
+        else:
+            row_mask = tl.max(local.to(tl.int32), axis=1) > 0
+        tl.store(
+            output_ptr + tokens[:, None] * hidden_size + offsets[None, :],
+            accumulator.to(output_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & offsets_mask[None, :],
+        )
 
 
 def trtllm_finalize(
@@ -176,6 +211,8 @@ def trtllm_finalize(
     output: torch.Tensor,
     valid_tokens: torch.Tensor,
     top_k: int,
+    write_unrouted_rows: bool = True,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """Finalize trtllm_bf16_routed_moe(do_finalize=False) into an FP32 or BF16 buffer.
 
@@ -186,20 +223,31 @@ def trtllm_finalize(
         output: [rows, hidden] destination, normally the NVLS combine (RSV) buffer.
         valid_tokens: device int32[1], the live token prefix; rows past it are not written.
         top_k: routed experts per token.
+        write_unrouted_rows: write a zero row for valid tokens with no local expert (default).
+            Pass False when the consumer never reads those rows (the all-to-all-v combine):
+            they are then left untouched.
+        config: overrides of _FINALIZE_CONFIG (for tuning; the result does not depend on it).
     """
     assert HAVE_TRITON, "Triton is required for the TRT-LLM MoE finalize."
     assert gemm2_output.is_contiguous() and output.is_contiguous()
     assert output.dtype in (torch.float32, torch.bfloat16)
     assert valid_tokens.dtype == torch.int32 and valid_tokens.numel() == 1
+    assert 0 < top_k <= 64, "the per-tile slot mask is an int64"
     rows, hidden_size = output.shape
     assert gemm2_output.shape[1] == hidden_size
     assert expert_weights.numel() >= rows * top_k and inverse_map.numel() >= rows * top_k
     if rows == 0:
         return output
-    block_h = 256
-    num_token_blocks = min(rows, 128)
-    num_h_blocks = min(triton.cdiv(hidden_size, block_h), 8)
-    _finalize_kernel[(num_token_blocks, num_h_blocks)](
+    cfg = {**_FINALIZE_CONFIG, **(config or {})}
+    block_h = min(triton.next_power_of_2(hidden_size), cfg["BLOCK_H"])
+    num_h_blocks = triton.cdiv(hidden_size, block_h)
+    # Static grid (CUDA graphs): enough programs to fill every SM programs_per_sm times, but no
+    # more token programs than rows has tiles.
+    num_token_programs = min(
+        triton.cdiv(rows, cfg["BLOCK_T"]),
+        max(1, cfg["programs_per_sm"] * _get_num_sms(output.device) // num_h_blocks),
+    )
+    _finalize_kernel[(num_token_programs, num_h_blocks)](
         gemm2_output,
         expert_weights,
         inverse_map,
@@ -208,11 +256,11 @@ def trtllm_finalize(
         hidden_size,
         gemm2_output.shape[0],
         TOP_K=top_k,
-        BLOCK_TOP_K=triton.next_power_of_2(top_k),
+        TOP_K_POW2=triton.next_power_of_2(top_k),
+        BLOCK_T=cfg["BLOCK_T"],
         BLOCK_H=block_h,
-        NUM_TOKEN_BLOCKS=num_token_blocks,
-        NUM_H_BLOCKS=num_h_blocks,
-        num_warps=4,
+        WRITE_UNROUTED=write_unrouted_rows,
+        num_warps=cfg["num_warps"],
     )
     return output
 
@@ -297,12 +345,15 @@ def trtllm_bf16_routed_moe_forward(
     rows: int,
     out: torch.Tensor | None = None,
     valid_tokens: torch.Tensor | None = None,
+    write_unrouted_rows: bool = True,
 ) -> torch.Tensor:
     """Run TRT-LLM BF16 routed MoE on the first `rows` rows of packed routing (pack_routing).
 
     Every row in [0, rows) must carry this step's routing or expert -1. With `out` (the NVLS combine
     buffer) the kernel skips its own finalize and trtllm_finalize writes the valid prefix of
     `out`, which is returned. Without `out`, returns the kernel's finalized [rows, hidden].
+    write_unrouted_rows=False (with `out` only) leaves the rows of tokens with no local expert
+    untouched, for consumers that never read them (the all-to-all-v combine).
     """
     require_flashinfer_trtllm_bf16()
     assert hidden_states.dtype == torch.bfloat16, "trtllm_bf16_routed requires BF16 input"
@@ -340,5 +391,6 @@ def trtllm_bf16_routed_moe_forward(
         output=out[:rows],
         valid_tokens=valid_tokens,
         top_k=top_k,
+        write_unrouted_rows=write_unrouted_rows,
     )
     return out

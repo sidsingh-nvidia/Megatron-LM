@@ -1306,6 +1306,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         # DeepEP delivers local expert ids and combines out of its own bf16 buffer.
         self._deepep_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep'
+        # The all-to-all-v combine reads a token's partial only from ranks that hold one of
+        # its experts, so the expert output rows of other tokens need not be written.
+        self._a2a_dispatcher = config.inference_moe_token_dispatcher_type == 'nvl_a2a'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
         # TRT-LLM BlockMajorK copies of the expert weights, built with the concatenated ones.
         self._trtllm_fc1_weight: Optional[torch.Tensor] = None
@@ -1616,6 +1619,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 probs[:rows].contiguous(),
                 real_token_count=real_token_count,
             )
+        # At EP=1 the output is used directly, so every valid row must be written.
+        write_unrouted_rows = not (self._a2a_dispatcher and self.ep_group.size() > 1)
         output = trtllm_bf16_routed_moe_forward(
             hidden_states,
             routing_map,
@@ -1628,6 +1633,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             rows=rows,
             out=out,
             valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            write_unrouted_rows=write_unrouted_rows,
         )
         return output, None
 

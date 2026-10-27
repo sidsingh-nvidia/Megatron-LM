@@ -6,9 +6,10 @@ Inference kernels do not feed the training loss, but RL rollouts and batch-invar
 inference depend on them replaying bit-exactly. Covered here: KV-cache tensor ops and the
 fused KV append, the inference MoE activations and MXFP8 quantisation, the inference MoE
 permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
-control), the vLLM-derived fused MoE GEMM and top-k sum, the batch-invariant GEMM /
-log-softmax / mean kernels, and the CUDA-graph routing-map padding mask. Multi-rank NVLS
-symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
+control), the vLLM-derived fused MoE GEMM and top-k sum, the TRT-LLM MoE finalize and
+routing pack, the batch-invariant GEMM / log-softmax / mean kernels, and the CUDA-graph
+routing-map padding mask. Multi-rank NVLS symmetric-memory collectives are exempted in the
+manifest (they need NVLink peers).
 """
 
 import pytest
@@ -525,6 +526,61 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+
+
+# --- TRT-LLM BF16 routed MoE (finalize and routing pack) --------------------------------------
+
+
+def test_trtllm_finalize_and_pack_routing_replay():
+    from megatron.core.inference.moe.trtllm_bf16 import pack_routing, trtllm_finalize
+
+    seeded()
+    tokens, hidden, topk, experts, local = 4096, 2048, 22, 512, 8
+    routing_map = torch.rand(tokens, experts, device="cuda").topk(topk, dim=1).indices
+    probs = torch.rand(tokens, topk, device="cuda")
+    valid = _dev_scalar(tokens - 100)
+
+    def pack(routing_map, probs):
+        return pack_routing(routing_map, probs, valid)
+
+    assert_replays_bit_exact(
+        pack, (routing_map, probs), replays=4, backward=False, what="pack_routing"
+    )
+
+    # Expert-grouped GEMM2 rows of the pairs routed to experts [0, local), as the TRT-LLM kernel
+    # lays them out, and the (token, slot) -> row map; about 70% of tokens have no local expert.
+    is_local = routing_map < local
+    pairs = is_local.flatten().nonzero().squeeze(1)
+    order = torch.argsort(routing_map.flatten()[pairs], stable=True)
+    inverse_map = torch.full((tokens * topk,), -1, dtype=torch.int32, device="cuda")
+    inverse_map[pairs[order]] = torch.arange(pairs.numel(), dtype=torch.int32, device="cuda")
+    inverse_map = inverse_map.view(tokens, topk)
+    gemm2 = torch.randn(pairs.numel(), hidden, device="cuda", dtype=torch.bfloat16)
+    weights = probs.bfloat16()
+    out_buf = torch.empty(tokens, hidden, device="cuda", dtype=torch.float32)
+
+    for write_unrouted_rows in (True, False):
+
+        def finalize(gemm2, weights):
+            out_buf.zero_()
+            trtllm_finalize(
+                gemm2,
+                weights,
+                inverse_map,
+                out_buf,
+                valid,
+                topk,
+                write_unrouted_rows=write_unrouted_rows,
+            )
+            return out_buf[: tokens - 100].clone()
+
+        assert_replays_bit_exact(
+            finalize,
+            (gemm2, weights),
+            replays=4,
+            backward=False,
+            what=f"trtllm_finalize(write_unrouted_rows={write_unrouted_rows})",
+        )
 
 
 # --- batch-invariant kernels -----------------------------------------------------------------
