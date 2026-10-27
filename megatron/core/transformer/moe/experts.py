@@ -1666,6 +1666,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         else:
             local_expert_start = self.ep_group.rank() * self.num_local_experts
             out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        # At EP=1 the output is used directly, so every valid row must be written.
+        write_unrouted_rows = not (self._a2a_dispatcher and self.ep_group.size() > 1)
         output = vllm_fused_moe(
             hidden_states,
             probs,
@@ -1679,6 +1681,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=out,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            write_unrouted_rows=write_unrouted_rows,
         )
         return output, None
 

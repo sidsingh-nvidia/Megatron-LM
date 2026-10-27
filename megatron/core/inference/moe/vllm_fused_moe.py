@@ -552,6 +552,15 @@ def _invoke_fused_moe_kernel(
 # ---------------------------------------------------------------------------
 
 
+# Launch config of _moe_sum_kernel. Each program reduces a [BLOCK_T tokens, BLOCK_K
+# columns] tile, so its loads cover BLOCK_T tokens at once. Programs per SM let the SM switch
+# to another program while one waits on memory: the kernel is latency-bound (a token's 22
+# slots are mostly not local, so it moves little data). Tuned on GB200 for Super (top-22 of
+# 512 experts). Small tiles keep the per-tile slot skip effective: at EP=64 about 6% of a
+# 4-token tile's slots are used, so most row loads are skipped.
+_MOE_SUM_CONFIG = {"BLOCK_T": 4, "BLOCK_K": 512, "programs_per_sm": 8, "num_warps": 4}
+
+
 @triton.jit
 def _moe_sum_kernel(
     input_ptr,
@@ -563,11 +572,12 @@ def _moe_sum_kernel(
     num_local_experts: tl.constexpr,
     K,
     topk: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    NUM_K_BLOCKS: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
     APPLY_WEIGHTS: tl.constexpr = True,
     ACC_FP64: tl.constexpr = False,
+    WRITE_UNROUTED: tl.constexpr = True,
 ):
     """Reduce topk dimension with routing weight application.
 
@@ -582,42 +592,80 @@ def _moe_sum_kernel(
     (e.g. reduce-scatter-v) only read the first valid_tokens rows.
     Routing weight multiplication and accumulation in fp32 for numerical accuracy.
 
-    Persistent grid: launches BLOCK_M CTAs that stride over valid_tokens.
-    CUDA-graph safe (grid is static); the loop bound is loaded device-side.
+    With WRITE_UNROUTED=False, the output rows of tokens with no local expert are not
+    written. Only for consumers that never read such rows (the all-to-all-v combine pulls a
+    token's partial only from ranks that hold one of its experts).
+
+    Grid: (persistent programs over BLOCK_T-token tiles, BLOCK_K column blocks). A tile
+    first reads its whole routing block and skips, with a branch uniform across the tile,
+    the slots none of its tokens has on this rank. Within a used slot, non-local tokens are
+    masked rather than branched on. Every element sums its local slots in slot order, as one
+    program per token would. CUDA-graph safe: the grid is static and the tile count is
+    loaded device-side.
     """
-    pid = tl.program_id(0)
+    pid_t = tl.program_id(0)
+    num_programs_t = tl.num_programs(0)
+    offs_k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = offs_k < K
     valid_tokens = tl.load(valid_tokens_ptr)
+    num_tiles = tl.cdiv(valid_tokens, BLOCK_T)
+    slots = tl.arange(0, TOPK_POW2)
 
-    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
-        token_id_i64 = token_id.to(tl.int64)
-        base = token_id_i64 * topk * K
-
-        # k_idx outer / topk inner keeps the live accumulator at one BLOCK_K tile.
-        # Swapping (topk outer) would need NUM_K_BLOCKS persistent accumulators
-        # (~NUM_K_BLOCKS * BLOCK_K * 4 B), which spills / cuts occupancy at large K.
-        for k_idx in range(NUM_K_BLOCKS):
-            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < K
-
-            acc = tl.zeros([BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
-            for t in range(topk):
-                eid = tl.load(routing_map_ptr + token_id * topk + t)
-                lid = eid - local_expert_start
-                if lid >= 0 and lid < num_local_experts:
-                    v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    if APPLY_WEIGHTS:
-                        w = tl.load(topk_weights_ptr + token_id * topk + t)
-                        if ACC_FP64:
-                            acc += v.to(tl.float64) * w.to(tl.float64)
-                        else:
-                            acc += v.to(tl.float32) * w
+    for tile in tl.range(pid_t, num_tiles, num_programs_t):
+        tok = (tile * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
+        tok_mask = tok < valid_tokens
+        acc = tl.zeros([BLOCK_T, BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
+        # The tile's [BLOCK_T, topk] routing block in one load.
+        lids = (
+            tl.load(
+                routing_map_ptr + tok[:, None] * topk + slots[None, :],
+                mask=tok_mask[:, None] & (slots[None, :] < topk),
+                other=-1,
+            )
+            - local_expert_start
+        )
+        local = (lids >= 0) & (lids < num_local_experts)
+        # Bit t set: some token of the tile has slot t on this rank.
+        slot_used = tl.max(local.to(tl.int64), axis=0)
+        used_bits = tl.sum(slot_used << slots.to(tl.int64), axis=0)
+        for t in tl.static_range(topk):
+            # Skipping a slot adds nothing, exactly like loading it fully masked.
+            if ((used_bits >> t) & 1) != 0:
+                lid = (
+                    tl.load(routing_map_ptr + tok * topk + t, mask=tok_mask, other=-1)
+                    - local_expert_start
+                )
+                is_local = (lid >= 0) & (lid < num_local_experts) & tok_mask
+                # Masked lanes load 0 and add nothing; they cost no memory traffic.
+                v = tl.load(
+                    input_ptr + (tok * topk + t)[:, None] * K + offs_k[None, :],
+                    mask=is_local[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                if APPLY_WEIGHTS:
+                    w = tl.load(topk_weights_ptr + tok * topk + t, mask=is_local, other=0.0)
+                    # Explicit fused multiply-add: left to the compiler, `acc += v * w` is
+                    # fused or not depending on the output dtype and tile shape, which changes
+                    # the rounding of these heavily cancelling sums.
+                    if ACC_FP64:
+                        acc = tl.fma(v.to(tl.float64), w.to(tl.float64)[:, None], acc)
                     else:
-                        if ACC_FP64:
-                            acc += v.to(tl.float64)
-                        else:
-                            acc += v.to(tl.float32)
+                        acc = tl.fma(v.to(tl.float32), w[:, None], acc)
+                else:
+                    if ACC_FP64:
+                        acc += v.to(tl.float64)
+                    else:
+                        acc += v.to(tl.float32)
 
-            tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
+        if WRITE_UNROUTED:
+            row_mask = tok_mask
+        else:
+            row_mask = tl.max(local.to(tl.int32), axis=1) > 0
+        tl.store(
+            output_ptr + tok[:, None] * K + offs_k[None, :],
+            acc.to(tl.float32),
+            mask=row_mask[:, None] & k_mask[None, :],
+        )
 
 
 def _moe_sum(
@@ -633,6 +681,8 @@ def _moe_sum(
     out: Optional[torch.Tensor] = None,
     apply_weights: bool = True,
     acc_fp64: bool = False,
+    write_unrouted_rows: bool = True,
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
@@ -652,13 +702,24 @@ def _moe_sum(
             (e.g. at the activation in batch-invariant mode).
         acc_fp64: accumulate the topk sum in fp64, making the reduction
             order-independent by precision.
+        write_unrouted_rows: write a zero row for valid tokens with no local expert
+            (default). Pass False when the consumer never reads those rows (the
+            all-to-all-v combine): they are then left untouched.
+        config: overrides of _MOE_SUM_CONFIG (for tuning; the result does not depend on it).
     """
     if out is None:
         out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
-    BLOCK_K = min(triton.next_power_of_2(K), 1024)
-    NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    BLOCK_M = _get_num_sms(input.device)
-    _moe_sum_kernel[(BLOCK_M,)](
+    cfg = {**_MOE_SUM_CONFIG, **(config or {})}
+    BLOCK_T = cfg["BLOCK_T"]
+    BLOCK_K = min(triton.next_power_of_2(K), cfg["BLOCK_K"])
+    num_k_blocks = _ceil_div(K, BLOCK_K)
+    # Static grid (CUDA graphs): enough programs to fill every SM programs_per_sm times, but
+    # no more token programs than max_tokens has tiles.
+    num_token_programs = min(
+        _ceil_div(max_tokens, BLOCK_T),
+        max(1, cfg["programs_per_sm"] * _get_num_sms(input.device) // num_k_blocks),
+    )
+    _moe_sum_kernel[(num_token_programs, num_k_blocks)](
         input,
         out,
         topk_weights,
@@ -668,11 +729,13 @@ def _moe_sum(
         num_local_experts,
         K,
         topk=topk,
-        BLOCK_M=BLOCK_M,
+        BLOCK_T=BLOCK_T,
         BLOCK_K=BLOCK_K,
-        NUM_K_BLOCKS=NUM_K_BLOCKS,
+        TOPK_POW2=triton.next_power_of_2(topk),
         APPLY_WEIGHTS=apply_weights,
         ACC_FP64=acc_fp64,
+        WRITE_UNROUTED=write_unrouted_rows,
+        num_warps=cfg["num_warps"],
     )
     return out
 
@@ -695,6 +758,7 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
+    write_unrouted_rows: bool = True,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -722,6 +786,9 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
+        write_unrouted_rows: write a zero output row for valid tokens with no local
+            expert (default). False leaves those rows untouched, for consumers that never
+            read them (the all-to-all-v combine).
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -884,4 +951,5 @@ def vllm_fused_moe(
         out=out,
         apply_weights=apply_routing_weights,
         acc_fp64=accumulate_in_fp64,
+        write_unrouted_rows=write_unrouted_rows,
     )
