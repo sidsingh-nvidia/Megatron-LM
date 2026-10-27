@@ -95,6 +95,234 @@ class TestPackRouting:
         assert torch.equal(got, ref)
 
 
+if trtllm_bf16.HAVE_TRITON:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _one_token_finalize_kernel(
+        gemm2_ptr,
+        weights_ptr,
+        inverse_map_ptr,
+        output_ptr,
+        valid_tokens_ptr,
+        hidden_size,
+        gemm2_rows,
+        TOP_K: tl.constexpr,
+        BLOCK_TOP_K: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        NUM_TOKEN_BLOCKS: tl.constexpr,
+        NUM_H_BLOCKS: tl.constexpr,
+    ):
+        """The previous finalize kernel (one token per iteration, every slot of a routed
+        token), kept as the bit-exact reference for the tiled kernel."""
+        token_pid = tl.program_id(0)
+        hidden_pid = tl.program_id(1)
+        valid_tokens = tl.load(valid_tokens_ptr).to(tl.int32)
+        top_k_offsets = tl.arange(0, BLOCK_TOP_K)
+        top_k_mask = top_k_offsets < TOP_K
+        for token in tl.range(token_pid, valid_tokens, NUM_TOKEN_BLOCKS):
+            mapped_rows = tl.load(
+                inverse_map_ptr + token * TOP_K + top_k_offsets, mask=top_k_mask, other=-1
+            ).to(tl.int32)
+            local_mask = top_k_mask & (mapped_rows >= 0) & (mapped_rows < gemm2_rows)
+            has_local_expert = tl.sum(local_mask.to(tl.int32), axis=0) > 0
+            for hidden_offset in tl.range(
+                hidden_pid * BLOCK_H, hidden_size, NUM_H_BLOCKS * BLOCK_H
+            ):
+                offsets = hidden_offset + tl.arange(0, BLOCK_H)
+                offsets_mask = offsets < hidden_size
+                accumulator = tl.zeros([BLOCK_H], dtype=tl.float32)
+                if has_local_expert:
+                    for top_k_idx in range(TOP_K):
+                        mapped_row = tl.load(inverse_map_ptr + token * TOP_K + top_k_idx).to(
+                            tl.int32
+                        )
+                        is_local = (mapped_row >= 0) & (mapped_row < gemm2_rows)
+                        safe_row = tl.maximum(mapped_row, 0).to(tl.int64)
+                        weight = tl.load(
+                            weights_ptr + token * TOP_K + top_k_idx, mask=is_local, other=0.0
+                        ).to(tl.float32)
+                        value = tl.load(
+                            gemm2_ptr + safe_row * hidden_size + offsets,
+                            mask=is_local & offsets_mask,
+                            other=0.0,
+                        ).to(tl.float32)
+                        accumulator += value * weight
+                tl.store(
+                    output_ptr + token * hidden_size + offsets,
+                    accumulator.to(output_ptr.dtype.element_ty),
+                    mask=offsets_mask,
+                )
+
+
+def _one_token_finalize(gemm2_output, expert_weights, inverse_map, output, valid_tokens, top_k):
+    """Launch the reference kernel the way the previous trtllm_finalize did."""
+    rows, hidden_size = output.shape
+    num_token_blocks = min(rows, 128)
+    num_h_blocks = min(triton.cdiv(hidden_size, 256), 8)
+    _one_token_finalize_kernel[(num_token_blocks, num_h_blocks)](
+        gemm2_output,
+        expert_weights,
+        inverse_map,
+        output,
+        valid_tokens,
+        hidden_size,
+        gemm2_output.shape[0],
+        TOP_K=top_k,
+        BLOCK_TOP_K=triton.next_power_of_2(top_k),
+        BLOCK_H=256,
+        NUM_TOKEN_BLOCKS=num_token_blocks,
+        NUM_H_BLOCKS=num_h_blocks,
+        num_warps=4,
+    )
+    return output
+
+
+def _finalize_inputs(
+    rows, hidden, top_k, num_experts, local_start, num_local, padding_every=0, weights_dtype=None
+):
+    """Finalize inputs laid out like trtllm_bf16_routed_moe(do_finalize=False) returns them.
+
+    Each token routes to top_k distinct experts (every padding_every-th token to none). GEMM2
+    rows are grouped by local expert, each group padded to a multiple of 8, and inverse_map
+    maps a (token, slot) pair to its GEMM2 row, or -1 when the expert is not local.
+    """
+    torch.manual_seed(1234)
+    ids = torch.rand(rows, num_experts, device="cuda").topk(top_k, dim=1).indices
+    if padding_every:
+        ids[::padding_every] = -1
+    local_ids = ids - local_start
+    is_local = (ids >= 0) & (local_ids >= 0) & (local_ids < num_local)
+    pairs = is_local.flatten().nonzero().squeeze(1)
+    experts = local_ids.flatten()[pairs]
+    order = torch.argsort(experts, stable=True)
+    counts = torch.bincount(experts, minlength=num_local)
+    padded = (counts + 7) // 8 * 8
+    group_start = torch.cumsum(padded, 0) - padded
+    sorted_experts = experts[order]
+    rank_in_group = (
+        torch.arange(order.numel(), device="cuda")
+        - (torch.cumsum(counts, 0) - counts)[sorted_experts]
+    )
+    inverse_map = torch.full((rows * top_k,), -1, dtype=torch.int32, device="cuda")
+    inverse_map[pairs[order]] = (group_start[sorted_experts] + rank_in_group).int()
+    gemm2 = torch.randn(max(int(padded.sum()), 8), hidden, device="cuda").bfloat16()
+    weights = torch.rand(rows, top_k, device="cuda").to(weights_dtype or torch.bfloat16)
+    return gemm2, weights, inverse_map.view(rows, top_k), is_local.any(dim=1)
+
+
+def _vt(n):
+    return torch.tensor([n], dtype=torch.int32, device="cuda")
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not trtllm_bf16.HAVE_TRITON, reason="needs Triton")
+class TestTrtllmFinalize:
+
+    @pytest.mark.parametrize("hidden", [128, 1000, 2048])
+    @pytest.mark.parametrize(
+        "num_experts,local_start,num_local,padding_every",
+        [(64, 0, 64, 0), (64, 8, 8, 0), (512, 24, 8, 5)],
+    )
+    @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_bit_exact_vs_one_token(
+        self, hidden, num_experts, local_start, num_local, padding_every, out_dtype, weights_dtype
+    ):
+        """The tiled kernel sums the same slots in the same order as the previous kernel, so
+        every written element is bit-identical; rows >= valid_tokens stay untouched."""
+        rows, top_k, valid = 300, 22, 287
+        gemm2, weights, inverse_map, _ = _finalize_inputs(
+            rows, hidden, top_k, num_experts, local_start, num_local, padding_every, weights_dtype
+        )
+
+        def fresh_out():
+            return torch.full((rows, hidden), float("nan"), device="cuda", dtype=out_dtype)
+
+        expected = _one_token_finalize(gemm2, weights, inverse_map, fresh_out(), _vt(valid), top_k)
+        result = trtllm_bf16.trtllm_finalize(
+            gemm2, weights, inverse_map, fresh_out(), _vt(valid), top_k
+        )
+        assert torch.equal(result[:valid], expected[:valid])
+        assert torch.isnan(result[valid:]).all()
+
+    # BLOCK_T=1 masks a row with the tile's scalar slot mask, larger tiles per row.
+    @pytest.mark.parametrize("block_t", [1, 4])
+    @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+    def test_skip_unrouted_rows(self, block_t, out_dtype):
+        """write_unrouted_rows=False leaves rows with no local expert untouched and writes
+        every other valid row bit-identically to the default."""
+        rows, hidden, top_k, valid = 300, 1000, 22, 287
+        gemm2, weights, inverse_map, routed = _finalize_inputs(
+            rows, hidden, top_k, 512, 24, 8, padding_every=5
+        )
+        routed[valid:] = False
+        assert routed.any() and not routed[:valid].all()
+
+        def run(write_unrouted_rows):
+            out = torch.full((rows, hidden), float("nan"), device="cuda", dtype=out_dtype)
+            return trtllm_bf16.trtllm_finalize(
+                gemm2,
+                weights,
+                inverse_map,
+                out,
+                _vt(valid),
+                top_k,
+                write_unrouted_rows=write_unrouted_rows,
+                config={"BLOCK_T": block_t},
+            )
+
+        full, skipped = run(True), run(False)
+        assert torch.equal(skipped[routed], full[routed])
+        assert torch.isnan(skipped[~routed]).all()
+        assert not torch.isnan(full[:valid]).any()
+        assert torch.isnan(full[valid:]).all()
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"BLOCK_T": 4, "BLOCK_H": 512, "programs_per_sm": 8, "num_warps": 4},
+            {"BLOCK_T": 2, "BLOCK_H": 128, "programs_per_sm": 1, "num_warps": 1},
+            {"BLOCK_T": 8, "BLOCK_H": 256, "programs_per_sm": 16, "num_warps": 8},
+            {"BLOCK_T": 1, "BLOCK_H": 1024, "programs_per_sm": 4, "num_warps": 4},
+        ],
+    )
+    @pytest.mark.parametrize("write_unrouted_rows", [True, False])
+    def test_result_independent_of_launch_config(self, config, write_unrouted_rows):
+        """Tile sizes and program counts change only who computes an element, not how."""
+        rows, hidden, top_k, valid = 300, 1000, 22, 291
+        gemm2, weights, inverse_map, _ = _finalize_inputs(
+            rows, hidden, top_k, 512, 24, 8, padding_every=7
+        )
+
+        def run(cfg):
+            out = torch.full((rows, hidden), float("nan"), device="cuda")
+            return trtllm_bf16.trtllm_finalize(
+                gemm2,
+                weights,
+                inverse_map,
+                out,
+                _vt(valid),
+                top_k,
+                write_unrouted_rows=write_unrouted_rows,
+                config=cfg,
+            )
+
+        # Bitwise, so that unwritten (NaN) rows compare equal too.
+        assert torch.equal(run(None).view(torch.int32), run(config).view(torch.int32))
+
+    @pytest.mark.parametrize("write_unrouted_rows", [True, False])
+    def test_zero_valid_tokens_writes_nothing(self, write_unrouted_rows):
+        rows, hidden, top_k = 64, 256, 22
+        gemm2, weights, inverse_map, _ = _finalize_inputs(rows, hidden, top_k, 64, 0, 8)
+        out = torch.full((rows, hidden), float("nan"), device="cuda")
+        trtllm_bf16.trtllm_finalize(
+            gemm2, weights, inverse_map, out, _vt(0), top_k, write_unrouted_rows=write_unrouted_rows
+        )
+        assert torch.isnan(out).all()
+
+
 class _FakeGroup:
     def __init__(self, size):
         self._size = size
