@@ -14,8 +14,8 @@
 #
 # Run from the Megatron-LM repo root:
 #   source inference-bench/cluster.env
-#   sbatch inference-bench/server/launch.sh
-#   sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch.sh
+#   sbatch inference-bench/server/launch_minf.sh
+#   sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch_minf.sh
 #
 # Knobs (environment variables):
 #   EXP_NAME           run label                                    (default: run)
@@ -70,7 +70,7 @@
 # Output: inference-bench/experiments/<timestamp>_<EXP_NAME>/ with config.env, server_rank*.log and,
 # with BENCH, bench.log + bench.json. The server listens on port 5000 (OpenAI API at /v1).
 
-SCRIPT=inference-bench/server/launch.sh
+SCRIPT=inference-bench/server/launch_minf.sh
 
 # ── Outer: inside sbatch, launch one task per GPU in the container ─────────────
 if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
@@ -82,7 +82,7 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     echo "Experiment directory: ${EXP_DIR}"
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
-    cp "${SCRIPT}" "${EXP_DIR}/launch.sh"
+    cp "${SCRIPT}" "${EXP_DIR}/launch_minf.sh"
     export INFERENCE_BENCH_INNER=1
     NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
     if [ "${MODEL:-nanov3p5}" == "ultrav3" ] && [ "${NUM_NODES}" -lt 2 ]; then
@@ -94,7 +94,7 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         --container-image "${INFERENCE_BENCH_SERVE_IMAGE:?set in cluster.env}" \
         --container-name "inference_bench_${SLURM_JOB_ID}" \
         --container-mounts "${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
-        --container-workdir="${PWD}" bash "${EXP_DIR}/launch.sh"
+        --container-workdir="${PWD}" bash "${EXP_DIR}/launch_minf.sh"
     exit $?
 fi
 
