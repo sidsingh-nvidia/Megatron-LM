@@ -67,6 +67,9 @@ def main():
         print(f"=== {name} [{mode}] {'PASS' if ok else 'FAIL'} "
               f"(reasoning {len(reasoning)} chars, content {len(content)} chars)")
         print(content.strip()[:600])
+        if not content.strip() and reasoning:
+            # No answer: show where the reasoning starts and ends (coherent but long, or garbage).
+            print(f"[reasoning head] {reasoning[:300]!r}\n[reasoning tail] {reasoning[-300:]!r}")
     print(f"\n{passed}/{len(PROMPTS)} prompts pass alone")
 
 
