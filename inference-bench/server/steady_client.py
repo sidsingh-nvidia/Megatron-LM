@@ -34,16 +34,40 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from collect_rollouts import PROMPT_SUFFIX, load_rows  # noqa: E402
 
 
+# vLLM's names for the mcore:* counters (vLLM's prompt-token counter includes cached tokens).
+VLLM_METRICS = {
+    "generation_tokens_total": "generation_tokens_total",
+    "prompt_tokens_total": "prompt_tokens_total",
+    "prompt_tokens_cached_total": "prompt_tokens_cached_total",
+    "request_success_total": "requests_finished_total",
+    "iteration_tokens_total_count": "engine_steps_total",
+    "num_requests_running": "requests_running",
+    "num_requests_waiting": "requests_waiting",
+}
+
+
 def read_metrics(server):
-    """Summed (unlabeled) values of the server's mcore:* metrics."""
+    """The server's mcore:* metrics (or vLLM's equivalents). mcore prints each metric per
+    engine (labeled) and as an unlabeled total, so the total is used when present; vLLM prints
+    only labeled lines, which are summed."""
     with urllib.request.urlopen(f"{server}/metrics", timeout=120) as resp:
         text = resp.read().decode()
-    out = {}
+    totals, labeled_sums = {}, {}
     for line in text.splitlines():
-        if line.startswith("mcore:") and "{" not in line:
-            name, value = line.split()
-            out[name[len("mcore:"):]] = float(value)
-    return out
+        if not line.startswith(("mcore:", "vllm:")):
+            continue
+        name, value = line.rsplit(None, 1)
+        labeled = "{" in name
+        prefix, _, name = name.split("{")[0].partition(":")
+        if prefix == "vllm":
+            name = VLLM_METRICS.get(name)
+        if name not in VLLM_METRICS.values():
+            continue
+        if labeled:
+            labeled_sums[name] = labeled_sums.get(name, 0.0) + float(value)
+        else:
+            totals[name] = float(value)
+    return {name: totals.get(name, labeled_sums.get(name, 0.0)) for name in VLLM_METRICS.values()}
 
 
 def percentile(values, q):
