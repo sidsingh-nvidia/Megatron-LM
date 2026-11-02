@@ -21,28 +21,38 @@ import re
 
 EXPERIMENTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experiments")
 
-# Interactivity SLOs (tokens/s/user): a median 18.9K-token answer in ~3 min at 100 (Super) and
-# ~6 min at 50 (Ultra); Ultra wide also marks a stricter 70 (~4.5 min), and Super wide a looser
-# 80 (~4 min), which vLLM reaches there while it never reaches 100.
+# Interactivity SLOs (p90 tokens/s/user): a median 18.9K-token answer in ~3 min at 100 (Super)
+# and ~6 min at 50 (Ultra); Ultra wide also marks a stricter 60 (~5 min; vLLM's p90 never
+# reaches 70 there), and Super wide a looser 80 (~4 min), which vLLM reaches there while it
+# never reaches 100.
 SUPER_SLO, ULTRA_SLO = [100], [50]
 
-# Panels per figure: (title lines, MInf run, vLLM run or None while pending, SLO lines).
+# Interactivity is the p90-slowest request's tokens/s (InferenceX style); throughput and
+# interactivity are each averaged over the repeated runs of a configuration, level by level.
+INTERACTIVITY = "user_tok_s_p90_slow"
+
+# Panels per figure: (title lines, MInf runs, vLLM runs, SLO lines); each runs entry is the
+# three independent trials of one configuration.
 FIGURES = {
     "e2e_wide": [
-        (("Nemotron-3-Super-120B-A12B", r"TP4$\times$DP16, EP64"),
-         "20261024_160510_math_superv3_wide_ep_nvls", "20261028_141706_superv3_wide_ep_vllm",
-         [(80, "left")] + SUPER_SLO),
         (("Nemotron-3-Ultra-550B-A55B", r"TP8$\times$DP8, EP64"),
-         "20261024_184036_math_ultrav3_wide_ep_nvls", "20261027_165152_ultrav3_wide_ep_vllm",
-         ULTRA_SLO + [70]),
+         ("20261024_184036_math_ultrav3_wide_ep_nvls", "20261029_121740_math_ultrav3_wide_ep_nvls_rep2", "20261029_190451_math_ultrav3_wide_ep_nvls_rep3"),
+         ("20261027_165152_ultrav3_wide_ep_vllm", "20261029_125620_ultrav3_wide_ep_vllm_rep2", "20261029_190451_ultrav3_wide_ep_vllm_rep3"),
+         ULTRA_SLO + [60]),
+        (("Nemotron-3-Super-120B-A12B", r"TP4$\times$DP16, EP64"),
+         ("20261024_160510_math_superv3_wide_ep_nvls", "20261029_133805_math_superv3_wide_ep_nvls_rep2", "20261029_170943_math_superv3_wide_ep_nvls_rep3"),
+         ("20261028_141706_superv3_wide_ep_vllm", "20261029_121420_superv3_wide_ep_vllm_rep2", "20261029_181520_superv3_wide_ep_vllm_rep3"),
+         [(80, "left")] + SUPER_SLO),
     ],
     "e2e_narrow": [
-        (("Nemotron-3-Super-120B-A12B", r"TP4$\times$DP2, EP8"),
-         "20261024_175142_math_superv3_narrow_ep_nvls",
-         "20261027_162013_superv3_narrow_ep_vllm_fi_one_sided", SUPER_SLO),
         (("Nemotron-3-Ultra-550B-A55B", "TP8, EP8"),
-         "20261024_171149_math_ultrav3_narrow_ep_nvls", "20261027_154043_ultrav3_narrow_ep_vllm",
+         ("20261024_171149_math_ultrav3_narrow_ep_nvls", "20261029_113536_math_ultrav3_narrow_ep_nvls_rep2", "20261029_162257_math_ultrav3_narrow_ep_nvls_rep3"),
+         ("20261027_154043_ultrav3_narrow_ep_vllm", "20261029_125840_ultrav3_narrow_ep_vllm_rep2", "20261029_162257_ultrav3_narrow_ep_vllm_rep3"),
          ULTRA_SLO),
+        (("Nemotron-3-Super-120B-A12B", r"TP4$\times$DP2, EP8"),
+         ("20261024_175142_math_superv3_narrow_ep_nvls", "20261029_105211_math_superv3_narrow_ep_nvls_rep2", "20261029_153823_math_superv3_narrow_ep_nvls_rep3"),
+         ("20261027_162013_superv3_narrow_ep_vllm_fi_one_sided", "20261029_105212_superv3_narrow_ep_vllm_rep2", "20261029_153823_superv3_narrow_ep_vllm_rep3"),
+         SUPER_SLO),
     ],
 }
 
@@ -53,26 +63,38 @@ def gpus_of(run):
     return 4 * int(m.group(1))
 
 
-def points(run):
-    """(tokens/s/user, tokens/s/GPU) per concurrency level, without the 1-per-GPU level."""
+def levels(run):
+    """{concurrency: (tokens/s/user, tokens/s/GPU)} of one run, without the 1-per-GPU level."""
     gpus = gpus_of(run)
-    out = []
+    out = {}
     for line in open(os.path.join(EXPERIMENTS, run, "steady.jsonl")):
         r = json.loads(line)
-        if r["concurrency"] == gpus or r["tpot_ms_p50"] != r["tpot_ms_p50"]:
+        if r["concurrency"] == gpus or r[INTERACTIVITY] != r[INTERACTIVITY]:
             continue
-        out.append((r["user_tok_s_p50"], r["output_tok_s"] / gpus))
+        out[r["concurrency"]] = (r[INTERACTIVITY], r["output_tok_s"] / gpus)
+    return out
+
+
+def points(runs, spread=False):
+    """(tokens/s/user, tokens/s/GPU) per concurrency level, each the mean over the repeated runs
+    (levels every run measured); with spread, also each axis's half range (max - min) / 2."""
+    per_run = [levels(r) for r in runs]
+    common = sorted(set.intersection(*(set(lv) for lv in per_run)))
+    out = []
+    for c in common:
+        vals = [[lv[c][k] for lv in per_run] for k in (0, 1)]
+        mean = tuple(sum(v) / len(v) for v in vals)
+        out.append(mean + tuple((max(v) - min(v)) / 2 for v in vals) if spread else mean)
     return out
 
 
 def at_interactivity(pts, x):
-    """Throughput at interactivity x, linearly interpolated between measured levels (None if
-    x is outside the measured range)."""
-    pts = sorted(pts)
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if x0 <= x <= x1:
-            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-    return None
+    """Throughput at interactivity x, linearly interpolated between consecutive concurrency
+    levels (pts in concurrency order); the highest if the curve crosses x more than once, None
+    if it never reaches x."""
+    ys = [y0 + (y1 - y0) * (x - x0) / (x1 - x0) if x1 != x0 else max(y0, y1)
+          for (x0, y0), (x1, y1) in zip(pts, pts[1:]) if min(x0, x1) <= x <= max(x0, x1)]
+    return max(ys) if ys else None
 
 
 def nice_max(v):
@@ -85,26 +107,27 @@ def coords(pts):
     return " ".join(f"({x:.1f},{y:.1f})" for x, y in pts)
 
 
-def panel(title, sys_run, vllm_run, slos, first, legend_name):
-    """One \\nextgroupplot block."""
+def panel(title, sys_run, vllm_run, slos, first, legend_name, ylabel=None):
+    """One \\nextgroupplot block; the first panel carries the legend, and ylabel (default: the
+    first panel's) the y label."""
     sys_pts = points(sys_run)
-    vllm_pts = points(vllm_run) if vllm_run else []
+    vllm_pts = points(vllm_run)
     xmax = nice_max(max(x for x, _ in sys_pts + vllm_pts))
     ymax = nice_max(max(y for _, y in sys_pts + vllm_pts))
     opts = [f"title={{{title[0]}\\\\{title[1]}}}", f"xmax={xmax:g}", f"ymax={ymax:g}"]
+    if first if ylabel is None else ylabel:
+        opts.append("ylabel={Throughput (tokens/s/GPU)}")
     if first:
-        opts += ["ylabel={Throughput (tokens/s/GPU)}", f"legend to name={legend_name}"]
+        opts.append(f"legend to name={legend_name}")
     out = ["\\nextgroupplot[" + ", ".join(opts) + "]"]
     if first:
         # Legend entries independent of the data, so a pending series still gets its entry.
         out += ["  \\addlegendimage{sysline}\\addlegendentry{\\sys{}}",
                 "  \\addlegendimage{vllmline}\\addlegendentry{vLLM}"]
+    # Run-to-run spread (points(..., spread=True)) is below the marker size, so it is stated in
+    # the caption rather than drawn as error bars.
     out.append(f"  \\addplot[sysline, forget plot] coordinates {{{coords(sys_pts)}}};")
-    if vllm_pts:
-        out.append(f"  \\addplot[vllmline, forget plot] coordinates {{{coords(vllm_pts)}}};")
-    else:
-        out.append("  \\node[text=figredtext, font=\\figfont\\bfseries\\scriptsize] "
-                   "at (rel axis cs:0.45,0.3) {vLLM pending};")
+    out.append(f"  \\addplot[vllmline, forget plot] coordinates {{{coords(vllm_pts)}}};")
     for i, slo in enumerate(slos):
         # An SLO is a number, or (number, "left") to put its ratio label left of the line
         # (clear of data points sitting on the line's foot).
@@ -129,7 +152,7 @@ def panel(title, sys_run, vllm_run, slos, first, legend_name):
 def figure(name, panels):
     legend_name = name.replace("_", "") + "legend"
     blocks = [panel(*p, first=(i == 0), legend_name=legend_name) for i, p in enumerate(panels)]
-    runs = ", ".join(r for p in panels for r in p[1:3] if r)
+    runs = ", ".join(r for p in panels for rs in p[1:3] for r in rs)
     return f"""% Generated by inference-bench/analysis/paper_figures.py; edit the script, not this block.
 % Runs: {runs}
 \\begin{{tikzpicture}}[
@@ -146,10 +169,52 @@ def figure(name, panels):
 \\end{{groupplot}}
 \\node[anchor=north, font=\\figfont\\footnotesize]
     at ($(group c1r1.south)!0.5!(group c{len(panels)}r1.south) + (0,-5mm)$)
-    {{Interactivity (tokens/s/user)}};
+    {{P90 interactivity (tokens/s/user)}};
 \\node[anchor=south]
     at ($(group c1r1.north)!0.5!(group c{len(panels)}r1.north) + (0,7mm)$)
     {{\\pgfplotslegendfromname{{{legend_name}}}}};
+\\end{{tikzpicture}}
+"""
+
+
+def e2e_figure():
+    """One 2x2 figure: (a) wide EP on the top row, (b) narrow EP on the bottom row, a shared
+    legend above and one shared x label."""
+    rows = [("(a) Wide EP on 64 GPUs", FIGURES["e2e_wide"]),
+            ("(b) Narrow EP on 8 GPUs", FIGURES["e2e_narrow"])]
+    blocks, runs = [], []
+    for r, (label, panels) in enumerate(rows):
+        blocks.append(f"% ---- {label.split(')')[0]}) {label.split(') ')[1].split(' on')[0]} ----")
+        for i, p in enumerate(panels):
+            blocks.append(panel(*p, first=(r == 0 and i == 0), legend_name="e2elegend",
+                                ylabel=(i == 0)))
+        runs.append(f"% Runs ({'wide' if r == 0 else 'narrow'}): "
+                    + ", ".join(x for p in panels for rs in p[1:3] for x in rs))
+    return f"""% Generated by inference-bench/analysis/paper_figures.py; edit the script, not this block.
+{chr(10).join(runs)}
+\\begin{{tikzpicture}}[
+    sloline/.style={{draw=figgrayline, densely dashed, line width=0.6pt, mark=none}},
+    slolabel/.style={{anchor=north west, inner sep=1pt, font=\\figfont\\tiny, text=black!60}},
+    sloratio/.style={{anchor=south, fill=white, inner sep=1pt, font=\\figfont\\bfseries\\tiny}},
+    ring/.style={{only marks, mark=o, mark size=2.2pt, mark options={{solid, line width=0.7pt}}}},
+    rowlbl/.style={{anchor=south, font=\\figfont\\footnotesize}}]
+\\begin{{groupplot}}[mplot, set layers, scale only axis, width=29mm, height=24mm,
+    group style={{group size=2 by 2, horizontal sep=10mm, vertical sep=21mm}},
+    xmin=0, ymin=0,
+    title style={{font=\\figfont\\scriptsize, align=center, inner sep=1pt}},
+    legend columns=2, legend style={{draw=none, fill=none, column sep=6pt}}]
+{chr(10).join(blocks)}
+\\end{{groupplot}}
+\\node[rowlbl] at ($(group c1r1.north)!0.5!(group c2r1.north) + (0,8mm)$)
+    {{{rows[0][0]}}};
+\\node[rowlbl] at ($(group c1r2.north)!0.5!(group c2r2.north) + (0,8mm)$)
+    {{{rows[1][0]}}};
+\\node[anchor=north, font=\\figfont\\footnotesize]
+    at ($(group c1r2.south)!0.5!(group c2r2.south) + (0,-5mm)$)
+    {{P90 interactivity (tokens/s/user)}};
+\\node[anchor=south]
+    at ($(group c1r1.north)!0.5!(group c2r1.north) + (0,12.5mm)$)
+    {{\\pgfplotslegendfromname{{e2elegend}}}};
 \\end{{tikzpicture}}
 """
 
@@ -228,13 +293,12 @@ def replace_block(path, name, body):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tex", required=True,
-                    help="inference-perf section, with % BEGIN/% END e2e_wide / e2e_narrow blocks")
+                    help="inference-perf section, with a % BEGIN/% END e2e block")
     ap.add_argument("--parallelism-tex", default=None,
                     help="tex/dp_ep_tp.tex (DP / TP / EP subsections), with a "
                          "% BEGIN/% END micro_collectives block")
     args = ap.parse_args()
-    for name, panels in FIGURES.items():
-        replace_block(args.tex, name, figure(name, panels))
+    replace_block(args.tex, "e2e", e2e_figure())
     if args.parallelism_tex:
         replace_block(args.parallelism_tex, "micro_collectives", collectives_figure())
 
