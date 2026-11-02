@@ -4,7 +4,7 @@
 # GPU partitions reject GPU-less jobs; taking all 4 also keeps the node (and its CPUs) to ourselves.
 #SBATCH --gres=gpu:4
 #
-# Run a client from its own node against a server started by launch.sh (without BENCH), so the
+# Run a client from its own node against a server started by launch_minf.sh or launch_vllm.sh (without BENCH), so the
 # client does not share CPUs with rank 0's engine, frontend and coordinator. CLIENT=steady (the
 # default) runs steady_client.py: BENCH concurrency levels of closed-loop math-blend load,
 # throughput from the server's /metrics and interactivity per finished request. CLIENT=smoke runs
@@ -14,15 +14,16 @@
 #
 # Run from the Megatron-LM repo root:
 #   source inference-bench/cluster.env
-#   SERVER_JOB=$(sbatch --parsable -q short -t 2:00:00 -N 16 --export=ALL,EXP_NAME=decode,MODEL=ultrav3,... inference-bench/server/launch.sh)
+#   SERVER_JOB=$(sbatch --parsable -q short -t 2:00:00 -N 16 --export=ALL,EXP_NAME=decode,MODEL=ultrav3,... inference-bench/server/launch_minf.sh)
 #   sbatch --dependency=after:${SERVER_JOB} --export=ALL,SERVER_JOB=${SERVER_JOB},BENCH="1 2 4 8" inference-bench/server/client.sh
 #
-# Knobs: SERVER_JOB (required: the launch.sh job id), CLIENT (steady | smoke; default steady),
+# Knobs: SERVER_JOB (required: the launch_minf.sh / launch_vllm.sh job id), CLIENT (steady | smoke |
+# sanity, the greedy checkable-answer prompts of sanity.py; default steady),
 # STEADY_WARMUP / STEADY_WINDOW (seconds per level; default 60 / 300), MAX_GEN_TOKENS (steady
 # output cap; default 0 = none), KEEP_SERVER (1 = leave the server running
 # after the sweep; default 0), PROFILE (1 = bracket the first batch size's timed iterations with
 # /start_profile + /stop_profile; the server must also run with PROFILE=1) and the BENCH_* knobs of
-# launch.sh (BENCH, BENCH_DATASET,
+# launch_minf.sh (BENCH, BENCH_DATASET,
 # BENCH_MIN_ISL, BENCH_ISL, BENCH_EXACT_ISLS, BENCH_OSL, BENCH_ITERS, BENCH_WARMUP).
 
 SCRIPT=inference-bench/server/client.sh
@@ -30,9 +31,9 @@ SCRIPT=inference-bench/server/client.sh
 if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     cd "${SLURM_SUBMIT_DIR:-$PWD}"
     source "${INFERENCE_BENCH_CONFIG:-inference-bench/cluster.env}"
-    : "${SERVER_JOB:?set SERVER_JOB to the launch.sh job id}" "${BENCH:?set BENCH, e.g. \"1 16 64\"}"
+    : "${SERVER_JOB:?set SERVER_JOB to the launch_minf.sh / launch_vllm.sh job id}" "${BENCH:?set BENCH, e.g. \"1 16 64\"}"
     export INFERENCE_BENCH_INNER=1
-    # Private copy, as in launch.sh.
+    # Private copy, as in launch_minf.sh.
     COPY="inference-bench/experiments/.client_${SLURM_JOB_ID:-$$}.sh"
     mkdir -p inference-bench/experiments && cp "${SCRIPT}" "${COPY}"
     srun -N 1 -n 1 \
@@ -53,10 +54,10 @@ until [ -n "${EXP_DIR}" ]; do
 done
 echo "Server experiment directory: ${EXP_DIR}"
 
-# launch.sh writes <exp dir>/host once the HTTP server is up; done means it already exited.
+# The launcher writes <exp dir>/host once the HTTP server is up; done means it already exited.
 until [ -f "${EXP_DIR}/host" ]; do
     if [ -f "${EXP_DIR}/done" ]; then
-        echo "Server exited before becoming ready; see ${EXP_DIR}/server_rank0.log"
+        echo "Server exited before becoming ready; see the server logs in ${EXP_DIR}"
         exit 1
     fi
     sleep 10
@@ -72,7 +73,11 @@ EOF
 
 # One thread per in-flight request.
 ulimit -u unlimited 2>/dev/null
-if [ "${CLIENT:-steady}" == "steady" ]; then
+if [ "${CLIENT:-steady}" == "sanity" ]; then
+    # Greedy prompts with checkable answers, alone and in a concurrent batch.
+    python3 -u inference-bench/server/sanity.py --server "${SERVER}" 2>&1 | tee "${EXP_DIR}/bench.log"
+    status=${PIPESTATUS[0]}
+elif [ "${CLIENT:-steady}" == "steady" ]; then
     echo "CLIENT=steady STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
     python3 -u inference-bench/server/steady_client.py \
         --server "${SERVER}" \

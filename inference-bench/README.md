@@ -3,8 +3,10 @@
 Tooling for benchmarking and profiling the mcore dynamic inference server on
 Nemotron MoE models, built to compare the MoE expert-parallel dispatchers (`nvls`, `nvl_a2a`).
 
-- `server/launch.sh`: one sbatch script that serves nano-3.5 or Super v3 on one 4-GPU node (Ultra v3
+- `server/launch_minf.sh`: one sbatch script that serves nano-3.5 or Super v3 on one 4-GPU node (Ultra v3
   on two) and, optionally, runs a throughput sweep or an nsys profile inside the same job.
+- `server/launch_vllm.sh`: the vLLM counterpart (one engine over all the job's GPUs: TP x DP with
+  expert parallelism over every GPU), with the same port, experiment directory and client handshake.
 - `run.sh` + `configs/`: submit a server and its client from one run config (see "Run configs").
 - `server/steady_client.py`: the steady-state MATH client (closed-loop load at fixed concurrency,
   throughput from the server's `/metrics`); see "Steady-state MATH workflow".
@@ -15,7 +17,7 @@ Nemotron MoE models, built to compare the MoE expert-parallel dispatchers (`nvls
   (2 nodes, TP8 x EP8).
 
 Run everything from the Megatron-LM repo root. Every knob and its default is documented at the
-top of `server/launch.sh`.
+top of `server/launch_minf.sh`.
 
 ## Setup
 
@@ -39,7 +41,13 @@ server and its client sweep from one (the client waits for the server, sweeps, t
 ```bash
 inference-bench/run.sh inference-bench/configs/math/ultrav3_wide_ep.env
 inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
+inference-bench/run.sh inference-bench/configs/math/superv3_wide_ep.env FRAMEWORK=vllm        # same run on vLLM
 ```
+
+`FRAMEWORK=vllm` serves the config's MODEL with `server/launch_vllm.sh` on the same nodes (EXP_NAME
+gets a `_vllm` suffix). vLLM takes the config's TP and PREFIX_CACHING and puts one engine over all
+GPUs, so its EP is the job's GPU count: 64 for the wide configs, 8 for the narrow ones (a single
+EP8 group, as in the mcore runs). The mcore-only knobs (EP, DISPATCHER, BUFFER_GB, ...) are ignored.
 
 | Config | Nodes | Non-expert TP x DP | Expert EP x DP | Experts / GPU | Concurrency per GPU |
 |---|---|---|---|---|---|
@@ -145,12 +153,12 @@ The server listens on port 5000 (OpenAI API at `/v1`) until the 4 h time limit. 
 printed in the slurm log and written to `<exp dir>/host`.
 
 ```bash
-sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch_minf.sh
 # Super v3, for evals: chat responses without prompt token ids
-sbatch --export=ALL,EXP_NAME=eval,MODEL=superv3,EVAL_MODE=1 inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=eval,MODEL=superv3,EVAL_MODE=1 inference-bench/server/launch_minf.sh
 # Ultra v3 (~1.1 TB of weights) on 2 nodes, TP8 x EP8; --segment keeps both nodes in one NVLink
 # domain, which the cross-node TP8 multicast collectives need
-sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra,MODEL=ultrav3 inference-bench/server/launch.sh
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra,MODEL=ultrav3 inference-bench/server/launch_minf.sh
 ```
 
 Multi-node runs launch one task per GPU on every node (`sbatch -N <n>`); global rank 0 hosts the
@@ -204,13 +212,13 @@ GPU's ~184 GiB, so memory is tight:
 
 ```bash
 # serve (evals)
-sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_eval,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,BUFFER_GB=20,MAMBA_PREFIX_GB=20 inference-bench/server/launch.sh
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_eval,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,BUFFER_GB=20,MAMBA_PREFIX_GB=20 inference-bench/server/launch_minf.sh
 
 # prefill sweep: one request per step, exact prompt lengths up to the 2048-token step budget
-sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_prefill,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS="512 1024 2048",BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=5 inference-bench/server/launch.sh
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_prefill,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS="512 1024 2048",BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=5 inference-bench/server/launch_minf.sh
 
 # decode sweep: GSM8K prompts, 1024 output tokens
-sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_decode,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,BENCH="1 2 4 8 16 32",BENCH_OSL=1024 inference-bench/server/launch.sh
+sbatch -N 2 --segment=2 --export=ALL,EXP_NAME=ultra_decode,MODEL=ultrav3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,MAX_TOKENS=2048,BENCH="1 2 4 8 16 32",BENCH_OSL=1024 inference-bench/server/launch_minf.sh
 ```
 
 ## Ultra v3 trace log
@@ -247,13 +255,13 @@ when the sweep finishes. Results go to `<exp dir>/bench.log` and `bench.json`.
 
 ```bash
 # decode-heavy: short GSM8K prompts, 1024 output tokens, batch sizes 1-128
-sbatch --export=ALL,EXP_NAME=decode,BENCH="1 2 4 8 16 32 64 128" inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=decode,BENCH="1 2 4 8 16 32 64 128" inference-bench/server/launch_minf.sh
 
 # prefill-heavy, batched: 512-1024-token ShareGPT prompts, 1 output token
-sbatch --export=ALL,EXP_NAME=prefill,BENCH="1 8 32 128",BENCH_DATASET=sharegpt,BENCH_MIN_ISL=512,BENCH_OSL=1 inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=prefill,BENCH="1 8 32 128",BENCH_DATASET=sharegpt,BENCH_MIN_ISL=512,BENCH_OSL=1 inference-bench/server/launch_minf.sh
 
 # prefill, one request per step: exact prompt lengths, CUDA graphs up to 8k tokens
-sbatch --export=ALL,EXP_NAME=prefill1,MODEL=superv3,CUDA_GRAPH_MAX_TOKENS=8192,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS="1024 2048 4096 8000",BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=5 inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=prefill1,MODEL=superv3,CUDA_GRAPH_MAX_TOKENS=8192,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS="1024 2048 4096 8000",BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=5 inference-bench/server/launch_minf.sh
 ```
 
 Notes:
@@ -277,12 +285,12 @@ brackets the timed iterations of the first batch size / prompt length with `/sta
 one-time spike, so profile at least two iterations.
 
 ```bash
-sbatch --export=ALL,EXP_NAME=trace,MODEL=superv3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,CUDA_GRAPH_MAX_TOKENS=8192,PROFILE=1,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS=4096,BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=2 inference-bench/server/launch.sh
+sbatch --export=ALL,EXP_NAME=trace,MODEL=superv3,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16,CUDA_GRAPH_MAX_TOKENS=8192,PROFILE=1,LOG_INTERVAL=1,BENCH=1,BENCH_DATASET=sharegpt,BENCH_EXACT_ISLS=4096,BENCH_OSL=1,BENCH_WARMUP=2,BENCH_ITERS=2 inference-bench/server/launch_minf.sh
 ```
 
 ## Output
 
 Each run writes `inference-bench/experiments/<timestamp>_<EXP_NAME>/` with `config.env` (knobs and
-the full server command), `server_rank*.log`, the `launch.sh` copy the ranks ran (so editing the
+the full server command), `server_rank*.log`, the `launch_minf.sh` copy the ranks ran (so editing the
 script cannot affect running jobs), and `bench.*` / `trace_rank*.nsys-rep` when enabled. Run
 outputs are git-ignored.

@@ -18,6 +18,82 @@ are under `inference-bench/experiments/` (git-ignored); analysis scripts and plo
   Checkpoint totals: routed experts 526 B params (980 GiB), Mamba 20.2 B, shared experts 8.2 B,
   router + latent 1.8 B, attention 1.7 B, embedding + LM head 2.1 B.
 
+## 2026-10-27: Megatron Core inference (MInf, NVLS) vs vLLM 0.32 on the math blend
+
+Same workload, client and metrics as the math-blend steady runs: closed loop at c users,
+natural EOS, no output cap, 60 s warmup + 300 s window per ascending level; throughput from each
+server's `/metrics`, interactivity = 1000 / median TPOT (TTFT included). Prefix caching off for
+both. vLLM 0.32.0 (`launch_vllm.sh`), one engine over all of a run's GPUs with
+`--enable-expert-parallel` and the configs' exact TP / DP; its expert GEMM is FlashInfer's
+TRT-LLM BF16 MoE, the same kernel family as MInf's `trtllm_bf16_routed`. vLLM's EP dispatch:
+
+- EP > TP (DP > 1): `--all2all-backend flashinfer_nvlink_one_sided` (FlashInfer's NVLink one-sided
+  all-to-all, what InferenceX's vLLM GB200 recipes use); vLLM's default all-gather /
+  reduce-scatter (AG/RS) shown for Super narrow.
+- EP = TP (DP = 1, Ultra narrow): no dispatch; tokens replicated across TP and the TP all-reduce
+  (FlashInfer MNNVL, fused with RMSNorm) combines. vLLM ignores the all-to-all setting here.
+
+The 1-request-per-GPU level is dropped (few completions; first level after startup). Plots:
+`analysis/pareto/mlsys-minf/`. tok/s/GPU, tok/s/user; last column = MInf throughput vs best vLLM.
+
+**Super v3, 8 GPUs: non-expert TP4 x DP2, expert EP8**
+
+| c | MInf (NVLS) | vLLM (FlashInfer A2A) | vLLM (AG/RS) | MInf vs vLLM A2A |
+|---|---|---|---|---|
+| 16 | 278.7, 140.4 | 225.4, 110.8 | 222.2, 113.3 | **+24%** |
+| 32 | 443.4, 111.6 | 390.5, 99.1 | 370.8, 92.3 | **+14%** |
+| 64 | 703.4, 88.5 | 648.7, 82.2 | 598.6, 75.7 | **+8%** |
+| 128 | 1118.8, 71.4 | 1031.1, 64.8 | 928.4, 58.9 | **+9%** |
+| 256 | 1612.2, 50.8 | 1561.6, 49.6 | 1285.1, 40.7 | +3% |
+
+**Ultra v3, 8 GPUs: non-expert TP8, expert EP8 (EP = TP)**
+
+| c | MInf (NVLS) | vLLM (no dispatch) | MInf vs vLLM |
+|---|---|---|---|
+| 16 | 118.0, 59.3 | 126.7, 63.8 | -7% |
+| 32 | 180.5, 45.4 | 187.9, 48.6 | -4% |
+| 64 | 285.0, 35.8 | 293.5, 37.1 | -3% |
+| 128 | 446.0, 27.9 | 433.0, 27.4 | **+3%** |
+
+**Ultra v3, 64 GPUs: non-expert TP8 x DP8, expert EP64**
+
+| c | MInf (NVLS) | vLLM (FlashInfer A2A) | MInf vs vLLM |
+|---|---|---|---|
+| 128 | 173.7, 87.6 | 146.2, 73.5 | **+19%** |
+| 256 | 287.5, 73.4 | 242.8, 61.7 | **+18%** |
+| 512 | 418.1, 53.4 | 380.0, 48.2 | **+10%** |
+| 1024 | 547.5, 34.6 | 550.2, 34.8 | -0.5% |
+
+Super v3 wide (TP4 x DP16, EP64) on vLLM is queued.
+
+**Reading.**
+
+- With EP > TP, MInf leads at every level below the top, by up to ~20-25% on both axes, and
+  the gap closes as the batch grows (tied by 16 requests per GPU). With EP = TP, vLLM leads at
+  small batches by up to ~7% and MInf passes it by c = 128.
+- Output lengths are not the cause: per-level median output tokens are similar across the two
+  servers and move in no consistent direction (finished requests per window are small, so the
+  medians are noisy).
+- The expert GEMM is the same kernel, and the gap shrinks as the step becomes GEMM-bound, so
+  the difference is a fixed per-step cost on vLLM's EP > TP path. Candidates, not yet measured:
+  (1) vLLM synchronizes token counts across DP ranks every step (a CPU all-reduce under async
+  scheduling) and idle ranks run dummy steps; (2) under CUDA graphs it pads every DP rank's whole
+  forward (attention, Mamba, dense) to the largest rank's token count, where MInf pads only the
+  MoE rows; (3) collective latency per MoE layer at small token counts (NVLS multicast all-gather
+  / reduce-scatter vs the one-sided all-to-all). An nsys trace of one decode step on each side
+  would split these.
+- vLLM's dispatch backend matters at scale: the one-sided all-to-all beats its default AG/RS by
+  21% at c = 256 on Super narrow, but not at c = 16.
+- The EP = TP result is the replicate-tokens path: one fused all-reduce + norm per layer beats
+  sequence parallelism's all-gather + reduce-scatter while latency dominates, and loses once the
+  replicated non-expert activation traffic grows. A per-step switch between the two in MInf was
+  prototyped and stashed (incorrect output; not debugged).
+
+Runs: `20261024_175142_math_superv3_narrow_ep_nvls`,
+`20261027_162013_superv3_narrow_ep_vllm_fi_one_sided`, `20261027_154044_superv3_narrow_ep_vllm`,
+`20261024_171149_math_ultrav3_narrow_ep_nvls`, `20261027_154043_ultrav3_narrow_ep_vllm`,
+`20261024_184036_math_ultrav3_wide_ep_nvls`, `20261027_165152_ultrav3_wide_ep_vllm`.
+
 ## 2026-10-17: A long-decode dataset: natural generation lengths of Super v3 on math reasoning
 
 The wide-EP sweeps so far force OSL 8192 with `ignore_eos` on ~60-token GSM8K prompts, so most
