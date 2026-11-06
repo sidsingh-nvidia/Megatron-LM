@@ -39,6 +39,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.step_time_metrics import StepTimeHistogram, classify_step
+from megatron.core.inference.moe.routing_counts import RoutingCounter
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -709,6 +711,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 "requests_finished_total": 0,
                 "engine_steps_total": 0,
             }
+        if not hasattr(self, "_step_time_histogram"):
+            # Logging steps only (the ones the engine times); see step_time_metrics.
+            self._step_time_histogram = StepTimeHistogram()
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -3694,9 +3699,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
+            # Count this step's expert routing (MCORE_ROUTING_COUNTS=1, EP rank 0 only).
+            RoutingCounter.arm(True)
         controller_result: DynamicBatchControllerStepResult = (
             await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
+        if will_log_this_step:
+            RoutingCounter.arm(False)
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
@@ -3706,6 +3715,21 @@ class DynamicInferenceEngine(AbstractEngine):
             self.step_end_event.record()
             self.step_end_event.synchronize()
             step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+            self._observe_step_time(controller_result.decode_only, step_time)
+            if RoutingCounter.active():
+                counts = RoutingCounter.read_and_reset()
+                launched = getattr(
+                    controller_result.decode_only, "launched", controller_result.decode_only
+                )
+                logger.info(
+                    "routing counts | step %d | %.2f ms | local %s | EP prefill %s | %s",
+                    self.context.step_count,
+                    step_time * 1e3,
+                    "decode" if launched else "prefill",
+                    self.context.step_ep_any_prefill,
+                    RoutingCounter.summary(counts),
+                )
+                RoutingCounter.dump(self.context.step_count, step_time * 1e3, counts)
         else:
             step_time = 0.0
         self.context.step_count += 1
@@ -3794,6 +3818,33 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._partial_emit_lengths.update(emit_lengths)
 
+    def _observe_step_time(self, decode_only, step_time: float) -> None:
+        """Record a timed step in the step-time histogram, classed by the forward it launched.
+
+        The timed window ends with the forward launched this step, and the EP consensus that
+        set context.step_ep_any_prefill ran while preparing that same forward.
+        """
+        # Async scheduling reports the consumed and launched forwards; legacy, one bool.
+        launched_decode_only = getattr(decode_only, "launched", decode_only)
+        if launched_decode_only is None:  # no forward launched (idle step)
+            return
+        step_class = classify_step(
+            local_prefill=not launched_decode_only,
+            ep_any_prefill=self.context.step_ep_any_prefill,
+        )
+        self._step_time_histogram.observe(step_class, step_time * 1e3)
+
+    @staticmethod
+    def _context_percentiles(lengths) -> Dict[str, int]:
+        """min / p50 / p90 / p99 / max of the active requests' context lengths (0 if none)."""
+        names = ("min", "p50", "p90", "p99", "max")
+        if not lengths.numel():
+            return {f"{n}_context_tokens": 0 for n in names}
+        ordered = lengths.sort().values.tolist()
+        last = len(ordered) - 1
+        picks = (0, last // 2, int(0.9 * last), int(0.99 * last), last)
+        return {f"{n}_context_tokens": int(ordered[i]) for n, i in zip(names, picks)}
+
     def _metrics_snapshot(self) -> Dict[str, int]:
         """This engine's lifetime counters and current gauges, for /metrics.
 
@@ -3801,6 +3852,7 @@ class DynamicInferenceEngine(AbstractEngine):
         divides the difference by its length.
         """
         context = self.context
+        lengths = context.get_active_sequence_lengths()
         return {
             **self._metrics_counters,
             "prompt_tokens_total": context.metrics_prompt_tokens_total,
@@ -3808,6 +3860,22 @@ class DynamicInferenceEngine(AbstractEngine):
             "requests_running": context.total_request_count - context.paused_request_count,
             "requests_paused": context.paused_request_count,
             "requests_waiting": len(self.waiting_request_ids),
+            # Context (prompt + generated) tokens of the active requests: this engine's
+            # attention / KV load.
+            "kv_tokens": int(lengths.sum()) if lengths.numel() else 0,
+            # Distribution of active requests' context (prompt + generated); the longest is the
+            # slowest sequence in attention. The mean is kv_tokens / requests_running.
+            **self._context_percentiles(lengths),
+            # Every active request's context: {request id: tokens}, for per-request timelines.
+            "request_context_tokens": dict(
+                zip(
+                    map(str, context.request_ids[
+                        context.paused_request_count : context.total_request_count
+                    ].tolist()),
+                    lengths.tolist(),
+                )
+            ),
+            "step_time_ms": self._step_time_histogram.snapshot(),
         }
 
     async def async_bookkeep(

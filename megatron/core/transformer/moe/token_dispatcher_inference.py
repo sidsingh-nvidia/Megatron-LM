@@ -49,6 +49,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
+from megatron.core.inference.moe import routing_counts
 from megatron.core.inference.moe.trtllm_bf16 import pack_routing
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -585,6 +586,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
+        # Diagnostic per-step routing counts (MCORE_ROUTING_COUNTS=1), on EP rank 0 only: the
+        # gathered routing covers the whole EP group, so one rank sees every token.
+        self._routing_count_layer: Optional[int] = None
+        if routing_counts.enabled() and self.ep_rank == 0 and self.ep_size > 1:
+            self._routing_count_layer = routing_counts.RoutingCounter.register_layer(
+                config.num_moe_experts, self.ep_size
+            )
         # When shared_expert_overlap is enabled, the shared expert forward is launched
         # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
         self._shared_expert_output: Optional[torch.Tensor] = None
@@ -681,6 +689,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
         self.routing_map = agv_r["tensor"].view(global_max, topk)
+        if self._routing_count_layer is not None:
+            routing_counts.RoutingCounter.count(
+                self._routing_count_layer, self.routing_map, self._valid_tokens(), packed=False
+            )
         probs = agv_p["tensor"].view(global_max, topk)
         hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
         return hidden_states, probs
@@ -714,6 +726,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self._dispatch_collective_packed(agv_h, agv_pk, hidden_states, packed)
         global_max = self._per_rank_worst_case_token_count * self.ep_size
         self.routing_map = agv_pk["tensor"].view(global_max, self.topk)
+        if self._routing_count_layer is not None:
+            routing_counts.RoutingCounter.count(
+                self._routing_count_layer, self.routing_map, self._valid_tokens(), packed=True
+            )
         return agv_h["tensor"].view(global_max, hidden_states.shape[1]), probs
 
     def _dispatch_collective_packed(self, agv_h, agv_pk, hidden_states, packed):

@@ -449,6 +449,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._async_sched_token_offsets = None
 
+        # FlashInfer paged decode for decode-only steps (inference_decode_attention_backend): planned
+        # once per step from the host-side KV lengths, at the end of initialize_attention_state,
+        # which async scheduling runs while the previous forward is on the GPU. Attention layers
+        # pick up the planned wrapper from `flashinfer_decode_wrapper` (None = FlashAttention).
+        self._flashinfer_decode = (
+            getattr(model_config, "inference_decode_attention_backend", "fa4") == "flashinfer"
+        )
+        self.flashinfer_decode_wrapper = None
+        if self._flashinfer_decode:
+            assert self.num_speculative_tokens == 0, (
+                "inference_decode_attention_backend='flashinfer' does not support speculative "
+                "decoding yet"
+            )
+            assert not isinstance(
+                model_config, MLATransformerConfig
+            ), "inference_decode_attention_backend='flashinfer' does not support MLA"
+            self._fi_num_qo_heads = core_divide(model_config.num_attention_heads, tp_size)
+            self._fi_sm_scale = model_config.softmax_scale or model_config.kv_channels**-0.5
+            self._fi_workspace = None  # float workspace shared by every wrapper
+            self._fi_eager_wrapper = None
+            self._fi_graph_wrappers = {}  # padded decode batch size -> CUDA-graph wrapper
+
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
         # Otherwise:
@@ -818,6 +840,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         #     with bound = largest CUDA-graph token count x EP (loose);
         #   - any rank has no graph: every rank runs eager, bound = EP-wide token sum.
         # DeepEP needs the same bound: a rank receives at most the EP-wide token sum.
+        self.step_ep_any_prefill: Optional[bool] = None
         self._ep_moe_row_bound = (
             (
                 self._nvls_dispatcher
@@ -1857,6 +1880,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ep_zmq_communicator=self._ep_zmq_communicator,
             )
         )
+        # Whether any EP rank prefills in this forward; read by the engine's step-time metrics.
+        self.step_ep_any_prefill = any_non_decode
         if not any_non_decode:
             graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
                 dataclasses.replace(batch_dimensions, token_count=max_token_count),
@@ -2618,6 +2643,74 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.mamba_metadata.batch_allocate_slots(N)
             )
 
+    def _plan_flashinfer_decode(self, padded_bs: int):
+        """Plan FlashInfer's paged decode for this step and return the wrapper to run it.
+
+        Reads the step's MHA metadata from the pinned CPU buffers filled by
+        initialize_attention_state (KV lengths, block table; padding rows have length 0 and get no
+        pages, which FlashInfer returns as zero rows, like FlashAttention). plan() splits every
+        request's KV into chunks so the work is even over the SMs, and stages the schedule into the
+        wrapper's device buffers with stream-ordered non-blocking copies, which land after the
+        forward already queued on the stream. CUDA-graphed steps use one wrapper per padded batch
+        size with fixed buffers (captured once, re-planned every step); eager steps share one.
+        """
+        import flashinfer  # optional dependency, only needed for this backend
+
+        page = self.block_size_tokens
+        lengths = self._cpu_mha_kv_seq_lengths[:padded_bs]
+        num_pages = (lengths + page - 1) // page
+        indptr = torch.zeros(padded_bs + 1, dtype=torch.int32)
+        indptr[1:] = torch.cumsum(num_pages, dim=0)
+        cols = torch.arange(self._cpu_mha_block_table.shape[1], dtype=torch.int32)
+        indices = self._cpu_mha_block_table[:padded_bs][cols[None, :] < num_pages[:, None]]
+        last_page_len = torch.where(
+            num_pages > 0, lengths - (num_pages - 1) * page, torch.zeros_like(lengths)
+        ).to(torch.int32)
+
+        device = torch.cuda.current_device()
+        if self._fi_workspace is None:
+            self._fi_workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        if self.using_cuda_graph_this_step():
+            wrapper = self._fi_graph_wrappers.get(padded_bs)
+            if wrapper is None:
+                wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    self._fi_workspace,
+                    "NHD",
+                    use_cuda_graph=True,
+                    use_tensor_cores=True,
+                    backend="fa2",
+                    paged_kv_indptr_buffer=torch.zeros(
+                        padded_bs + 1, dtype=torch.int32, device=device
+                    ),
+                    paged_kv_indices_buffer=torch.zeros(
+                        padded_bs * self.max_kv_block_count, dtype=torch.int32, device=device
+                    ),
+                    paged_kv_last_page_len_buffer=torch.zeros(
+                        padded_bs, dtype=torch.int32, device=device
+                    ),
+                )
+                self._fi_graph_wrappers[padded_bs] = wrapper
+        else:
+            if self._fi_eager_wrapper is None:
+                self._fi_eager_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    self._fi_workspace, "NHD", use_tensor_cores=True, backend="fa2"
+                )
+            wrapper = self._fi_eager_wrapper
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            self._fi_num_qo_heads,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+            page,
+            q_data_type=self.params_dtype,
+            kv_data_type=self.params_dtype,
+            sm_scale=self._fi_sm_scale,
+            non_blocking=True,
+        )
+        return wrapper
+
     def initialize_attention_state(
         self,
         *,
@@ -2674,6 +2767,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         self.batch_dimensions = batch_dimensions
+        # Set by the EP consensus below when this forward has one (TRT-LLM routed MoE).
+        self.step_ep_any_prefill = None
 
         moe_rows_bound = None
         if self._ep_moe_row_bound and self.is_creating_cuda_graphs:
@@ -2846,6 +2941,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             padded_active_request_count=padded_bs,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+        )
+
+        self.flashinfer_decode_wrapper = (
+            self._plan_flashinfer_decode(padded_bs)
+            if self._flashinfer_decode and padded_bs > 0 and self.is_decode_only()
+            else None
         )
 
         if self.is_hybrid_model:

@@ -1389,6 +1389,15 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
+    inference_decode_attention_backend: Literal['fa4', 'flashinfer'] = 'fa4'
+    """Attention kernel for decode-only steps of dynamic inference (mixed steps always use
+    FlashAttention). 'fa4': FlashAttention, split-KV count from FA4's heuristic (one CTA per
+    request at large batch, so the kernel waits for the longest request). 'flashinfer':
+    FlashInfer's paged decode (tensor-core kernel), planned by the inference context each step on
+    the host from the step's KV lengths, which spreads every request's KV evenly over the SMs.
+    Requires no speculative decoding, no sliding window, softcap or attention sinks, and non-MLA
+    attention; other decode steps fall back to FlashAttention."""
+
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm', 'trtllm_bf16_routed'] = (
         "vllm"
     )

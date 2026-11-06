@@ -42,6 +42,9 @@
 #   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs, so prefill / mixed steps up
 #                      to it are graphed too (default: 2048; the server's own default is 512)
 #   LOG_INTERVAL       engine step-log interval; 1 = log every step  (default: 1000)
+#   MCORE_ROUTING_COUNTS  1 = EP rank 0 counts each logged step's expert routing: a summary on
+#                      its step log and the raw per-layer, per-expert counts in
+#                      <exp dir>/routing_counts.jsonl (MCORE_ROUTING_COUNTS_PATH overrides)
 #   EVAL_MODE          1 = --eval-mode: chat responses skip echoing prompt token IDs, which
 #                      speeds up evals with long contexts             (default: 1)
 #   PROMPT_LOGPROBS    1 = materialize logits for every prompt token so /v1/completions can
@@ -83,6 +86,10 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
     cp "${SCRIPT}" "${EXP_DIR}/launch_minf.sh"
+    # Per-step expert routing counts (EP rank 0) default into the experiment directory.
+    if [ "${MCORE_ROUTING_COUNTS:-0}" == "1" ]; then
+        export MCORE_ROUTING_COUNTS_PATH=${MCORE_ROUTING_COUNTS_PATH:-${EXP_DIR}/routing_counts.jsonl}
+    fi
     export INFERENCE_BENCH_INNER=1
     NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
     if [ "${MODEL:-nanov3p5}" == "ultrav3" ] && [ "${NUM_NODES}" -lt 2 ]; then
@@ -215,6 +222,8 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 # (gathered across TP); skip prompt log-probs so only each request's last-token logits are kept.
 [ "${PROMPT_LOGPROBS:-0}" == "1" ] || ARGS+=(--skip-prompt-log-probs)
 ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
+# Decode-only attention kernel: fa4 (FlashAttention) or flashinfer (planned, load-balanced decode).
+ARGS+=(--inference-decode-attention-backend "${DECODE_ATTN:-fa4}")
 
 # Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
 # Copied to EXP_DIR as server_rank<N>.log when the rank exits, including on failure.
@@ -229,7 +238,7 @@ SLURM_JOB_ID=${SLURM_JOB_ID}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
-ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048}
+ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} DECODE_ATTN=${DECODE_ATTN:-fa4} MCORE_FA4_MIN_NUM_SPLITS=${MCORE_FA4_MIN_NUM_SPLITS:-0}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}

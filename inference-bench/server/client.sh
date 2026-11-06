@@ -18,7 +18,14 @@
 #   sbatch --dependency=after:${SERVER_JOB} --export=ALL,SERVER_JOB=${SERVER_JOB},BENCH="1 2 4 8" inference-bench/server/client.sh
 #
 # Knobs: SERVER_JOB (required: the launch_minf.sh / launch_vllm.sh job id), CLIENT (steady | smoke |
-# sanity, the greedy checkable-answer prompts of sanity.py; default steady),
+# sanity, the greedy checkable-answer prompts of sanity.py | inferencex, random-token prompts at
+# fixed IX_ISL / IX_OSL with IX_RANGE_RATIO and IX_PROMPTS_PER_CONC, see inferencex_client.py;
+# default steady),
+# STEADY_WINDOWS (consecutive windows per level, one record each; default 1),
+# STEADY_IGNORE_EOS (1 = ignore EOS; with MAX_GEN_TOKENS every request has exactly that OSL),
+# STEADY_SAMPLE_INTERVAL (seconds between per-engine gauge samples into steady.engines.jsonl; 0 = off),
+# STEADY_DATASET (steady prompts: math | wildchat; default math), STEADY_STREAM (1 = stream
+# responses, which also records TTFT; default 0),
 # STEADY_WARMUP / STEADY_WINDOW (seconds per level; default 60 / 300), MAX_GEN_TOKENS (steady
 # output cap; default 0 = none), KEEP_SERVER (1 = leave the server running
 # after the sweep; default 0), PROFILE (1 = bracket the first batch size's timed iterations with
@@ -77,14 +84,33 @@ if [ "${CLIENT:-steady}" == "sanity" ]; then
     # Greedy prompts with checkable answers, alone and in a concurrent batch.
     python3 -u inference-bench/server/sanity.py --server "${SERVER}" 2>&1 | tee "${EXP_DIR}/bench.log"
     status=${PIPESTATUS[0]}
+elif [ "${CLIENT:-steady}" == "inferencex" ]; then
+    # InferenceX-style random-token load: BENCH concurrency levels, IX_PROMPTS_PER_CONC x c
+    # requests each at fixed IX_ISL / IX_OSL (lengths in [IX_RANGE_RATIO x len, len]), ignore_eos.
+    echo "CLIENT=inferencex IX_ISL=${IX_ISL:-1024} IX_OSL=${IX_OSL:-1024} IX_RANGE_RATIO=${IX_RANGE_RATIO:-0.8} IX_PROMPTS_PER_CONC=${IX_PROMPTS_PER_CONC:-10}" >> "${EXP_DIR}/config.env"
+    python3 -u inference-bench/server/inferencex_client.py \
+        --server "${SERVER}" \
+        --tokenizer "${TOKENIZER}" \
+        --isl "${IX_ISL:-1024}" --osl "${IX_OSL:-1024}" \
+        --range-ratio "${IX_RANGE_RATIO:-0.8}" \
+        --prompts-per-conc "${IX_PROMPTS_PER_CONC:-10}" \
+        --concurrency ${BENCH} \
+        --out "${EXP_DIR}/inferencex.jsonl" \
+        2>&1 | tee "${EXP_DIR}/bench.log"
+    status=${PIPESTATUS[0]}
 elif [ "${CLIENT:-steady}" == "steady" ]; then
-    echo "CLIENT=steady STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
+    echo "CLIENT=steady STEADY_DATASET=${STEADY_DATASET:-math} STEADY_STREAM=${STEADY_STREAM:-0} STEADY_IGNORE_EOS=${STEADY_IGNORE_EOS:-0} STEADY_WINDOWS=${STEADY_WINDOWS:-1} STEADY_SAMPLE_INTERVAL=${STEADY_SAMPLE_INTERVAL:-0} STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
     python3 -u inference-bench/server/steady_client.py \
         --server "${SERVER}" \
         --concurrency ${BENCH} \
         --warmup "${STEADY_WARMUP:-60}" \
         --window "${STEADY_WINDOW:-300}" \
         --max-tokens "${MAX_GEN_TOKENS:-0}" \
+        --dataset "${STEADY_DATASET:-math}" \
+        --windows "${STEADY_WINDOWS:-1}" \
+        --sample-interval "${STEADY_SAMPLE_INTERVAL:-0}" \
+        $([ "${STEADY_STREAM:-0}" == "1" ] && echo --stream) \
+        $([ "${STEADY_IGNORE_EOS:-0}" == "1" ] && echo --ignore-eos) \
         --out "${EXP_DIR}/steady.jsonl" \
         2>&1 | tee "${EXP_DIR}/bench.log"
     status=${PIPESTATUS[0]}

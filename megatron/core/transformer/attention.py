@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -99,6 +101,47 @@ try:
         from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
 except (ImportError, PackageNotFoundError):
     HAVE_FA4 = False
+
+# Floor on FA4's split-KV count in inference (decode-only and mixed steps); 0 keeps FA4's own choice.
+# FA4 splits only to fill idle SMs (num_SMs // (batch * kv_heads)), so at large batch it runs one CTA
+# per request and the kernel waits for the longest request. See fa4_num_splits.
+_FA4_MIN_NUM_SPLITS = int(os.environ.get("MCORE_FA4_MIN_NUM_SPLITS", "0"))
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def fa4_num_splits(
+    batch_size: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_splits: int,
+    tile_m: int = 128,
+    tile_n: int = 128,
+) -> int:
+    """max(FA4's split-KV heuristic, min_splits), or 0 (FA4 decides) if min_splits is 0.
+
+    Mirrors flash_attn.cute.interface's heuristic for Blackwell with head dim 128 (128 x 128 tiles,
+    GQA packed into the M tile): splits = min(num_SMs // (batch * kv_heads * m_blocks), 128, n_blocks),
+    and 1 when the KV is at most 4 tiles. The floor is capped at n_blocks, beyond which splits are
+    empty. FA4 splits each request's own KV evenly, so a long request gets min_splits CTAs instead
+    of one.
+    """
+    if min_splits <= 0:
+        return 0
+    seqlen_q_packed = max_seqlen_q * (num_heads_q // num_heads_kv)
+    q_stage = 2 if seqlen_q_packed > tile_m else 1
+    num_m_blocks = -(-seqlen_q_packed // (q_stage * tile_m))
+    num_n_blocks = -(-max_seqlen_k // tile_n)
+    if num_n_blocks <= 4:
+        return 1
+    total_mblocks = batch_size * num_heads_kv * num_m_blocks
+    heuristic = min(_num_sms(torch.cuda.current_device()) // total_mblocks, 128, num_n_blocks)
+    return min(max(heuristic, min_splits), num_n_blocks)
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -1047,6 +1090,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         block_table,
         is_decode_only,
         softmax_offset: Optional[Tensor] = None,
+        flashinfer_decode_wrapper=None,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -1069,6 +1113,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
                 the same denominator-with-sink formulation used by the
                 static-inference path (TE / DotProductAttention).
+            flashinfer_decode_wrapper: FlashInfer BatchDecodeWithPagedKVCacheWrapper already
+                planned by the inference context for this decode-only step (see
+                DynamicInferenceContext._plan_flashinfer_decode), or None to use FlashAttention.
         Return:
             (Tensor) Attention output.
         """
@@ -1116,7 +1163,18 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=(
+                        1
+                        if self.batch_invariant_mode
+                        else fa4_num_splits(
+                            cu_seqlens_q.shape[0] - 1,
+                            q.shape[-2],
+                            k.shape[-2],
+                            int(max_seqlen_q),
+                            int(max_seqlen_k),
+                            _FA4_MIN_NUM_SPLITS,
+                        )
+                    ),
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1244,7 +1302,25 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if use_fa4:
+                # FlashInfer's planned decode balances each request's KV over the SMs (FA4 runs one
+                # CTA per request at large batch). The context plans it only for decode-only steps
+                # with one query token per request; the features below are not wired through.
+                use_flashinfer_decode = (
+                    flashinfer_decode_wrapper is not None
+                    and tokens_per_request == 1
+                    and not need_lse
+                    and window_size == (-1, -1)
+                    and self.config.attn_logit_softcapping is None
+                    and not self.batch_invariant_mode
+                )
+                if use_flashinfer_decode:
+                    output_total = flashinfer_decode_wrapper.run(
+                        q.reshape(-1, q.shape[-2], q.shape[-1]), (k, v)
+                    )
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
+                elif use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -1265,7 +1341,18 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        num_splits=(
+                            1
+                            if self.batch_invariant_mode
+                            else fa4_num_splits(
+                                num_requests,
+                                q_varlen.shape[-2],
+                                k.shape[-2],
+                                tokens_per_request,
+                                int(max_seqlen_k),
+                                _FA4_MIN_NUM_SPLITS,
+                            )
+                        ),
                         **softcap_kwargs,
                     )
                     if need_lse:
@@ -1665,6 +1752,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     block_table,
                     inference_context.is_decode_only(),
                     softmax_offset=self._get_inference_softmax_offset(),
+                    flashinfer_decode_wrapper=getattr(
+                        inference_context, "flashinfer_decode_wrapper", None
+                    ),
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
