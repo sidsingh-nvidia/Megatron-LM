@@ -23,7 +23,9 @@ top of `server/launch_minf.sh`.
 
 Cluster-specific settings (slurm account, partition and QoS; container images and mounts; the
 HF cache; checkpoint paths) are not in the scripts. Copy `cluster.env.example` to
-`inference-bench/cluster.env` (git-ignored), fill it in, and source it in the shell you submit from:
+`inference-bench/cluster.env` (git-ignored), fill it in, and source it in the shell you submit from.
+For a working `cluster.env` (the account, images and checkpoint paths these runs used), ask
+Siddharth Singh.
 
 ```bash
 cp inference-bench/cluster.env.example inference-bench/cluster.env   # then edit

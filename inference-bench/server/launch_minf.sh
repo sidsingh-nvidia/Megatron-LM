@@ -42,6 +42,9 @@
 #   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs, so prefill / mixed steps up
 #                      to it are graphed too (default: 2048; the server's own default is 512)
 #   LOG_INTERVAL       engine step-log interval; 1 = log every step  (default: 1000)
+#   MCORE_ROUTING_COUNTS  1 = EP rank 0 counts each logged step's expert routing: a summary on
+#                      its step log and the raw per-layer, per-expert counts in
+#                      <exp dir>/routing_counts.jsonl (MCORE_ROUTING_COUNTS_PATH overrides)
 #   EVAL_MODE          1 = --eval-mode: chat responses skip echoing prompt token IDs, which
 #                      speeds up evals with long contexts             (default: 1)
 #   PROMPT_LOGPROBS    1 = materialize logits for every prompt token so /v1/completions can
@@ -83,6 +86,10 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
     cp "${SCRIPT}" "${EXP_DIR}/launch_minf.sh"
+    # Per-step expert routing counts (EP rank 0) default into the experiment directory.
+    if [ "${MCORE_ROUTING_COUNTS:-0}" == "1" ]; then
+        export MCORE_ROUTING_COUNTS_PATH=${MCORE_ROUTING_COUNTS_PATH:-${EXP_DIR}/routing_counts.jsonl}
+    fi
     export INFERENCE_BENCH_INNER=1
     NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
     if [ "${MODEL:-nanov3p5}" == "ultrav3" ] && [ "${NUM_NODES}" -lt 2 ]; then
@@ -226,6 +233,7 @@ if [ "${RANK}" == "0" ]; then
     cat > "${EXP_DIR}/config.env" <<EOF
 EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
+IMAGE=${INFERENCE_BENCH_SERVE_IMAGE:-}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
