@@ -818,6 +818,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         #     with bound = largest CUDA-graph token count x EP (loose);
         #   - any rank has no graph: every rank runs eager, bound = EP-wide token sum.
         # DeepEP needs the same bound: a rank receives at most the EP-wide token sum.
+        self.step_ep_any_prefill: Optional[bool] = None
         self._ep_moe_row_bound = (
             (
                 self._nvls_dispatcher
@@ -1857,6 +1858,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ep_zmq_communicator=self._ep_zmq_communicator,
             )
         )
+        # Whether any EP rank prefills in this forward; read by the engine's step-time metrics.
+        self.step_ep_any_prefill = any_non_decode
         if not any_non_decode:
             graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
                 dataclasses.replace(batch_dimensions, token_count=max_token_count),
@@ -2674,6 +2677,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         self.batch_dimensions = batch_dimensions
+        # Set by the EP consensus below when this forward has one (TRT-LLM routed MoE).
+        self.step_ep_any_prefill = None
 
         moe_rows_bound = None
         if self._ep_moe_row_bound and self.is_creating_cuda_graphs:
