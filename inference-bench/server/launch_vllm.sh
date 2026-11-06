@@ -75,7 +75,6 @@ ARGS=(
     # The EP dispatch InferenceX's vLLM GB200 recipes use. With one DP rank (EP = TP) vLLM ignores
     # it and skips EP communication (tokens replicated across TP; the TP all-reduce combines).
     --all2all-backend flashinfer_nvlink_one_sided
-    --attention-config.backend flash_attn
 )
 # The API server (node 0) splits reasoning from the answer; headless nodes run no API server.
 [ "${NODE_RANK}" == "0" ] && ARGS+=(--reasoning-parser nemotron_v3)
