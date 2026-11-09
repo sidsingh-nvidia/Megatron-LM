@@ -1403,8 +1403,10 @@ class TransformerConfig(ModelParallelConfig):
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
       permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
-    - 'trtllm_bf16_routed': FlashInfer's TRT-LLM BF16 routed MoE kernel (BF16 only).
-      Keeps a BlockMajorK copy of the expert weights. Under the 'nvls' dispatcher the
+    - 'trtllm_bf16_routed': FlashInfer's TRT-LLM routed MoE kernels, BF16 or (with
+      fp8_recipe='mxfp8', non-gated squared-ReLU experts) MXFP8 experts. Converts the expert
+      weights to TRT-LLM's layout (BF16: BlockMajorK; MXFP8: Major-K with interleaved block
+      scales) and frees the canonical copy, so the layer cannot train or refit. Under the 'nvls' dispatcher the
       context runs an EP consensus every step so the kernel only processes a host-known
       bound on the gathered rows.
     """
@@ -2022,23 +2024,20 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                self.inference_grouped_gemm_backend
+                in (
+                    InferenceGroupedGemmBackend.FLASHINFER,
+                    InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
+                )
                 and mxfp8_enabled
                 and (self.gated_linear_unit or self.activation_func != squared_relu)
             ):
                 raise ValueError(
-                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
-                    "squared-ReLU experts. Set activation_func=squared_relu and "
-                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
-                    "'torch' or 'vllm'."
+                    "TRT-LLM routed MXFP8 MoE (inference_grouped_gemm_backend 'flashinfer' or "
+                    "'trtllm_bf16_routed') currently supports only non-gated squared-ReLU "
+                    "experts. Set activation_func=squared_relu and gated_linear_unit=False, or "
+                    "select inference_grouped_gemm_backend 'torch' or 'vllm'."
                 )
-
-            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
-                if mxfp8_enabled:
-                    raise ValueError(
-                        "inference_grouped_gemm_backend='trtllm_bf16_routed' supports BF16 "
-                        "experts only; use 'flashinfer' for MXFP8."
-                    )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:

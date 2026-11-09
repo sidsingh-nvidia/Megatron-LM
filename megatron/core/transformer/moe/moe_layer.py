@@ -427,6 +427,9 @@ class MoELayer(BaseMoELayer):
                 )
 
                 require_flashinfer_trtllm_bf16()
+                fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
+                if config.fp8 and fp8_recipe == "mxfp8":
+                    require_flashinfer_routed_mxfp8()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "

@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the TRT-LLM BF16 routed MoE path and the EP token-sum consensus."""
+"""Unit tests for the TRT-LLM routed MoE path (BF16 and MXFP8 experts) and the EP token-sum
+consensus."""
 
 import pytest
 import torch
@@ -38,7 +39,7 @@ class TestTrtllmBf16RoutedMoe:
         num_experts, local, offset, topk, buffer_rows = 64, 8, 16, 6, 256
         fc1 = (torch.randn(local, inter, hidden, device="cuda") * hidden**-0.5).bfloat16()
         fc2 = (torch.randn(local, hidden, inter, device="cuda") * inter**-0.5).bfloat16()
-        w1, w2, padded = trtllm_bf16.build_trtllm_bf16_weights(fc1, fc2, gated=False)
+        w1, w2, padded = trtllm_bf16.build_trtllm_weights(fc1, fc2, gated=False)
 
         # Worst-case buffers holding stale garbage, as after an earlier larger step.
         h = (torch.randn(buffer_rows, hidden, device="cuda") * 0.5).bfloat16()
@@ -53,12 +54,12 @@ class TestTrtllmBf16RoutedMoe:
 
         with torch.inference_mode():
             packed = trtllm_bf16.pack_routing(r, p, valid_t)
-            trtllm_bf16.trtllm_bf16_routed_moe_forward(
+            trtllm_bf16.trtllm_routed_moe_forward(
                 h, packed, w1, w2,
                 num_experts=num_experts, local_expert_offset=offset, intermediate_size=padded,
                 activation_type=ActivationType.Relu2.value, rows=rows, out=out, valid_tokens=valid_t,
             )
-            finalized = trtllm_bf16.trtllm_bf16_routed_moe_forward(
+            finalized = trtllm_bf16.trtllm_routed_moe_forward(
                 h, packed, w1, w2,
                 num_experts=num_experts, local_expert_offset=offset, intermediate_size=padded,
                 activation_type=ActivationType.Relu2.value, rows=rows,
@@ -69,6 +70,68 @@ class TestTrtllmBf16RoutedMoe:
         assert (out[:valid].float() - ref).norm() / scale < 2e-2
         assert (finalized[:valid].float() - ref).norm() / scale < 2e-2
         # Rows past the valid prefix are never written.
+        assert torch.all(out[valid:] == 7.0)
+
+
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("valid,rows", [(1, 8), (37, 64), (64, 64)])
+    def test_mxfp8_matches_routed_mxfp8_and_reference(self, out_dtype, valid, rows):
+        """MXFP8 experts through the shared path (pack_routing, trtllm_finalize into `out`) match
+        the FlashInfer routed MXFP8 path on the same weights, and an fp32 reference loosely."""
+        from flashinfer.fused_moe.core import ActivationType
+
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            HAVE_FLASHINFER_ROUTED_MXFP8,
+            flashinfer_routed_mxfp8_moe,
+        )
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        if not HAVE_FLASHINFER_ROUTED_MXFP8 or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("routed MXFP8 needs Blackwell and FlashInfer >= 0.6.4")
+
+        def stacked(weight):
+            q = [MXFP8Tensor.from_bf16(e, backend="triton") for e in weight]
+            return MXFP8Tensor(
+                data=torch.stack([e.data for e in q]).contiguous(),
+                scale=torch.stack([e.scale for e in q]).contiguous(),
+                backend="triton",
+                dtype=torch.bfloat16,
+            )
+
+        torch.manual_seed(valid)
+        num_experts, local, offset, topk, hidden, inter, buffer_rows = 64, 8, 16, 6, 1024, 1280, 256
+        fc1 = (torch.randn(local, inter, hidden, device="cuda") * hidden**-0.5).bfloat16()
+        fc2 = (torch.randn(local, hidden, inter, device="cuda") * inter**-0.5).bfloat16()
+        w1, w2, padded = trtllm_bf16.build_trtllm_weights(stacked(fc1), stacked(fc2), gated=False)
+
+        h = (torch.randn(buffer_rows, hidden, device="cuda") * 0.5).bfloat16()
+        r = torch.randint(0, num_experts, (buffer_rows, topk), device="cuda")
+        p = torch.rand(buffer_rows, topk, device="cuda")
+        r[:valid] = torch.rand(valid, num_experts, device="cuda").topk(topk, dim=1).indices
+        p[:valid] = p[:valid] / p[:valid].sum(1, keepdim=True)
+        out = torch.full((buffer_rows, hidden), 7.0, device="cuda", dtype=out_dtype)
+        valid_t = torch.tensor([valid], dtype=torch.int32, device="cuda")
+        relu2 = ActivationType.Relu2.value
+
+        with torch.inference_mode():
+            packed = trtllm_bf16.pack_routing(r, p, valid_t)
+            trtllm_bf16.trtllm_routed_moe_forward(
+                h, packed, w1, w2,
+                num_experts=num_experts, local_expert_offset=offset, intermediate_size=padded,
+                activation_type=relu2, rows=rows, out=out, valid_tokens=valid_t,
+            )
+            routed = flashinfer_routed_mxfp8_moe(
+                h[:valid], r[:valid], p[:valid], w1, w2,
+                num_experts=num_experts, local_expert_offset=offset, activation_type=relu2,
+            )
+        torch.cuda.synchronize()
+        got = out[:valid].float()
+        ref = _reference(h[:valid], r[:valid], p[:valid], fc1, fc2, offset)
+        scale = ref.norm().clamp_min(1e-6)
+        # Same kernel and quantization; only the finalize differs (fp32 vs the kernel's bf16 sum).
+        assert (got - routed.float()).norm() / scale < 2e-2
+        # MXFP8 weights and activations against the BF16-weight fp32 reference.
+        assert (got - ref).norm() / scale < 1e-1
         assert torch.all(out[valid:] == 7.0)
 
 
