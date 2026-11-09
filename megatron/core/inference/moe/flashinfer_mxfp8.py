@@ -10,13 +10,13 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a
+    from flashinfer import mxfp8_quantize
     from flashinfer.fused_moe import (
         Fp8QuantizationType,
         WeightLayout,
         trtllm_fp8_block_scale_routed_moe,
     )
-    from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices
 
     HAVE_FLASHINFER_ROUTED_MXFP8 = True
     _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR: ImportError | None = None
@@ -53,59 +53,13 @@ class FlashInferRoutedMXFP8Weight:
     padded_cols: int
 
 
+# Experts repacked per batched gather in prepare_routed_mxfp8_weights; bounds the extra memory to
+# about one padded copy of this many experts.
+_EXPERT_CHUNK = 16
+
+
 def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
-
-
-def _unshuffle_cublas_scale(
-    scale: torch.Tensor, logical_rows: int, logical_cols: int
-) -> torch.Tensor:
-    """Undo MCore's 128x4 cuBLAS scale swizzle into a logical scale matrix."""
-    if logical_cols % 32:
-        raise ValueError(f"MXFP8 K dimension must be divisible by 32; got {logical_cols}")
-    padded_rows = _round_up(logical_rows, 128)
-    logical_scale_cols = logical_cols // 32
-    padded_scale_cols = _round_up(logical_scale_cols, 4)
-    expected = padded_rows * padded_scale_cols
-    scale_u8 = scale.contiguous().view(torch.uint8).reshape(-1)
-    if scale_u8.numel() != expected:
-        raise ValueError(
-            "unexpected MXFP8 scale size: "
-            f"got {scale_u8.numel()}, expected {expected} for "
-            f"weight shape=({logical_rows}, {logical_cols})"
-        )
-    logical = (
-        scale_u8.reshape(padded_rows // 128, padded_scale_cols // 4, 32, 4, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .reshape(padded_rows, padded_scale_cols)
-    )
-    return logical[:logical_rows, :logical_scale_cols]
-
-
-def _block_scale_interleave(scale: torch.Tensor) -> torch.Tensor:
-    """Apply TRT-LLM's architecture-independent 128x4 scale interleave."""
-    rows, columns = scale.shape
-    if rows % 128 or columns % 4:
-        raise ValueError(
-            "TRT-LLM scale interleave requires rows divisible by 128 and columns "
-            f"divisible by 4; got shape={tuple(scale.shape)}"
-        )
-    return (
-        scale.reshape(rows // 128, 4, 32, columns // 4, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .reshape(-1)
-    )
-
-
-def _shuffle_routed_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Convert a logical UE8M0 scale matrix to TRT-LLM Major-K byte layout."""
-    scale_u8 = scale.contiguous().view(torch.uint8)
-    # Avoid FlashInfer's architecture-dispatched convenience wrapper: this
-    # permutation and interleave are architecture-independent.
-    row_indices = get_shuffle_matrix_sf_a_row_indices(scale_u8, 128).to(scale.device)
-    return _block_scale_interleave(scale_u8[row_indices]).contiguous().view(torch.uint8)
 
 
 def prepare_routed_mxfp8_weights(
@@ -162,22 +116,53 @@ def prepare_routed_mxfp8_weights(
     # weights. MCore stores row-major MXFP8 data with cuBLAS-swizzled UE8M0 scales but TRT-LLM
     # kernels require 128-aligned Major-K data and its interleaved scale layout. Repack the data
     # and scales into TRT-LLM's 128-aligned Major-K layout without requantizing.
-    for expert in range(experts):
-        padded_data = torch.zeros(
-            padded_rows, padded_cols, dtype=weight.data.dtype, device=weight.data.device
+    # The shuffles depend only on the (padded) shape: compute their row indices once and apply
+    # them to EXPERT_CHUNK experts at a time, rather than recomputing them per expert.
+    # The indices are built on the host; copy them from pinned memory without blocking, since
+    # this can run lazily inside a forward with collectives in flight.
+    device = weight.data.device
+    data_rows = get_shuffle_matrix_a_row_indices(
+        torch.empty(padded_rows, padded_cols, dtype=torch.uint8), 128
+    ).pin_memory().to(device, non_blocking=True)
+    scale_rows = get_shuffle_matrix_sf_a_row_indices(
+        torch.empty(padded_rows, scale_cols, dtype=torch.uint8), 128
+    ).pin_memory().to(device, non_blocking=True)
+    if logical_cols % 32:
+        raise ValueError(f"MXFP8 K dimension must be divisible by 32; got {logical_cols}")
+    padded_scale_cols = _round_up(logical_cols // 32, 4)
+    if weight.scale[0].numel() != padded_rows * padded_scale_cols:
+        raise ValueError(
+            f"unexpected MXFP8 scale size: got {weight.scale[0].numel()}, expected "
+            f"{padded_rows * padded_scale_cols} for weight shape=({logical_rows}, {logical_cols})"
         )
-        padded_data[:logical_rows, :logical_cols].copy_(weight.data[expert])
-        routed_data[expert].copy_(
-            shuffle_matrix_a(padded_data.view(torch.uint8), 128).view(weight.data.dtype)
-        )
+    for start in range(0, experts, _EXPERT_CHUNK):
+        chunk = slice(start, min(start + _EXPERT_CHUNK, experts))
+        n = chunk.stop - chunk.start
+        padded_data = torch.zeros(n, padded_rows, padded_cols, dtype=torch.uint8, device=device)
+        padded_data[:, :logical_rows, :logical_cols].copy_(weight.data[chunk].view(torch.uint8))
+        routed_data[chunk].view(torch.uint8).copy_(padded_data.index_select(1, data_rows))
+        del padded_data
 
-        logical_scale = torch.zeros(
-            padded_rows, scale_cols, dtype=torch.uint8, device=weight.data.device
+        # Undo MCore's 128x4 cuBLAS scale swizzle into logical [rows, K / 32] scales.
+        cublas = (
+            weight.scale[chunk]
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(n, padded_rows // 128, padded_scale_cols // 4, 32, 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .reshape(n, padded_rows, padded_scale_cols)
         )
-        logical_scale[:logical_rows, : logical_cols // 32].copy_(
-            _unshuffle_cublas_scale(weight.scale[expert], logical_rows, logical_cols)
+        logical_scale = torch.zeros(n, padded_rows, scale_cols, dtype=torch.uint8, device=device)
+        logical_scale[:, :logical_rows, : logical_cols // 32].copy_(
+            cublas[:, :logical_rows, : logical_cols // 32]
         )
-        routed_scale[expert].copy_(_shuffle_routed_scale(logical_scale))
+        # TRT-LLM's scale row shuffle, then its architecture-independent 128x4 interleave.
+        routed_scale[chunk].copy_(
+            logical_scale.index_select(1, scale_rows)
+            .reshape(n, padded_rows // 128, 4, 32, scale_cols // 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .reshape(n, -1)
+        )
 
     if out is not None:
         return out

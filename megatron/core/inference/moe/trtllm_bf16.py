@@ -1,10 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FlashInfer TRT-LLM BF16 routed MoE for inference.
+"""FlashInfer TRT-LLM routed MoE for inference, with BF16 or MXFP8 expert weights.
 
-Adapted from nvcsathe/Megatron-LM@trtllm-fused-moe: BlockMajorK expert weights, packed
-(expert id << 16 | bf16 prob) routing, and a padding-aware finalize into the NVLS combine
-buffer. Here the finalize loops only over the valid token prefix and also writes a BF16
-combine buffer.
+Adapted from nvcsathe/Megatron-LM@trtllm-fused-moe: packed (expert id << 16 | bf16 prob)
+routing and a padding-aware finalize into the NVLS combine buffer. Here the finalize loops only
+over the valid token prefix and also writes a BF16 combine buffer.
+
+BF16 and MXFP8 experts share everything but the weight layout and the GEMM kernel: BF16 runs
+trtllm_bf16_routed_moe on BlockMajorK weights; MXFP8 quantizes the gathered rows (the dispatch
+moves BF16) and runs trtllm_fp8_block_scale_routed_moe on Major-K weights with UE8M0 block
+scales. Both skip the kernel's finalize and use trtllm_finalize.
 
 The kernel's cost scales with the rows it is handed even when they route to no expert, so
 callers pass only a host-known bound on the gathered rows (see the NVLS dispatcher's
@@ -48,6 +52,14 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    FlashInferRoutedMXFP8Weight,
+    prepare_routed_mxfp8_weights,
+    quantize_routed_mxfp8_input,
+    require_flashinfer_routed_mxfp8,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
 _TILE = 128
 
 
@@ -89,17 +101,30 @@ def _convert_expert(w1, w2, gated, cache):
 
 
 @torch.no_grad()
-def build_trtllm_bf16_weights(
-    fc1: torch.Tensor, fc2: torch.Tensor, gated: bool
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Convert [E, fc1_out, H] / [E, H, I] BF16 expert weights to TRT-LLM BlockMajorK.
+def build_trtllm_weights(fc1, fc2, gated: bool):
+    """Convert a layer's [E, fc1_out, H] / [E, H, I] expert weights to the TRT-LLM layout.
 
-    Each expert is converted into a preallocated output, so the peak is one extra copy of the
-    layer's experts (not two, as with stacking a list). Returns (fc1, fc2, padded intermediate).
+    BF16 tensors become BlockMajorK; stacked MXFP8Tensors (Triton/cuBLAS layout) are repacked to
+    Major-K with interleaved block scales, without requantizing. Returns (fc1, fc2, the
+    intermediate size padded to a multiple of 128).
     """
+    mxfp8 = isinstance(fc1, MXFP8Tensor)
+    # trtllm_finalize reads GEMM2 rows as hidden wide; the kernels pad hidden to 128.
+    hidden_size = (fc1.data if mxfp8 else fc1).shape[-1]
+    assert hidden_size % _TILE == 0, f"hidden size {hidden_size} must be a multiple of 128"
+    if mxfp8:
+        require_flashinfer_routed_mxfp8()
+        assert not gated, "TRT-LLM routed MXFP8 supports non-gated experts only"
+        w1, w2 = prepare_routed_mxfp8_weights(fc1), prepare_routed_mxfp8_weights(fc2)
+        return w1, w2, w1.padded_rows
+    return _build_bf16_weights(fc1, fc2, gated)
+
+
+def _build_bf16_weights(fc1: torch.Tensor, fc2: torch.Tensor, gated: bool):
+    """BlockMajorK copies of BF16 expert weights, converted expert by expert into a preallocated
+    output, so the peak is one extra copy of the layer's experts (not two, as with stacking)."""
     require_flashinfer_trtllm_bf16()
     assert fc1.dtype == torch.bfloat16 and fc2.dtype == torch.bfloat16
-    assert fc1.shape[-1] % _TILE == 0, f"hidden size {fc1.shape[-1]} must be a multiple of 128"
     cache: dict = {}
     out1 = out2 = None
     intermediate_size = None
@@ -214,7 +239,7 @@ def trtllm_finalize(
     write_unrouted_rows: bool = True,
     config: dict | None = None,
 ) -> torch.Tensor:
-    """Finalize trtllm_bf16_routed_moe(do_finalize=False) into an FP32 or BF16 buffer.
+    """Finalize a TRT-LLM routed MoE kernel's do_finalize=False outputs into an FP32 or BF16 buffer.
 
     Args:
         gemm2_output: expert-grouped, tile-padded GEMM2 output [permuted rows, hidden].
@@ -332,11 +357,11 @@ def pack_routing(
     return out
 
 
-def trtllm_bf16_routed_moe_forward(
+def trtllm_routed_moe_forward(
     hidden_states: torch.Tensor,
     packed_routing: torch.Tensor,
-    fc1_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
+    fc1_weight,
+    fc2_weight,
     *,
     num_experts: int,
     local_expert_offset: int,
@@ -347,40 +372,70 @@ def trtllm_bf16_routed_moe_forward(
     valid_tokens: torch.Tensor | None = None,
     write_unrouted_rows: bool = True,
 ) -> torch.Tensor:
-    """Run TRT-LLM BF16 routed MoE on the first `rows` rows of packed routing (pack_routing).
+    """Run TRT-LLM routed MoE on the first `rows` rows of packed routing (pack_routing).
 
-    Every row in [0, rows) must carry this step's routing or expert -1. With `out` (the NVLS combine
-    buffer) the kernel skips its own finalize and trtllm_finalize writes the valid prefix of
-    `out`, which is returned. Without `out`, returns the kernel's finalized [rows, hidden].
+    fc1_weight / fc2_weight come from build_trtllm_weights: BF16 BlockMajorK tensors, or
+    FlashInferRoutedMXFP8Weight for MXFP8 experts. hidden_states are BF16 either way; MXFP8
+    quantizes the `rows` it runs on.
+
+    Every row in [0, rows) must carry this step's routing or expert -1. With `out` (the NVLS
+    combine buffer) the kernel skips its own finalize and trtllm_finalize writes the valid prefix
+    of `out`, which is returned. Without `out`, returns the kernel's finalized [rows, hidden].
     write_unrouted_rows=False (with `out` only) leaves the rows of tokens with no local expert
     untouched, for consumers that never read them (the all-to-all-v combine).
     """
-    require_flashinfer_trtllm_bf16()
-    assert hidden_states.dtype == torch.bfloat16, "trtllm_bf16_routed requires BF16 input"
+    assert hidden_states.dtype == torch.bfloat16, "TRT-LLM routed MoE takes BF16 input"
     assert packed_routing.dtype == torch.int32, "routing must be packed (pack_routing)"
     assert 0 < rows <= hidden_states.shape[0], f"rows={rows}, buffer {hidden_states.shape[0]}"
     top_k = packed_routing.shape[1]
-    result = trtllm_bf16_routed_moe(
+    kernel_args = dict(
         topk_ids=packed_routing[:rows],
-        hidden_states=hidden_states[:rows],
-        gemm1_weights=fc1_weight,
-        gemm2_weights=fc2_weight,
         num_experts=num_experts,
         top_k=top_k,
         n_group=None,
         topk_group=None,
         intermediate_size=intermediate_size,
         local_expert_offset=local_expert_offset,
-        local_num_experts=fc1_weight.shape[0],
         routed_scaling_factor=None,
         # Packed precomputed routing: weights are used as-is, no softmax/renormalization.
         routing_method_type=0,
         use_shuffled_weight=True,
-        weight_layout=WeightLayout.BlockMajorK,
         do_finalize=out is None,
         tune_max_num_tokens=rows,
         activation_type=activation_type,
     )
+    if isinstance(fc1_weight, FlashInferRoutedMXFP8Weight):
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            Fp8QuantizationType,
+            trtllm_fp8_block_scale_routed_moe,
+        )
+
+        hidden, hidden_scale = quantize_routed_mxfp8_input(
+            hidden_states[:rows], fc1_weight.padded_cols
+        )
+        result = trtllm_fp8_block_scale_routed_moe(
+            routing_bias=None,
+            hidden_states=hidden,
+            hidden_states_scale=hidden_scale,
+            gemm1_weights=fc1_weight.data,
+            gemm1_weights_scale=fc1_weight.scale,
+            gemm2_weights=fc2_weight.data,
+            gemm2_weights_scale=fc2_weight.scale,
+            local_num_experts=fc1_weight.data.shape[0],
+            weight_layout=WeightLayout.MajorK.value,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            **kernel_args,
+        )
+    else:
+        require_flashinfer_trtllm_bf16()
+        result = trtllm_bf16_routed_moe(
+            hidden_states=hidden_states[:rows],
+            gemm1_weights=fc1_weight,
+            gemm2_weights=fc2_weight,
+            local_num_experts=fc1_weight.shape[0],
+            weight_layout=WeightLayout.BlockMajorK,
+            **kernel_args,
+        )
     if out is None:
         return result[0] if isinstance(result, (list, tuple)) else result
     assert valid_tokens is not None, "valid_tokens is required when writing to `out`"

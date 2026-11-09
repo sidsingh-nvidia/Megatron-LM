@@ -432,3 +432,55 @@ def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
 
     assert calls == [("clear", -1), ("metadata", 7)]
     assert base_cls._host_valid_tokens_estimate == 28
+
+
+def _reference_prepare_routed_mxfp8(weight):
+    """The per-expert repack prepare_routed_mxfp8_weights used before it was batched."""
+    from flashinfer import shuffle_matrix_a
+    from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
+
+    experts, rows, cols = weight.data.shape
+    prows, pcols = -(-rows // 128) * 128, -(-cols // 128) * 128
+    scols, pscols = pcols // 32, -(-(cols // 32) // 4) * 4
+    data_out, scale_out = [], []
+    for e in range(experts):
+        padded = torch.zeros(prows, pcols, dtype=weight.data.dtype, device=weight.data.device)
+        padded[:rows, :cols].copy_(weight.data[e])
+        data_out.append(shuffle_matrix_a(padded.view(torch.uint8), 128))
+        cublas = (
+            weight.scale[e].contiguous().view(torch.uint8).reshape(prows // 128, pscols // 4, 32, 4, 4)
+            .permute(0, 3, 2, 1, 4).reshape(prows, pscols)
+        )
+        logical = torch.zeros(prows, scols, dtype=torch.uint8, device=weight.data.device)
+        logical[:rows, : cols // 32].copy_(cublas[:rows, : cols // 32])
+        idx = get_shuffle_matrix_sf_a_row_indices(logical, 128).to(logical.device)
+        scale_out.append(
+            logical[idx].reshape(prows // 128, 4, 32, scols // 4, 4).permute(0, 3, 2, 1, 4).reshape(-1)
+        )
+    return torch.stack(data_out), torch.stack(scale_out)
+
+
+@pytest.mark.skipif(
+    not HAVE_FLASHINFER_ROUTED_MXFP8 or not torch.cuda.is_available(),
+    reason="needs FlashInfer routed MXFP8 helpers and a GPU",
+)
+@pytest.mark.parametrize("experts,rows,cols", [(20, 200, 288), (3, 256, 1024)])
+def test_batched_routed_mxfp8_repack_matches_per_expert(experts, rows, cols):
+    """The batched repack (shared shuffle indices, expert chunks) is byte-identical to the
+    per-expert one, across a chunk boundary and with non-128-multiple shapes."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    torch.manual_seed(0)
+    bf16 = torch.randn(experts, rows, cols, device="cuda", dtype=torch.bfloat16)
+    quantized = [MXFP8Tensor.from_bf16(e, backend="triton") for e in bf16]
+    stacked = MXFP8Tensor(
+        data=torch.stack([q.data for q in quantized]).contiguous(),
+        scale=torch.stack([q.scale for q in quantized]).contiguous(),
+        backend="triton",
+        dtype=torch.bfloat16,
+    )
+    routed = prepare_routed_mxfp8_weights(stacked)
+    ref_data, ref_scale = _reference_prepare_routed_mxfp8(stacked)
+    assert torch.equal(routed.data.view(torch.uint8), ref_data)
+    assert torch.equal(routed.scale.view(torch.uint8), ref_scale)

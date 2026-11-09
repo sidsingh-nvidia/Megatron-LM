@@ -25,8 +25,8 @@ PROMPTS = [
 
 
 def chat(server, prompt, max_tokens):
+    # No "model": vLLM rejects names it does not serve and MInf ignores it.
     body = {
-        "model": "default",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": max_tokens,
@@ -38,7 +38,8 @@ def chat(server, prompt, max_tokens):
     )
     with urllib.request.urlopen(req, timeout=600) as r:
         msg = json.loads(r.read())["choices"][0]["message"]
-    return msg.get("content") or "", msg.get("reasoning_content") or ""
+    # MInf names the reasoning field reasoning_content, vLLM reasoning.
+    return msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or ""
 
 
 def main():

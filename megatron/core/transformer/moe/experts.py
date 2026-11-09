@@ -88,9 +88,9 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 from megatron.core.inference.moe.trtllm_bf16 import (
-    build_trtllm_bf16_weights,
+    build_trtllm_weights,
     pack_routing,
-    trtllm_bf16_routed_moe_forward,
+    trtllm_routed_moe_forward,
 )
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
@@ -1574,17 +1574,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _free_canonical_expert_weights(self):
-        """Release the canonical expert weights and the TE param views that keep them alive."""
+        """Release the canonical expert weights and the per-expert views that keep them alive.
+
+        BF16 experts are TE params viewing the stacked buffers; MXFP8 experts are MXFP8Tensors
+        (or params wrapping one) viewing the stacked data and scales.
+        """
         for linear in (self.linear_fc1, self.linear_fc2):
             for i in range(self.num_local_experts):
                 param = getattr(linear, f"weight{i}")
-                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                mxfp8 = param.data if isinstance(getattr(param, "data", None), MXFP8Tensor) else param
+                if isinstance(mxfp8, MXFP8Tensor):
+                    mxfp8.data = mxfp8.data.new_empty(0)
+                    mxfp8.scale = mxfp8.scale.new_empty(0)
+                else:
+                    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
         self._fc1_weight = None
         self._fc2_weight = None
         self._canonical_expert_weights_consumed = True
 
-    def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
-        """FlashInfer TRT-LLM BF16 routed MoE on the host-known bound of gathered rows."""
+    def _trtllm_routed_forward(self, hidden_states, probs, routing_map):
+        """FlashInfer TRT-LLM routed MoE (BF16 or MXFP8 experts) on the host-known bound of
+        gathered rows."""
         assert self._activation_clamp_scale is None, (
             "activation_func_tanh_clamp_scale is not supported by trtllm_bf16_routed."
         )
@@ -1621,7 +1631,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
         # At EP=1 the output is used directly, so every valid row must be written.
         write_unrouted_rows = not (self._a2a_dispatcher and self.ep_group.size() > 1)
-        output = trtllm_bf16_routed_moe_forward(
+        output = trtllm_routed_moe_forward(
             hidden_states,
             routing_map,
             self._trtllm_fc1_weight,
@@ -1725,13 +1735,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
-                assert not self._uses_mxfp8_weights, "trtllm_bf16_routed requires BF16 experts"
                 (
                     self._trtllm_fc1_weight,
                     self._trtllm_fc2_weight,
                     self._trtllm_intermediate_size,
-                ) = build_trtllm_bf16_weights(
+                ) = build_trtllm_weights(
                     self._fc1_weight, self._fc2_weight, self.config.gated_linear_unit
+                )
+                logger.info(
+                    "TRT-LLM routed MoE: converted %d local experts (%s, intermediate %d)",
+                    self.num_local_experts,
+                    "MXFP8" if self._uses_mxfp8_weights else "BF16",
+                    self._trtllm_intermediate_size,
                 )
                 # Keeping both layouts doubles expert memory (129 GB more per GPU for Ultra at
                 # EP8) and nothing on this backend reads the canonical one, so free it layer by
@@ -1746,7 +1761,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
-            return self._trtllm_bf16_routed_forward(
+            return self._trtllm_routed_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
