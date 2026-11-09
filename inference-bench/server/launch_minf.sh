@@ -42,6 +42,11 @@
 #   CUDA_GRAPH_MAX_TOKENS  largest token count captured in CUDA graphs, so prefill / mixed steps up
 #                      to it are graphed too (default: 2048; the server's own default is 512)
 #   LOG_INTERVAL       engine step-log interval; 1 = log every step  (default: 1000)
+#   FP8_RECIPE         mxfp8 = MXFP8 weights, quantized from the BF16 checkpoint at load
+#                      (--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather, which
+#                      inference_optimized requires); unset = BF16          (default: unset)
+#   SHARED_EXPERT_OVERLAP  1 = run the shared experts on a side stream, overlapped with the
+#                      routed experts; 0 = in order                         (default: 1)
 #   MCORE_ROUTING_COUNTS  1 = EP rank 0 counts each logged step's expert routing: a summary on
 #                      its step log and the raw per-layer, per-expert counts in
 #                      <exp dir>/routing_counts.jsonl (MCORE_ROUTING_COUNTS_PATH overrides)
@@ -142,7 +147,7 @@ ARGS=(
     --inference-moe-token-dispatcher-type "${DISPATCHER:-nvls}"
     --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
-    --moe-grouped-gemm --moe-shared-expert-overlap
+    --moe-grouped-gemm
     --inference-grouped-gemm-backend "${GEMM_BACKEND:-trtllm_bf16_routed}"
     --inference-use-synchronous-zmq-collectives
     --model-provider mamba
@@ -222,6 +227,9 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 # (gathered across TP); skip prompt log-probs so only each request's last-token logits are kept.
 [ "${PROMPT_LOGPROBS:-0}" == "1" ] || ARGS+=(--skip-prompt-log-probs)
 ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
+# FP8_RECIPE=mxfp8: MXFP8 expert weights (quantized from the BF16 checkpoint at load).
+[ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather)
+[ "${SHARED_EXPERT_OVERLAP:-1}" == "1" ] && ARGS+=(--moe-shared-expert-overlap)
 
 # Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
 # Copied to EXP_DIR as server_rank<N>.log when the rank exits, including on failure.
@@ -237,7 +245,7 @@ IMAGE=${INFERENCE_BENCH_SERVE_IMAGE:-}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
-ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048}
+ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} FP8_RECIPE=${FP8_RECIPE:-} SHARED_EXPERT_OVERLAP=${SHARED_EXPERT_OVERLAP:-1}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
