@@ -66,6 +66,19 @@
 #                      With BENCH=1 each request is a single prefill step (keep <= 8192).
 #   BENCH_OSL / BENCH_ITERS / BENCH_WARMUP   output tokens / timed / warmup iterations
 #                                             (default: 1024 / 3 / 1)
+#   PD                 1 = prefill/decode disaggregation in this one job: the first PREFILL_NODES
+#                      nodes form the prefill pool, the rest the decode pool, each its own
+#                      torch.distributed world and coordinator. Both pools run with prefix
+#                      caching (required by the KV hand-off) and without the Mamba prefix cache
+#                      (MAMBA_PREFIX_GB=0). The prefill pool serves no HTTP and publishes its
+#                      coordinator address to <exp dir>/prefill_coordinator; the decode pool's
+#                      rank 0 hosts the frontend, which routes each request through both pools.
+#                      KV and Mamba state move over NIXL. Any PREFILL_<KNOB> overrides <KNOB> on
+#                      the prefill pool (PREFILL_TP, PREFILL_EP, ...). The prefill pool logs into
+#                      <exp dir>/prefill/.                        (default: 0 = aggregated)
+#   PREFILL_NODES      with PD=1: prefill-pool nodes                         (default: 1)
+#   DONE_FILE          file that stops the server when it appears  (default: <exp dir>/done)
+#   EXP_DIR            experiment directory (default: a new timestamped one)
 #   PROFILE            1 = run every rank under nsys (capture range = cudaProfilerApi) and have the
 #                      client wrap the timed iterations of the first BENCH batch size in
 #                      /start_profile + /stop_profile; the server exits when profiling stops.
@@ -85,8 +98,10 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     cd "${SLURM_SUBMIT_DIR:-$PWD}"
     # Exported settings reach the ranks through srun's environment.
     source "${INFERENCE_BENCH_CONFIG:-inference-bench/cluster.env}"
-    export EXP_DIR="inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}"
+    export EXP_DIR="${EXP_DIR:-inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}}"
+    export DONE_FILE="${DONE_FILE:-${EXP_DIR}/done}"
     mkdir -p "${EXP_DIR}"
+    [ "${PD:-0}" == "1" ] && mkdir -p "${EXP_DIR}/prefill"
     echo "Experiment directory: ${EXP_DIR}"
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
@@ -114,9 +129,68 @@ fi
 export RANK=${SLURM_PROCID} LOCAL_RANK=${SLURM_LOCALID} WORLD_SIZE=${SLURM_NTASKS}
 # Multi-node runs use the rendezvous address the cluster exports; fall back to localhost.
 export MASTER_ADDR=${MASTER_ADDR:-localhost} MASTER_PORT=${MASTER_PORT:-29500}
+DONE_FILE=${DONE_FILE:-${EXP_DIR}/done}
+POOL_NODES=${SLURM_JOB_NUM_NODES:-1}
+DISAGG_ROLE=
+
+if [ "${PD:-0}" == "1" ]; then
+    # Split the job's nodes into the two pools, each its own torch.distributed world.
+    PREFILL_NODES=${PREFILL_NODES:-1}
+    PD_COORDINATOR_FILE="${EXP_DIR}/prefill_coordinator"
+    if (( SLURM_NODEID < PREFILL_NODES )); then
+        DISAGG_ROLE=prefill
+        POOL_NODES=${PREFILL_NODES}
+        FIRST_TASK=0
+        for var in $(compgen -v PREFILL_); do
+            [ "${var}" == "PREFILL_NODES" ] || export "${var#PREFILL_}=${!var}"
+        done
+        EXP_DIR="${EXP_DIR}/prefill"
+        EXP_NAME="${EXP_NAME:-run}_prefill"
+        MASTER_PORT=29600
+    else
+        DISAGG_ROLE=decode
+        POOL_NODES=$(( ${SLURM_JOB_NUM_NODES} - PREFILL_NODES ))
+        FIRST_TASK=$(( 4 * PREFILL_NODES ))
+        MASTER_PORT=29500
+    fi
+    RANK=$(( SLURM_PROCID - FIRST_TASK ))
+    WORLD_SIZE=$(( 4 * POOL_NODES ))
+    # Pool-local rendezvous: the pool's rank 0 publishes its host.
+    MASTER_FILE="${EXP_DIR}/.master_addr_${SLURM_JOB_ID}"
+    if [ "${RANK}" == "0" ]; then
+        hostname > "${MASTER_FILE}.tmp" && mv "${MASTER_FILE}.tmp" "${MASTER_FILE}"
+    fi
+    until [ -s "${MASTER_FILE}" ]; do sleep 1; done
+    MASTER_ADDR=$(cat "${MASTER_FILE}")
+    export RANK WORLD_SIZE MASTER_ADDR MASTER_PORT EXP_DIR EXP_NAME
+fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TRITON_CACHE_DIR=/tmp/triton_cache_${RANK}
 export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache_${RANK}
+
+if [ -n "${DISAGG_ROLE}" ]; then
+    # The KV hand-off needs prefix caching; math prompts share no prefixes, so the Mamba prefix
+    # cache would only take memory (and the decode pool must not have one).
+    PREFIX_CACHING=1
+    MAMBA_PREFIX_GB=0
+    # The cluster sets UCX_TLS=tcp, which keeps NIXL off the GPU transports (cuda_ipc, cuda_copy,
+    # RDMA); let UCX choose.
+    unset UCX_TLS
+    # NIXL from a pip --target directory when the image has none.
+    [ -n "${NIXL_PYTHONPATH:-}" ] && export PYTHONPATH="${NIXL_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
+    # `import torch` loads HPC-X's UCX (through UCC); NIXL bundles its own, and with two copies in
+    # one process GPU-memory registration fails. Preload NIXL's libucs so a single copy serves both.
+    NIXL_UCS=$(python -c 'import glob, importlib.util, os
+spec = importlib.util.find_spec("nixl_cu13")
+root = os.path.dirname(os.path.dirname(spec.origin)) if spec else ""
+print(next(iter(sorted(glob.glob(os.path.join(root, "nixl_cu13.libs", "libucs-*.so*")))), ""))')
+    if [ -z "${NIXL_UCS}" ]; then
+        echo "DISAGG_ROLE needs NIXL (nixl + nixl-cu13); use the +nixl image or set NIXL_PYTHONPATH"
+        touch "${DONE_FILE}"
+        exit 1
+    fi
+    export LD_PRELOAD="${NIXL_UCS}${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
 
 # Ultra v3 runs TP8 x EP8 on 2 nodes; the others default to TP4.
 if [ "${MODEL:-nanov3p5}" == "ultrav3" ]; then TP=${TP:-8}; else TP=${TP:-4}; fi
@@ -219,7 +293,13 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 [ "${PREFIX_CACHING:-1}" == "1" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching
     --inference-dynamic-batching-prefix-caching-eviction-policy lru
+)
+[ "${PREFIX_CACHING:-1}" == "1" ] && [ "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}" != "0" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}"
+)
+[ -n "${DISAGG_ROLE}" ] && ARGS+=(
+    --disagg-role "${DISAGG_ROLE}" --kv-transfer-backend nixl
+    --disagg-prefill-coordinator-file "${PD_COORDINATOR_FILE}"
 )
 [ -n "${MAX_REQUESTS:-}" ] && ARGS+=(--inference-dynamic-batching-max-requests "${MAX_REQUESTS}")
 [ "${EVAL_MODE:-1}" == "1" ] && ARGS+=(--eval-mode)
@@ -243,9 +323,10 @@ EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
 IMAGE=${INFERENCE_BENCH_SERVE_IMAGE:-}
 TOKENIZER=${TOKENIZER}
-MODEL=${MODEL:-nanov3p5} NODES=${SLURM_JOB_NUM_NODES:-1} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
+MODEL=${MODEL:-nanov3p5} NODES=${POOL_NODES} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
 ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} FP8_RECIPE=${FP8_RECIPE:-} SHARED_EXPERT_OVERLAP=${SHARED_EXPERT_OVERLAP:-1}
+PD=${PD:-0} DISAGG_ROLE=${DISAGG_ROLE} PREFILL_NODES=${PREFILL_NODES:-} GPUS=$((4 * POOL_NODES))
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
@@ -261,7 +342,7 @@ fi
 "${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
-# Serve until <exp dir>/done appears (written by the in-job sweep or by client.sh) or the server
+# Serve until DONE_FILE (<exp dir>/done) appears (written by the in-job sweep or by client.sh) or the server
 # dies. Under PROFILE the server shuts itself down when profiling stops; killing it early would
 # cut off nsys while it writes the report.
 serve_until_done() {
@@ -269,7 +350,9 @@ serve_until_done() {
         wait "${SERVER_PID}"
         exit 0
     fi
-    while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
+    while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${DONE_FILE}" ]; do sleep 2; done
+    # A rank whose server died ends the deployment (in PD, both pools).
+    kill -0 "${SERVER_PID}" 2>/dev/null || touch "${DONE_FILE}"
     kill "${SERVER_PID}" 2>/dev/null
     # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
     wait "${SERVER_PID}"
@@ -277,12 +360,20 @@ serve_until_done() {
 }
 
 [ "${RANK}" != "0" ] && serve_until_done
+# The prefill pool of a PD deployment serves no HTTP; the decode pool's frontend reaches its
+# coordinator through PD_COORDINATOR_FILE.
+[ "${DISAGG_ROLE}" == "prefill" ] && serve_until_done
 
 # Rank 0: wait for the server, then either run the client sweep or keep serving.
 until grep -q "Running on http://0.0.0.0:5000" "${LOG}" 2>/dev/null; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         echo "Server exited during startup; see ${LOG}"
-        touch "${EXP_DIR}/done"
+        touch "${DONE_FILE}"
+        exit 1
+    fi
+    if [ -f "${DONE_FILE}" ]; then
+        echo "Stopped during startup (${DONE_FILE} appeared)"
+        kill "${SERVER_PID}" 2>/dev/null
         exit 1
     fi
     sleep 5
@@ -306,6 +397,6 @@ if [ -n "${BENCH:-}" ]; then
         --pause "${BENCH_PAUSE:-0}" \
         $([ "${PROFILE:-0}" == "1" ] && { [ "${PROFILE_ALL:-0}" == "1" ] && echo --profile-all || echo --profile; }) \
         2>&1 | tee "${EXP_DIR}/bench.log"
-    touch "${EXP_DIR}/done"
+    touch "${DONE_FILE}"
 fi
 serve_until_done

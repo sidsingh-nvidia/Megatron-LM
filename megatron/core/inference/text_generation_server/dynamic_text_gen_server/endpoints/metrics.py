@@ -6,6 +6,10 @@ GET /metrics asks every data parallel engine for its counters through the Infere
 coordinator -> engines path (GET_METRICS); each engine answers at its next step. Counters are
 lifetime totals, so throughput over a window is the difference of two scrapes divided by the
 window length. Each metric is reported per engine (label ``engine``) and summed over engines.
+
+Behind a disaggregated (prefill/decode) frontend the engines are labeled ``prefill/<id>`` and
+``decode/<id>``; prompt tokens are counted by the prefill engines, generated tokens by both (the
+first token by prefill, the rest by decode), and finished user requests by decode.
 """
 
 import logging
@@ -20,6 +24,10 @@ _METRICS = {
     "prompt_tokens_total": ("counter", "Prompt tokens prefilled (computed)."),
     "prompt_tokens_cached_total": ("counter", "Prompt tokens skipped by prefix-cache hits."),
     "requests_finished_total": ("counter", "Requests finished."),
+    "prefill_handoffs_total": (
+        "counter",
+        "Disaggregated prefill requests finished and handed off to decode.",
+    ),
     "engine_steps_total": ("counter", "Engine steps."),
     "requests_running": ("gauge", "Requests in the active batch."),
     "requests_paused": ("gauge", "Requests paused (out of KV blocks)."),
@@ -38,6 +46,19 @@ _METRICS = {
 _HISTOGRAMS = {
     "step_time_ms": "Time of the steps the engine times (logging steps), by step class: "
     "prefill, decode_clean, decode_interfered (another EP rank prefills), decode.",
+}
+
+
+# name -> help, for per-step-class counters reported as {class: {field: value}} (see
+# step_time_metrics.StepMixCounter.snapshot), one counter per field, labeled by the class as
+# ``step``.
+_STEP_MIX_FIELDS = {
+    "steps": "Engine steps (every step), by step class: prefill_only, mixed (prefill and decode "
+    "requests in this rank's batch), decode_clean, decode_interfered (another EP rank "
+    "prefills), decode (no EP consensus).",
+    "tokens": "Input tokens of the engine's steps, by step class.",
+    "wall_ms": "Host wall time of the engine's steps (gap between consecutive steps, ms), by "
+    "step class.",
 }
 
 
@@ -87,6 +108,18 @@ def render_prometheus(per_engine):
                 total["count"] += hist["count"]
         for step_class, hist in sorted(totals.items()):
             lines += _render_histogram(metric, f'step="{step_class}"', hist)
+    for field, help_text in _STEP_MIX_FIELDS.items():
+        metric = f"mcore:step_mix_{field}_total"
+        lines.append(f"# HELP {metric} {help_text}")
+        lines.append(f"# TYPE {metric} counter")
+        totals = {}
+        for engine, values in sorted(per_engine.items()):
+            for step_class, counters in sorted(values.get("step_mix", {}).items()):
+                value = counters.get(field, 0)
+                lines.append(f'{metric}{{engine="{engine}",step="{step_class}"}} {value}')
+                totals[step_class] = totals.get(step_class, 0) + value
+        for step_class, value in sorted(totals.items()):
+            lines.append(f'{metric}{{step="{step_class}"}} {value}')
     for name, help_text in _PER_REQUEST.items():
         metric = f"mcore:{name}"
         lines.append(f"# HELP {metric} {help_text}")

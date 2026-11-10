@@ -34,6 +34,15 @@ def construct_kv_transfer_backend_class(name: str) -> KVTransportBackend:
     raise ValueError("Unsupported KV transfer backend %r; expected 'nixl' or 'nccl'." % name)
 
 
+def _kv_heads_partition_ok(num_kv_heads_global: int, tp_size: int, heads_per_partition: int) -> bool:
+    """True when the local head count matches an even TP split of the KV heads,
+    or one replicated head per rank when there are fewer KV heads than TP ranks
+    (the same rule DynamicInferenceContext uses to size the KV cache)."""
+    if num_kv_heads_global >= tp_size:
+        return heads_per_partition * tp_size == num_kv_heads_global
+    return tp_size % num_kv_heads_global == 0 and heads_per_partition == 1
+
+
 @dataclass
 class BufferGeometry:
     """Address geometry of one registered paged buffer.
@@ -105,7 +114,7 @@ def compute_buffer_geometry(
             layer_start,
             layer_end,
         )
-        and heads_per_partition * tp_size == num_kv_heads_global
+        and _kv_heads_partition_ok(num_kv_heads_global, tp_size, heads_per_partition)
     )
 
     shape = list(memory_buffer.shape)

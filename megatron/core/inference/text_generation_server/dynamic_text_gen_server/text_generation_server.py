@@ -20,6 +20,7 @@ except ImportError as e:
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
 from megatron.core.inference.config import MultimodalPromptConfig, PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.pd_client import PDInferenceClient
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
@@ -65,10 +66,14 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    prefill_coordinator_addr: Optional[str] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
     manages its own InferenceClient connected to the provided coordinator address.
+
+    With ``prefill_coordinator_addr``, ``coordinator_addr`` is a disaggregated decode pool's
+    coordinator and requests are routed prefill -> decode by a PDInferenceClient.
     """
     if not HAS_BACKEND:
         raise RuntimeError(f"Web backend framework (Quart) not available")
@@ -77,12 +82,21 @@ async def _run_text_gen_server(
     # The client hashes prompts for prefix-affinity routing so the coordinator
     # does not have to on its single serial loop. It is the only place holding
     # both the tokens and, for multimodal, the media key that salts them.
-    inference_client = InferenceClient(
-        coordinator_addr,
+    client_kwargs = dict(
         deserialize=False,
         block_size_tokens=block_size_tokens,
         prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
     )
+    if prefill_coordinator_addr is not None:
+        inference_client = PDInferenceClient.from_addresses(
+            prefill_coordinator_addr, coordinator_addr, **client_kwargs
+        )
+        logger.info(
+            f"Rank {rank}: disaggregated routing, prefill {prefill_coordinator_addr} -> "
+            f"decode {coordinator_addr}"
+        )
+    else:
+        inference_client = InferenceClient(coordinator_addr, **client_kwargs)
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
@@ -182,6 +196,7 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    prefill_coordinator_addr: Optional[str] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -204,6 +219,7 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                prefill_coordinator_addr,
             )
         )
     except KeyboardInterrupt:
@@ -267,6 +283,7 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    prefill_coordinator_addr: Optional[str] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -290,6 +307,9 @@ def start_text_gen_server(
             shared with them.
         chat_template: Chat template to apply, as a file path or an inline
             template string. None falls back to the tokenizer's own template.
+        prefill_coordinator_addr: Coordinator of a disaggregated prefill pool. When set,
+            ``coordinator_addr`` must be the matching decode pool's coordinator, and each
+            request is prefilled there and handed off to decode (see PDInferenceClient).
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -332,6 +352,7 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                prefill_coordinator_addr,
             ),
             daemon=True,
         )

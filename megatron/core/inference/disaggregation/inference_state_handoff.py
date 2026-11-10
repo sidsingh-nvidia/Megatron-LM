@@ -1211,7 +1211,9 @@ class InferenceStateHandoffMixin:
                 "SSM transfer agents. Ensure KV transfer was initialized on a "
                 "hybrid decode engine."
             )
-        live_slot = self.context.mamba_metadata.allocate_slot()
+        # Unbound until admission binds it to the request row, so a context that drains to no
+        # active requests meanwhile cannot hand it to another request.
+        live_slot = self.context.mamba_metadata.allocate_unbound_slot()
         if live_slot is None:
             raise RuntimeError("Live SSM slot capacity changed during handoff admission")
         return PendingSSMImport(handles=[], live_slot=int(live_slot))

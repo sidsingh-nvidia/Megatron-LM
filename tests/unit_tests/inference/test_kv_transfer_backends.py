@@ -363,3 +363,100 @@ def test_nixl_begin_pull_blocks_returns_pollable_handle(monkeypatch):
     assert backend._agent.polls == 0
     assert handle.poll() is False
     assert handle.poll() is True
+
+
+def _kv_geometry_kwargs(tp_size, tp_rank, num_kv_heads, heads_per_partition, rank):
+    return dict(
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        num_kv_heads_global=num_kv_heads,
+        heads_per_partition=heads_per_partition,
+        head_dim=4,
+        tokens_per_block=2,
+        global_rank=rank,
+        pp_size=1,
+        pp_rank=0,
+        num_layers_global=3,
+        layer_start=0,
+        layer_end=3,
+    )
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_kv_geometry_accepts_replicated_kv_heads(tp_size):
+    """2 KV heads at TP4/TP8: every rank holds one replicated head, as
+    DynamicInferenceContext sizes it, and still gets a reshard layout."""
+    buf = torch.zeros(2, 3, 5, 2, 1, 4)
+    for tp_rank in range(tp_size):
+        geometry = base.compute_buffer_geometry(
+            buf,
+            5,
+            backend_name="test",
+            **_kv_geometry_kwargs(tp_size, tp_rank, 2, 1, tp_rank),
+        )
+        assert geometry.layout is not None
+        head = tp_rank // (tp_size // 2)
+        assert geometry.layout.head_range() == (head, head + 1)
+
+
+def test_kv_geometry_rejects_wrong_replicated_head_count():
+    buf = torch.zeros(2, 3, 5, 2, 2, 4)
+    geometry = base.compute_buffer_geometry(
+        buf, 5, backend_name="test", **_kv_geometry_kwargs(4, 0, 2, 2, 0)
+    )
+    assert geometry.layout is None
+
+
+def test_nixl_pull_replicated_kv_heads_reads_one_replica(monkeypatch):
+    """Decode TP4 rank 1 pulling from a TP4 prefill with 2 replicated KV heads
+    issues one whole-slice read from the matching prefill replica (rank 1)."""
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def __init__(self, name, config):
+            self.name = name
+            self.reads = []
+
+        def get_agent_metadata(self):
+            return self.name.encode()
+
+        def register_memory(self, tensor):
+            return ("reg", tuple(tensor.shape))
+
+        def add_remote_agent(self, metadata):
+            return metadata.decode()
+
+        def get_xfer_descs(self, tuples, mem_type):
+            return list(tuples)
+
+        def initialize_xfer(self, op, local_desc, remote_desc, peer_id):
+            assert op == "READ"
+            self.reads.append((peer_id, local_desc, remote_desc))
+            return peer_id
+
+        def transfer(self, xfer):
+            pass
+
+        def check_xfer_state(self, xfer):
+            return "DONE"
+
+    monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
+    monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
+
+    def make(role, tp_rank):
+        return nixl_mod.NixlTransferBackend(
+            f"{role}-rank{tp_rank}",
+            torch.zeros(2, 3, 5, 2, 1, 4),
+            expected_num_blocks=5,
+            **_kv_geometry_kwargs(4, tp_rank, 2, 1, tp_rank),
+        )
+
+    prefill_metas = [make("prefill", r).export_meta() for r in range(4)]
+    decode = make("decode", 1)
+    decode.begin_pull_blocks({"tp_metas": prefill_metas}, [0, 3], [2, 4]).wait()
+
+    assert [peer for peer, _, _ in decode._agent.reads] == ["prefill-rank1"]
+    _, local_desc, remote_desc = decode._agent.reads[0]
+    # Whole slices: 2 blocks x (2 K/V planes x 3 layers) outer slices.
+    assert len(local_desc) == len(remote_desc) == 2 * 6

@@ -20,12 +20,12 @@ from megatron.core.inference.disaggregation.utils import transfers_for_dst
 L, Hh, BC, BS, HD = 12, 8, 2, 4, 5  # layers, kv-heads, block_count, block_size, head_dim
 
 
-def _global_kv():
+def _global_kv(num_heads=Hh):
     # [2(K/V), L, BC, BS, H, HD] with unique values per (kv, layer, head)
-    g = torch.zeros(2, L, BC, BS, Hh, HD)
+    g = torch.zeros(2, L, BC, BS, num_heads, HD)
     for kv in range(2):
         for l in range(L):
-            for h in range(Hh):
+            for h in range(num_heads):
                 g[kv, l, :, :, h, :] = (kv * 1_000_000) + l * 1000 + h
     return g
 
@@ -41,7 +41,7 @@ def _shard_of(global_kv, lay: KVShardLayout):
     return sub.permute(2, 0, 1, 3, 4, 5).contiguous()  # [BC,2,ll,BS,hh,HD]
 
 
-def _make_layouts(tp, pp, ep=1, etp=1):
+def _make_layouts(tp, pp, ep=1, etp=1, num_heads=Hh):
     outs = []
     rank = 0
     for p in range(pp):
@@ -51,7 +51,7 @@ def _make_layouts(tp, pp, ep=1, etp=1):
                     outs.append(
                         KVShardLayout(
                             num_layers=L,
-                            num_heads=Hh,
+                            num_heads=num_heads,
                             tp_size=tp,
                             tp_rank=t,
                             pp_size=pp,
@@ -68,7 +68,7 @@ def _make_layouts(tp, pp, ep=1, etp=1):
 
 
 def _run_reshard(src_layouts, dst_layouts):
-    g = _global_kv()
+    g = _global_kv(src_layouts[0].num_heads)
     # src buffers = each src's correct shard of the global KV
     src_buf = {s.global_rank: _shard_of(g, s) for s in src_layouts}
     plan = plan_kv_reshard(src_layouts, dst_layouts)
@@ -189,3 +189,72 @@ def test_explicit_layer_window_is_all_or_nothing():
         KVShardLayout(L, Hh, 1, 0, 2, 0, 0, layer_start=0)
     with pytest.raises(ValueError):
         KVShardLayout(L, Hh, 1, 0, 2, 0, 0, num_local_layers=5)
+
+
+# --- replicated KV heads (num_kv_heads < tp_size) ---------------------------
+
+
+def test_replicated_head_ranges_match_attention():
+    """With 2 KV heads at TP8, ranks [0, 4) hold head 0 and [4, 8) hold head 1,
+    the same assignment Attention uses (tp_rank // (tp_size // num_kv_heads))."""
+    layouts = _make_layouts(tp=8, pp=1, num_heads=2)
+    assert [lay.head_range() for lay in layouts] == [(0, 1)] * 4 + [(1, 2)] * 4
+    assert all(lay.local_num_heads() == 1 and lay.head_replicas() == 4 for lay in layouts)
+
+
+def test_replicated_heads_reject_uneven_replication():
+    with pytest.raises(ValueError):
+        KVShardLayout(L, 3, 4, 0, 1, 0, 0)  # 4 TP ranks cannot evenly replicate 3 heads
+
+
+@pytest.mark.parametrize(
+    "src,dst",
+    [
+        ((4, 1), (4, 1)),  # same TP, both replicated
+        ((8, 1), (8, 1)),
+        ((4, 1), (8, 1)),  # replication factor grows
+        ((8, 1), (4, 1)),  # replication factor shrinks
+        ((1, 1), (4, 1)),  # unreplicated -> replicated
+        ((2, 1), (8, 1)),
+        ((4, 1), (1, 1)),  # replicated -> unreplicated
+        ((8, 1), (2, 1)),
+        ((4, 2), (8, 3)),  # with a PP change
+    ],
+)
+def test_replicated_kv_heads_reshard(src, dst):
+    """Two KV heads at various TP sizes: every destination receives exactly its
+    head(s), each head-layer region exactly once, from a single replica."""
+    num_heads = 2
+    src_layouts = _make_layouts(src[0], src[1], num_heads=num_heads)
+    dst_layouts = _make_layouts(dst[0], dst[1], num_heads=num_heads)
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    g, out = _run_reshard(src_layouts, dst_layouts)
+    for d in dst_layouts:
+        assert torch.equal(out[d.global_rank], _shard_of(g, d)), f"dst rank {d.global_rank}"
+        # No region is written twice: the received volume equals the local shard.
+        received = sum(
+            (t.global_layer_hi - t.global_layer_lo) * (t.global_head_hi - t.global_head_lo)
+            for t in transfers_for_dst(plan, d.global_rank)
+        )
+        assert received == d.local_num_layers() * d.local_num_heads()
+
+
+def test_replicated_kv_heads_spread_reads_across_replicas():
+    """Same-TP replicated pools read rank-to-rank, so no single prefill GPU
+    serves every decode replica of a head."""
+    src_layouts = _make_layouts(tp=8, pp=1, num_heads=2)
+    dst_layouts = _make_layouts(tp=8, pp=1, num_heads=2)
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    assert sorted((t.src_rank, t.dst_rank) for t in plan) == [(r, r) for r in range(8)]
+
+
+def test_replicated_kv_heads_sender_only_plan_matches_receiver_plan():
+    """A two-sided sender plans with only its own layout; it must pick the same
+    transfers the receiver picks from the full source list."""
+    src_layouts = _make_layouts(tp=4, pp=1, num_heads=2)
+    dst_layouts = _make_layouts(tp=8, pp=1, num_heads=2)
+    full = set(plan_kv_reshard(src_layouts, dst_layouts))
+    per_sender = set()
+    for s in src_layouts:
+        per_sender.update(plan_kv_reshard([s], dst_layouts))
+    assert per_sender == full

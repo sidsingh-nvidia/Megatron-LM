@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
 # tools/ lives at the repo root; put the repo root on sys.path so the
@@ -36,6 +37,7 @@ from megatron.core.inference.config import (  # noqa: E402
     VideoProcessingConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
     VLMInferenceWrapper,
@@ -60,9 +62,13 @@ from megatron.inference.utils import (  # noqa: E402
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
-from megatron.training.arguments import parse_and_validate_args  # noqa: E402
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
+from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -130,6 +136,32 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         "Takes precedence over the model's generation_config.json; unset leaves "
         "that free to apply, falling back to 0 if neither is set.",
     )
+    group = parser.add_argument_group(
+        "disaggregated serving",
+        "Run this server as one pool of a prefill/decode (PD) disaggregated deployment. Start "
+        "a prefill pool and a decode pool as separate jobs; the decode pool's rank 0 hosts the "
+        "HTTP frontend and routes each request through both (see PDInferenceClient). Both "
+        "pools need --inference-dynamic-batching-prefix-caching and matching block size, KV "
+        "and SSM dtypes and speculative-token count.",
+    )
+    group.add_argument(
+        "--disagg-role",
+        choices=["prefill", "decode"],
+        default=None,
+        help="This server's pool. Unset (default): aggregated serving.",
+    )
+    group.add_argument(
+        "--kv-transfer-backend",
+        default="nixl",
+        help="KV/state transfer backend between the pools (default: nixl).",
+    )
+    group.add_argument(
+        "--disagg-prefill-coordinator-file",
+        default=None,
+        help="Shared-filesystem file holding the prefill pool's coordinator address: the "
+        "prefill pool writes it once its coordinator is up; the decode pool waits for it and "
+        "routes requests there. Required with --disagg-role.",
+    )
     parser.add_argument(
         "--eval-mode",
         action="store_true",
@@ -191,6 +223,19 @@ def parse_args_and_detect_vlm(
     return args, is_vlm
 
 
+def _wait_for_file(path: str, poll_s: float = 5.0) -> str:
+    """Contents of `path` once it exists and is non-empty."""
+    while True:
+        try:
+            with open(path) as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except FileNotFoundError:
+            pass
+        time.sleep(poll_s)
+
+
 def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
@@ -202,7 +247,10 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     args = get_args()
 
     if not is_vlm:
-        return get_dynamic_inference_engine()
+        engine_cls = DisaggDynamicInferenceEngine if args.disagg_role else None
+        return get_dynamic_inference_engine(engine_cls=engine_cls)
+    if args.disagg_role:
+        raise NotImplementedError("disaggregated serving does not support VLM checkpoints")
 
     tokenizer = build_tokenizer(args)
     model = get_vlm_model(is_vlm=True)
@@ -331,12 +379,39 @@ async def run_text_generation_server(
     """
 
     rank = torch.distributed.get_rank()
+    disagg_role = getattr(args, 'disagg_role', None)
+
+    if disagg_role:
+        # Collective over each engine's model-parallel ranks; must precede the coordinator
+        # handshake, which sets up the hand-off completion tracking.
+        engine.setup_kv_transfer(disagg_role, args.kv_transfer_backend)
+        if rank == 0:
+            logging.info("KV transfer ready: role=%s backend=%s", disagg_role, args.kv_transfer_backend)
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=coordinator_port,
         launch_inference_coordinator=True,
         hostname=hostname,
     )
+
+    prefill_coordinator_addr = None
+    if disagg_role == "prefill":
+        # The prefill pool serves no HTTP: the decode pool's frontend submits to its
+        # coordinator, whose address it publishes here.
+        if rank == 0:
+            path = args.disagg_prefill_coordinator_file
+            with open(path + ".tmp", "w") as f:
+                f.write(coordinator_addr + "\n")
+            os.replace(path + ".tmp", path)
+            logging.info("Prefill coordinator %s published to %s", coordinator_addr, path)
+        await engine.engine_loop_task
+        return
+    if disagg_role == "decode" and rank == 0:
+        logging.info(
+            "Waiting for the prefill coordinator address in %s", args.disagg_prefill_coordinator_file
+        )
+        prefill_coordinator_addr = _wait_for_file(args.disagg_prefill_coordinator_file)
+        logging.info("Prefill coordinator: %s", prefill_coordinator_addr)
 
     num_replicas = getattr(args, 'frontend_replicas', -1)
     if num_replicas < 0:
@@ -389,6 +464,7 @@ async def run_text_generation_server(
                 prefix_caching_coordinator_policy=(
                     engine.context.prefix_caching_coordinator_policy
                 ),
+                prefill_coordinator_addr=prefill_coordinator_addr,
             )
 
         if getattr(args, 'frontend_on_all_ranks', False):
@@ -483,6 +559,12 @@ if __name__ == "__main__":
         # Already requested via --return-log-probs default above; keep this
         # explicit assignment for clarity / belt-and-braces with the engine.
         args.return_log_probs = True
+
+        if args.disagg_role:
+            if not args.disagg_prefill_coordinator_file:
+                raise ValueError("--disagg-role requires --disagg-prefill-coordinator-file")
+            if getattr(args, 'frontend_on_all_ranks', False):
+                raise ValueError("--disagg-role does not support --frontend-on-all-ranks")
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 

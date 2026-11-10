@@ -39,8 +39,12 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.step_time_metrics import StepTimeHistogram, classify_step
-from megatron.core.inference.moe.routing_counts import RoutingCounter
+from megatron.core.inference.engines.step_time_metrics import (
+    StepMixCounter,
+    StepTimeHistogram,
+    classify_step,
+    classify_step_mix,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -61,6 +65,7 @@ from megatron.core.inference.inference_request import (
     merge_multimodal_data,
     resolve_multimodal_data_for_engine,
 )
+from megatron.core.inference.moe.routing_counts import RoutingCounter
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -714,6 +719,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if not hasattr(self, "_step_time_histogram"):
             # Logging steps only (the ones the engine times); see step_time_metrics.
             self._step_time_histogram = StepTimeHistogram()
+        if not hasattr(self, "_step_mix_counter"):
+            # Every step, host-timed; see step_time_metrics.StepMixCounter.
+            self._step_mix_counter = StepMixCounter()
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -3706,6 +3714,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if will_log_this_step:
             RoutingCounter.arm(False)
+        self._observe_step_mix(controller_result.decode_only)
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
@@ -3781,7 +3790,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 holdback = max(0, max(len(ids) for ids in stop_word_ids) - 1)
             emit_end = max(already, total - holdback)
             streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
-            if emit_end - already >= streaming_interval:
+            # The first tokens go out as soon as they exist (the client's time to first token,
+            # and the signal a disaggregated router uses to release the prefill's KV); later
+            # deltas are buffered to streaming_interval tokens.
+            if emit_end > already and (already == 0 or emit_end - already >= streaming_interval):
                 new_tokens = list(request.generated_tokens[already:emit_end])
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
@@ -3834,6 +3846,27 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         self._step_time_histogram.observe(step_class, step_time * 1e3)
 
+    def _observe_step_mix(self, decode_only) -> None:
+        """Count every launched forward by step class (local batch mix + EP consensus).
+
+        Host-only: reads the batch dimensions and EP consensus the context set while preparing
+        the launched forward, so it adds no GPU synchronization.
+        """
+        counter = getattr(self, "_step_mix_counter", None)
+        batch = getattr(self.context, "batch_dimensions", None)
+        if counter is None or batch is None:  # partially constructed engines (tests)
+            return
+        launched_decode_only = getattr(decode_only, "launched", decode_only)
+        if launched_decode_only is None:  # no forward launched (idle step)
+            counter.idle()
+            return
+        step_class = classify_step_mix(
+            local_prefill=not launched_decode_only,
+            local_decode_requests=batch.decode_req_count,
+            ep_any_prefill=self.context.step_ep_any_prefill,
+        )
+        counter.observe(step_class, batch.token_count)
+
     @staticmethod
     def _context_percentiles(lengths) -> Dict[str, int]:
         """min / p50 / p90 / p99 / max of the active requests' context lengths (0 if none)."""
@@ -3876,6 +3909,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             ),
             "step_time_ms": self._step_time_histogram.snapshot(),
+            "step_mix": self._step_mix_counter.snapshot(),
         }
 
     async def async_bookkeep(

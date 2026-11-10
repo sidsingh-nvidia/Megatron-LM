@@ -43,6 +43,8 @@ VLLM_METRICS = {
     "iteration_tokens_total_count": "engine_steps_total",
     "num_requests_running": "requests_running",
     "num_requests_waiting": "requests_waiting",
+    # Disaggregated mcore servers only (prefill-pool requests handed off to decode).
+    "prefill_handoffs_total": "prefill_handoffs_total",
 }
 
 
@@ -106,6 +108,57 @@ def diff_histograms(h0, h1):
     return out
 
 
+STEP_MIX_FIELDS = ("steps", "tokens", "wall_ms")
+
+
+def parse_step_mix(text):
+    """mcore step-mix counters from /metrics text: {scope: {class: {"steps", "tokens",
+    "wall_ms"}}}, scope an engine identity (prefill/<id> or decode/<id> behind a disaggregated
+    frontend) or "all" (the sum over engines)."""
+    out = {}
+    for line in text.splitlines():
+        if not line.startswith("mcore:step_mix_"):
+            continue
+        series, value = line.rsplit(None, 1)
+        field = series[len("mcore:step_mix_"):].split("{")[0].removesuffix("_total")
+        if field not in STEP_MIX_FIELDS:
+            continue
+        labels = dict(kv.split("=", 1) for kv in series.split("{", 1)[1].rstrip("}").split(","))
+        labels = {k: v.strip('"') for k, v in labels.items()}
+        entry = out.setdefault(labels.get("engine", "all"), {}).setdefault(
+            labels["step"], dict.fromkeys(STEP_MIX_FIELDS, 0.0))
+        entry[field] = float(value)
+    return out
+
+
+def diff_step_mix(m0, m1):
+    """Step-mix counters over a window: m1 - m0 per scope and class, with the mean step time
+    and each class's share of the scope's steps and wall time. "all" sums engines, so its
+    shares are over engine-steps; behind a disaggregated frontend, the per-pool sums are added
+    as "prefill" and "decode"."""
+    out = {}
+    for scope, classes in m1.items():
+        for step_class, counters in classes.items():
+            before = m0.get(scope, {}).get(step_class, {})
+            delta = {f: counters[f] - before.get(f, 0.0) for f in STEP_MIX_FIELDS}
+            if delta["steps"] > 0:
+                out.setdefault(scope, {})[step_class] = delta
+    for scope in [s for s in out if "/" in s]:
+        pool = out.setdefault(scope.split("/", 1)[0], {})
+        for step_class, delta in out[scope].items():
+            acc = pool.setdefault(step_class, dict.fromkeys(STEP_MIX_FIELDS, 0.0))
+            for f in STEP_MIX_FIELDS:
+                acc[f] += delta[f]
+    for classes in out.values():
+        steps = sum(d["steps"] for d in classes.values())
+        wall = sum(d["wall_ms"] for d in classes.values())
+        for d in classes.values():
+            d["mean_ms"] = d["wall_ms"] / d["steps"]
+            d["step_share"] = d["steps"] / steps
+            d["time_share"] = d["wall_ms"] / wall if wall > 0 else float("nan")
+    return out
+
+
 def read_engine_gauges(server, names=("requests_running", "requests_waiting", "kv_tokens",
                                       "min_context_tokens", "p50_context_tokens",
                                       "p90_context_tokens", "p99_context_tokens",
@@ -153,6 +206,7 @@ def read_metrics(server):
             totals[name] = float(value)
     metrics = {name: totals.get(name, labeled_sums.get(name, 0.0)) for name in VLLM_METRICS.values()}
     metrics["step_time_ms"] = parse_histograms(text)
+    metrics["step_mix"] = parse_step_mix(text)
     return metrics
 
 
@@ -182,6 +236,10 @@ def main():
     ap.add_argument("--stream", action="store_true",
                     help="stream responses (server-sent events): also records TTFT and the "
                          "TPOT after the first token")
+    ap.add_argument("--stream-interval", type=int, default=1,
+                    help="with --stream: tokens per streamed chunk after the first, which mcore "
+                         "sends immediately (fewer chunks keep the client off the critical path "
+                         "at high concurrency)")
     ap.add_argument("--dataset", choices=["math", "wildchat"], default="math",
                     help="math: the 160-problem math blend; wildchat: WildChat-1M first user turns")
     ap.add_argument("--out", required=True)
@@ -240,6 +298,8 @@ def main():
             if args.stream:
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
+                if args.stream_interval > 1:
+                    payload["streaming_interval"] = args.stream_interval
             req = urllib.request.Request(f"{args.server}/v1/chat/completions",
                                          data=json.dumps(payload).encode(),
                                          headers={"Content-Type": "application/json"})
@@ -261,6 +321,8 @@ def main():
                     requests_log.write(json.dumps({
                         "start": round(rec[0], 3), "end": round(rec[1], 3),
                         "output_tokens": rec[2], "prompt_tokens": rec[3], "finish_reason": rec[4],
+                        # Streaming only: when the first content token arrived.
+                        "first_token": round(rec[5], 3) if rec[5] is not None else None,
                     }) + "\n")
                     requests_log.flush()
             except Exception as e:  # noqa: BLE001
@@ -319,10 +381,14 @@ def main():
                 "window_index": window,
                 "window_start_s": round(t0 - level_start, 1),
                 "window_s": round(dt, 2),
+                # Absolute bounds, to pool <out>.requests.jsonl over a level's windows.
+                "window_t0": round(t0, 3),
+                "window_t1": round(t1, 3),
                 "output_tok_s": (m1["generation_tokens_total"] - m0["generation_tokens_total"]) / dt,
                 "prompt_tok_s": (m1["prompt_tokens_total"] - m0["prompt_tokens_total"]) / dt,
                 "cached_prompt_tok_s": (m1["prompt_tokens_cached_total"] - m0["prompt_tokens_cached_total"]) / dt,
                 "requests_finished": int(m1["requests_finished_total"] - m0["requests_finished_total"]),
+                "prefill_handoffs": int(m1["prefill_handoffs_total"] - m0["prefill_handoffs_total"]),
                 "engine_steps": int(m1["engine_steps_total"] - m0["engine_steps_total"]),
                 "running_at_end": int(m1["requests_running"]),
                 "waiting_at_end": int(m1["requests_waiting"]),
@@ -351,6 +417,9 @@ def main():
             rec["output_tok_s_over_c"] = rec["output_tok_s"] / c
             # Timed (logging) steps in the window by class, per engine and summed ("all").
             rec["step_time_ms"] = diff_histograms(m0["step_time_ms"], m1["step_time_ms"])
+            # Every step in the window by class (count, tokens, host wall time), per engine,
+            # summed ("all") and, behind a disaggregated frontend, per pool.
+            rec["step_mix"] = diff_step_mix(m0["step_mix"], m1["step_mix"])
             out.write(json.dumps(rec) + "\n")
             out.flush()
             print(f"c={c:5d}  output {rec['output_tok_s']:9.1f} tok/s  "
@@ -363,6 +432,14 @@ def main():
                 print(f"         streaming: TTFT p50 {rec['ttft_ms_p50']:.0f} ms, p90 {rec['ttft_ms_p90']:.0f} ms; "
                       f"TPOT after the first token p50 {rec['decode_tpot_ms_p50']:.2f} ms, "
                       f"p90 {rec['decode_tpot_ms_p90']:.2f} ms", flush=True)
+            # Disaggregated: one summary per pool; aggregated: the sum over engines.
+            scopes = [s for s in ("prefill", "decode") if s in rec["step_mix"]] or ["all"]
+            for scope in scopes:
+                for step_class, d in sorted(rec["step_mix"].get(scope, {}).items()):
+                    print(f"         {scope:7s} {step_class:18s} {int(d['steps']):7d} steps "
+                          f"({100 * d['step_share']:5.1f}% of steps, "
+                          f"{100 * d['time_share']:5.1f}% of time), mean {d['mean_ms']:7.2f} ms",
+                          flush=True)
             for step_class, h in sorted(rec["step_time_ms"].get("all", {}).items()):
                 print(f"         {step_class:18s} {h['count']:6d} timed steps, mean {h['mean_ms']:8.2f} ms",
                       flush=True)

@@ -24,7 +24,8 @@
 # STEADY_WINDOWS (consecutive windows per level, one record each; default 1),
 # STEADY_IGNORE_EOS (1 = ignore EOS; with MAX_GEN_TOKENS every request has exactly that OSL),
 # STEADY_SAMPLE_INTERVAL (seconds between per-engine gauge samples into steady.engines.jsonl; 0 = off),
-# STEADY_DATASET (steady prompts: math | wildchat; default math), STEADY_STREAM (1 = stream
+# STEADY_DATASET (steady prompts: math | wildchat; default math), STEADY_STREAM_INTERVAL (with
+# STEADY_STREAM=1: tokens per streamed chunk after the first; default 1), STEADY_STREAM (1 = stream
 # responses, which also records TTFT; default 0),
 # STEADY_WARMUP / STEADY_WINDOW (seconds per level; default 60 / 300), MAX_GEN_TOKENS (steady
 # output cap; default 0 = none), KEEP_SERVER (1 = leave the server running
@@ -99,7 +100,7 @@ elif [ "${CLIENT:-steady}" == "inferencex" ]; then
         2>&1 | tee "${EXP_DIR}/bench.log"
     status=${PIPESTATUS[0]}
 elif [ "${CLIENT:-steady}" == "steady" ]; then
-    echo "CLIENT=steady STEADY_DATASET=${STEADY_DATASET:-math} STEADY_STREAM=${STEADY_STREAM:-0} STEADY_IGNORE_EOS=${STEADY_IGNORE_EOS:-0} STEADY_WINDOWS=${STEADY_WINDOWS:-1} STEADY_SAMPLE_INTERVAL=${STEADY_SAMPLE_INTERVAL:-0} STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
+    echo "CLIENT=steady STEADY_DATASET=${STEADY_DATASET:-math} STEADY_STREAM=${STEADY_STREAM:-0} STEADY_STREAM_INTERVAL=${STEADY_STREAM_INTERVAL:-1} STEADY_IGNORE_EOS=${STEADY_IGNORE_EOS:-0} STEADY_WINDOWS=${STEADY_WINDOWS:-1} STEADY_SAMPLE_INTERVAL=${STEADY_SAMPLE_INTERVAL:-0} STEADY_WARMUP=${STEADY_WARMUP:-60} STEADY_WINDOW=${STEADY_WINDOW:-300} MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-0}" >> "${EXP_DIR}/config.env"
     python3 -u inference-bench/server/steady_client.py \
         --server "${SERVER}" \
         --concurrency ${BENCH} \
@@ -109,7 +110,7 @@ elif [ "${CLIENT:-steady}" == "steady" ]; then
         --dataset "${STEADY_DATASET:-math}" \
         --windows "${STEADY_WINDOWS:-1}" \
         --sample-interval "${STEADY_SAMPLE_INTERVAL:-0}" \
-        $([ "${STEADY_STREAM:-0}" == "1" ] && echo --stream) \
+        $([ "${STEADY_STREAM:-0}" == "1" ] && echo --stream --stream-interval "${STEADY_STREAM_INTERVAL:-1}") \
         $([ "${STEADY_IGNORE_EOS:-0}" == "1" ] && echo --ignore-eos) \
         --out "${EXP_DIR}/steady.jsonl" \
         2>&1 | tee "${EXP_DIR}/bench.log"

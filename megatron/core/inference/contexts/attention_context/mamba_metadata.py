@@ -141,6 +141,10 @@ class MambaMetadata:
             self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
+        # Slots held outside any request row: detached from a finished prefill request whose state
+        # a disaggregated decode is still reading, or reserved for a decode-side state import not
+        # yet admitted. reset() keeps them out of the free pool until free_slot() returns them.
+        self.unbound_slots: set = set()
 
         # Intermediate state extraction buffers (CUDA graph compatible). Sized by
         # the per-step token-budget cap shared from DynamicInferenceContext.
@@ -190,8 +194,14 @@ class MambaMetadata:
 
         self.reset_varlen_metadata()
 
-        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
-        self.mamba_state_free_slot_count = self.max_requests
+        if not getattr(self, "unbound_slots", None):
+            torch.arange(self.max_requests, out=self.mamba_state_free_slots)
+            self.mamba_state_free_slot_count = self.max_requests
+            return
+        # Unbound slots are owned outside the request rows (see __init__), so they stay allocated.
+        free = [i for i in range(self.max_requests) if i not in self.unbound_slots]
+        self.mamba_state_free_slots[: len(free)] = torch.tensor(free, dtype=torch.int32)
+        self.mamba_state_free_slot_count = len(free)
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -908,13 +918,31 @@ class MambaMetadata:
 
         return int(mamba_idx)
 
+    def allocate_unbound_slot(self) -> Optional[int]:
+        """Allocate a slot owned outside any request row until bind_slot() or free_slot()."""
+
+        mamba_idx = self.allocate_slot()
+        if mamba_idx is not None:
+            self.unbound_slots.add(mamba_idx)
+        return mamba_idx
+
+    def bind_slot(self, request_idx: int, mamba_idx: int) -> None:
+        """Hand an unbound slot to a request row, which frees it with the request."""
+
+        self.unbound_slots.discard(int(mamba_idx))
+        self.request_to_mamba_state_idx[request_idx] = mamba_idx
+
     def detach_state_slot(self, request_idx: int) -> int:
-        """Detach and return a request's live state slot without freeing it."""
+        """Detach and return a request's live state slot without freeing it.
+
+        The slot stays allocated, across reset() too, until free_slot() returns it.
+        """
 
         mamba_idx = int(self.request_to_mamba_state_idx[request_idx].item())
         if mamba_idx < 0:
             raise RuntimeError(f"Request index {request_idx} has no live Mamba state slot")
         self.request_to_mamba_state_idx[request_idx] = -1
+        self.unbound_slots.add(mamba_idx)
         return mamba_idx
 
     def free_slot(self, mamba_idx: int) -> None:
@@ -924,6 +952,7 @@ class MambaMetadata:
             raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
         if self.mamba_state_free_slot_count >= self.max_requests:
             raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.unbound_slots.discard(int(mamba_idx))
         self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
         self.mamba_state_free_slot_count += 1
 

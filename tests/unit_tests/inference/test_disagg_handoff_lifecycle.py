@@ -107,6 +107,9 @@ class _MambaMetadata:
         self.mamba_state_free_slot_count -= 1
         return slot
 
+    def allocate_unbound_slot(self):
+        return self.allocate_slot()
+
     def free_slot(self, slot):
         self.freed.append(slot)
         self.mamba_state_free_slot_count += 1
@@ -267,8 +270,10 @@ def test_prefilled_decode_admission_uses_exact_ssm_state_without_prompt_tokens()
         token_to_local_position_within_kv_block=torch.zeros(8, dtype=torch.int32),
         token_to_block_idx=torch.full((8,), -1, dtype=torch.int32),
     )
+    mamba_rows = torch.full((2,), -1, dtype=torch.int32)
     context.mamba_metadata = SimpleNamespace(
-        request_to_mamba_state_idx=torch.full((2,), -1, dtype=torch.int32)
+        request_to_mamba_state_idx=mamba_rows,
+        bind_slot=lambda request_idx, slot: mamba_rows.__setitem__(request_idx, slot),
     )
     request = DynamicInferenceRequest(
         request_id=7,
@@ -1244,3 +1249,30 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         is not requests[1].disaggregated_params["kv_meta"]
     )
     assert all("ssm" not in meta for meta in engine._kv_peer_metas)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MambaMetadata allocates CUDA buffers")
+def test_unbound_mamba_slots_survive_a_drained_context_reset():
+    """A finished prefill request's detached slot (and a decode import's reserved slot) stay
+    allocated when the context drains and resets its Mamba pool; free_slot() returns them."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+
+    metadata = MambaMetadata(4, 64, max_intermediate_count=8)
+    slots = [metadata.allocate_slot() for _ in range(2)]
+    metadata.request_to_mamba_state_idx[0] = slots[0]
+    metadata.request_to_mamba_state_idx[1] = slots[1]
+    detached = metadata.detach_state_slot(0)  # prefill hand-off: pinned until RELEASE_KV
+    reserved = metadata.allocate_unbound_slot()  # decode import awaiting admission
+
+    metadata.reset()  # the context drained: no active requests
+
+    assert metadata.mamba_state_free_slot_count == 2
+    free = set(metadata.mamba_state_free_slots[:2].tolist())
+    assert detached not in free and reserved not in free
+    assert {metadata.allocate_slot(), metadata.allocate_slot()} == free
+    assert metadata.allocate_slot() is None
+
+    metadata.bind_slot(0, reserved)  # admission: freed with its request from now on
+    metadata.free_slot(detached)  # RELEASE_KV
+    assert metadata.unbound_slots == set()
+    assert metadata.allocate_slot() == detached

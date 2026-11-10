@@ -423,8 +423,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     return setup_cfg.to_inference_config(model, metrics_writer=metrics_writer)
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+def get_dynamic_inference_engine(
+    model: Optional[MegatronModule] = None, engine_cls: Optional[type] = None
+) -> DynamicInferenceEngine:
+    """Builds a `DynamicInferenceEngine`, or `engine_cls` (a subclass taking the same
+    controller and context, e.g. DisaggDynamicInferenceEngine)."""
     args = get_args()
     if model is None:
         model = get_model_for_inference()
@@ -434,5 +437,5 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
+    engine = (engine_cls or DynamicInferenceEngine)(controller, context)
     return engine

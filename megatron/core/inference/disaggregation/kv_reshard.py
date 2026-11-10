@@ -43,9 +43,19 @@ class KVShardLayout:
     num_local_layers: Optional[int] = None
 
     def __post_init__(self) -> None:
-        # TP must divide heads (the head split is always even).
-        if self.num_heads % self.tp_size != 0:
-            raise ValueError(f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}")
+        # Heads split evenly across TP, or -- when there are fewer KV heads than
+        # TP ranks -- each head is replicated on tp_size // num_heads consecutive
+        # ranks (matching Attention's num_query_groups < tp_size path).
+        if self.num_heads >= self.tp_size:
+            if self.num_heads % self.tp_size != 0:
+                raise ValueError(
+                    f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}"
+                )
+        elif self.tp_size % self.num_heads != 0:
+            raise ValueError(
+                f"tp_size={self.tp_size} not divisible by num_heads={self.num_heads}; "
+                "replicated KV heads need an even replication factor"
+            )
         # layer_start and num_local_layers are an all-or-nothing explicit window:
         # setting only one would silently fall back to the even-split count and
         # defeat the purpose (uneven stage with an even count).
@@ -74,8 +84,22 @@ class KVShardLayout:
         per = self.num_layers // self.pp_size
         return (self.pp_rank * per, (self.pp_rank + 1) * per)
 
+    def head_replicas(self) -> int:
+        """How many TP ranks hold each KV head (1 unless num_heads < tp_size)."""
+        if self.num_heads >= self.tp_size:
+            return 1
+        return self.tp_size // self.num_heads
+
     def head_range(self) -> Tuple[int, int]:
-        """Global KV-head range ``[lo, hi)`` owned by this rank."""
+        """Global KV-head range ``[lo, hi)`` owned by this rank.
+
+        With replicated KV heads, ranks ``[h * r, (h + 1) * r)`` all hold head
+        ``h``, where ``r = head_replicas()``.
+        """
+        replicas = self.head_replicas()
+        if replicas > 1:
+            head = self.tp_rank // replicas
+            return (head, head + 1)
         per = self.num_heads // self.tp_size
         return (self.tp_rank * per, (self.tp_rank + 1) * per)
 
@@ -143,6 +167,15 @@ def plan_kv_reshard(
     source each shard from exactly one of them -- the smallest
     ``global_rank`` -- which avoids duplicate sends and is independent of
     how EP/ETP map onto ranks.
+
+    KV heads may also be replicated across TP (fewer KV heads than TP ranks):
+    ``head_replicas()`` consecutive source TP ranks then hold the same head.
+    Each destination reads that head from exactly one of them, the replica
+    whose ``tp_rank % replicas`` equals the destination's
+    ``tp_rank % replicas``. The rule only needs the source rank's own layout,
+    so a sender that knows only itself (two-sided backends) and a receiver
+    that sees every source agree on the plan, and destination ranks spread
+    their reads over the replicas instead of all hitting one GPU.
     """
     if srcs and dsts:
         if srcs[0].num_layers != dsts[0].num_layers or srcs[0].num_heads != dsts[0].num_heads:
@@ -162,6 +195,9 @@ def plan_kv_reshard(
         dl, dh = d.layer_range(), d.head_range()
         for s in srcs:
             if s.global_rank not in source_ranks:
+                continue
+            replicas = s.head_replicas()
+            if replicas > 1 and s.tp_rank % replicas != d.tp_rank % replicas:
                 continue
             li = intersect(s.layer_range(), dl)
             if li is None:
