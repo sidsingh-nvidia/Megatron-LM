@@ -2,7 +2,7 @@
 
 import torch
 
-from .barrier import symm_mem_sync
+from .barrier import barrier_ptrs, symm_mem_sync_end, symm_mem_sync_start
 from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import add_v8_bf16_from_u32, asm_rsqrt, ld_128, st_128
 from .utils import sync_threads
@@ -118,7 +118,8 @@ def _multimem_reduce_scatter_residual_add_kernel(
     residual_input_ptr,
     rms_norm_weights_ptr,
     multicast_ptr,  # points to symmetric memory buffer
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     num_tokens,
     eps,
     HIDDEN_SIZE: tl.constexpr,
@@ -127,14 +128,8 @@ def _multimem_reduce_scatter_residual_add_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=False,
-        hasSubsequentMemAccess=False,
-    )
+    symm_mem_sync_start(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
     sync_threads()
 
     pid = tl.program_id(axis=0)
@@ -201,14 +196,8 @@ def _multimem_reduce_scatter_residual_add_kernel(
             st_128(multicast_ptrs, nx, ny, nz, nw, mask=mask, multicast_op=True)
 
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
 
 
 def fused_multimem_rs_add_norm_ag(
@@ -274,7 +263,7 @@ def fused_multimem_rs_add_norm_ag(
         residual_input_tensor.data_ptr(),
         rms_norm_weights.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         input_tensor.numel() // hsize,
         eps=eps,
         HIDDEN_SIZE=hsize,
