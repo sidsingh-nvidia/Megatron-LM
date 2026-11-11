@@ -38,7 +38,10 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from megatron.core.inference.communication.torch_symm_triton.barrier import symm_mem_sync
+from megatron.core.inference.communication.torch_symm_triton.barrier import (
+    barrier_ptrs,
+    symm_mem_sync_end,
+)
 from megatron.core.inference.communication.torch_symm_triton.multimem_asm import st_32
 from megatron.core.inference.communication.torch_symm_triton.utils import sync_threads
 
@@ -48,7 +51,8 @@ def _fused_metadata_kernel(
     local_tokens,
     local_buf_ptr,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     step_metadata_ptr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -63,7 +67,7 @@ def _fused_metadata_kernel(
         local_tokens: scalar int32, this rank's token count.
         local_buf_ptr: pointer to the local symmetric memory buffer (for reads).
         multicast_ptr: multicast pointer to the symmetric memory buffer (for writes).
-        signal_pad_ptrs: signal pads for barrier synchronization.
+        barrier_mc_ptr, barrier_local_ptr: the buffer's barrier state (barrier_ptrs).
         step_metadata_ptr: pointer to the 3-element int32 output tensor.
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
@@ -81,14 +85,8 @@ def _fused_metadata_kernel(
 
     # 2. Barrier — wait for all ranks to have written.
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(barrier_mc_ptr, barrier_local_ptr, 1, RANK, WORLD_SIZE)
+    sync_threads()  # the single block is the last block: every thread reads after its wait
 
     # 3. Load all ranks' values, reduce, and write metadata.
     offsets = tl.arange(0, WORLD_SIZE)
@@ -126,7 +124,7 @@ def fused_metadata_update(
         local_tokens,
         local_buf,
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         step_metadata,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,

@@ -36,7 +36,7 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from .barrier import symm_mem_sync
+from .barrier import barrier_ptrs, symm_mem_sync_end, symm_mem_sync_start
 from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_64, ld_128, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
@@ -46,7 +46,8 @@ from .utils import is_device_nvls_capable, sync_threads
 def _multimem_all_gather_v_kernel(
     local_ptr,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -66,7 +67,7 @@ def _multimem_all_gather_v_kernel(
     Args:
         local_ptr: pointer to this rank's local input, shape [local_tokens, hidden_size].
         multicast_ptr: multicast pointer to the output symmetric memory buffer.
-        signal_pad_ptrs: signal pads for barrier synchronization.
+        barrier_mc_ptr, barrier_local_ptr: the buffer's barrier state (barrier_ptrs).
         local_tokens: number of tokens this rank contributes.
         rank_token_offset_ptr: pointer to a scalar int32 CUDA tensor holding the index
             of the first token this rank writes in the global output (prefix sum of
@@ -140,21 +141,16 @@ def _multimem_all_gather_v_kernel(
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
 
 
 @triton.jit
 def _multimem_reduce_scatter_v_kernel(
     local_ptr,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -178,7 +174,7 @@ def _multimem_reduce_scatter_v_kernel(
     Args:
         local_ptr: output pointer to this rank's local buffer, shape [local_tokens, hidden_size].
         multicast_ptr: multicast pointer to the symmetric memory buffer holding all expert outputs.
-        signal_pad_ptrs: signal pads for barrier synchronization.
+        barrier_mc_ptr, barrier_local_ptr: the buffer's barrier state (barrier_ptrs).
         local_tokens: number of tokens this rank owns.
         rank_token_offset_ptr: pointer to a scalar int32 CUDA tensor holding the index of the
             first token this rank owns in the global token sequence. Fixed address; set each step.
@@ -203,14 +199,8 @@ def _multimem_reduce_scatter_v_kernel(
 
     # Wait for all ranks to have written their expert GEMM outputs to symm_mem
     # before any rank starts the reduce-load.
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=False,
-        hasSubsequentMemAccess=False,
-    )
+    symm_mem_sync_start(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
     sync_threads()
 
     tid = tl.arange(0, BLOCK_SIZE)
@@ -332,7 +322,7 @@ def multimem_reduce_scatter_v(
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
@@ -360,7 +350,8 @@ def _multimem_all_gatherv_3tensor_kernel(
     local_ptr_2,
     multicast_ptr_2,
     output_byte_offset_2,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -389,7 +380,7 @@ def _multimem_all_gatherv_3tensor_kernel(
     of the three per-tensor block sizes — smaller tensors mask out the extra threads
     via a mask.
 
-    signal_pad_ptrs from the first output buffer's symmetric memory handle are used
+    The barrier state of the first output buffer's symmetric memory handle is used
     for the single end-of-kernel barrier. Since all three writes complete before the
     barrier, a single sync suffices for all three tensors.
 
@@ -398,7 +389,8 @@ def _multimem_all_gatherv_3tensor_kernel(
         multicast_ptr_0/1/2: multicast pointers to the output symmetric memory buffers.
         output_byte_offset_0/1/2: byte offsets of each tensor within its symmetric
             memory buffer (0 when the buffer holds only that tensor).
-        signal_pad_ptrs: signal pads from symm_mem_hdl_0, used for the single barrier.
+        barrier_mc_ptr, barrier_local_ptr: barrier state of symm_mem_hdl_0, used for the single
+            barrier.
         local_tokens: number of tokens this rank contributes (shared across tensors).
         rank_token_offset_ptr: pointer to a scalar int32 CUDA tensor holding this rank's
             write offset in the global output (prefix sum over lower-ranked EP ranks).
@@ -504,14 +496,8 @@ def _multimem_all_gatherv_3tensor_kernel(
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
 
 
 def multimem_all_gather_v(
@@ -601,7 +587,7 @@ def multimem_all_gather_v(
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
@@ -648,7 +634,7 @@ def multimem_all_gatherv_3tensor(
     The 128-bit or 64-bit NVLS path is selected independently per tensor based on row
     alignment.
 
-    The barrier at the end of the kernel uses signal_pad_ptrs from symm_mem_hdl_0. Since
+    The barrier at the end of the kernel uses the barrier state of symm_mem_hdl_0. Since
     all three multicast stores complete before the barrier, a single sync covers all three
     tensors. All three handles must belong to the same EP group (identical rank/world_size).
 
@@ -657,7 +643,7 @@ def multimem_all_gatherv_3tensor(
             shape [global_tokens, hidden_size_i].
         input_tensor_0/1/2: this rank's local inputs, shape [local_tokens, hidden_size_i].
         symm_mem_hdl_0/1/2: symmetric memory handles for each output buffer.
-            signal_pad_ptrs from hdl_0 are used for the single end-of-kernel barrier.
+            hdl_0's barrier state is used for the single end-of-kernel barrier.
         rank_token_offset: pre-allocated scalar int32 CUDA tensor. The dispatcher writes
             this rank's token offset (prefix sum over lower-ranked EP ranks) each step.
         ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes the
@@ -745,7 +731,7 @@ def multimem_all_gatherv_3tensor(
         input_tensor_2.data_ptr(),
         symm_mem_hdl_2.multicast_ptr,
         output_byte_offset_2,
-        symm_mem_hdl_0.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl_0),
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
@@ -814,7 +800,8 @@ def _multimem_all_gatherv_2tensor_kernel(
     local_ptr_1,
     multicast_ptr_1,
     output_byte_offset_1,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -851,14 +838,8 @@ def _multimem_all_gatherv_2tensor_kernel(
         )
 
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
 
 
 def multimem_all_gatherv_2tensor(
@@ -931,7 +912,7 @@ def multimem_all_gatherv_2tensor(
         input_tensor_1.data_ptr(),
         symm_mem_hdl_1.multicast_ptr,
         output_byte_offset_1,
-        symm_mem_hdl_0.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl_0),
         local_tokens=input_tensor_0.shape[0],
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,

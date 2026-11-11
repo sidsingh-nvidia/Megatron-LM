@@ -57,7 +57,7 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from .barrier import symm_mem_sync
+from .barrier import barrier_ptrs, symm_mem_sync_end, symm_mem_sync_start
 from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_64, ld_128, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
@@ -179,7 +179,8 @@ def _a2a_dispatch_v_kernel(
     probs_ptr,
     probs_mc_ptr,
     probs_byte_offset,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -204,7 +205,8 @@ def _a2a_dispatch_v_kernel(
         hidden_byte_offset: byte offset of the hidden tensor inside its symmetric buffer.
         routing_ptr / probs_ptr: local [local_tokens, TOPK] int64 ids / fp32 probs.
         routing_mc_ptr / probs_mc_ptr: multicast pointers of their receive buffers.
-        signal_pad_ptrs: signal pads of the hidden buffer (one barrier covers all three).
+        barrier_mc_ptr, barrier_local_ptr: barrier state of the hidden buffer (one barrier covers
+            all three).
         local_tokens: this rank's token count.
         rank_token_offset_ptr / ep_max_tokens_ptr: per-step metadata (see AGV-V).
         HIDDEN_PACKS: 16-byte packs per hidden row.
@@ -276,14 +278,8 @@ def _a2a_dispatch_v_kernel(
 
     # The release in the barrier covers this CTA's unicast and multicast stores.
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
 
 
 @triton.jit
@@ -292,7 +288,8 @@ def _a2a_combine_v_kernel(
     partial_peer_ptrs,
     partial_byte_offset,
     routing_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
@@ -314,7 +311,7 @@ def _a2a_combine_v_kernel(
         routing_ptr: this rank's LOCAL routing [local_tokens, TOPK] as passed to dispatch
             (int64 ids, or packed int32 with PACKED), used to recompute which ranks each token
             was dispatched to.
-        signal_pad_ptrs: signal pads of the partial buffer.
+        barrier_mc_ptr, barrier_local_ptr: barrier state of the partial buffer.
         HIDDEN_PACKS: 16-byte packs (8 bf16) per row.
     """
     pid = tl.program_id(axis=0)
@@ -325,14 +322,8 @@ def _a2a_combine_v_kernel(
 
     # See:
     # https://github.com/yifuwang/symm-mem-recipes/blob/8ee5d5b8f53efb9c051e6cdf0ca62270c2b43c34/triton_barrier.py#L115-L119
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=False,
-        hasSubsequentMemAccess=False,
-    )
+    symm_mem_sync_start(
+        barrier_mc_ptr, barrier_local_ptr, tl.minimum(tl.num_programs(axis=0), ep_max_tokens), RANK, WORLD_SIZE)
     sync_threads()
 
     # Triton-3.6 fix (as in variable_collectives.py): widen raw pointer ints to i64.
@@ -499,7 +490,7 @@ def a2a_dispatch_v(
         input_probs.data_ptr(),
         symm_mem_hdl_probs.multicast_ptr,
         probs_byte_offset,
-        symm_mem_hdl_hidden.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl_hidden),
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
@@ -600,7 +591,7 @@ def a2a_combine_v(
         symm_mem_hdl_partial.buffer_ptrs_dev,
         partial_byte_offset,
         routing.data_ptr(),
-        symm_mem_hdl_partial.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl_partial),
         local_tokens=output.shape[0],
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
