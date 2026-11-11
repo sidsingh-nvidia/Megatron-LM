@@ -21,7 +21,7 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from .barrier import symm_mem_sync
+from .barrier import barrier_ptrs, symm_mem_sync_end, symm_mem_sync_start
 from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
@@ -69,7 +69,8 @@ def _ag_phase(
 def _multimem_all_gather_kernel(
     local_ptr,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     numel,
     byte_offset,
     BLOCK_SIZE: tl.constexpr,
@@ -83,29 +84,18 @@ def _multimem_all_gather_kernel(
         # Ensure every rank has finished reading the previous contents before
         # this all-gather reuses the symmetric buffer. The usual RS -> AG
         # sequence gets this ordering from the reduce-scatter; consecutive AGs
-        # must request it explicitly.
-        symm_mem_sync(
-            signal_pad_ptrs,
-            None,
-            RANK,
-            WORLD_SIZE,
-            hasPreviousMemAccess=True,
-            hasSubsequentMemAccess=True,
-        )
+        # must request it explicitly. A peer arrives only once its previous kernel,
+        # and with it its reads, has finished.
+        symm_mem_sync_start(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
         sync_threads()
 
     _ag_phase(
         local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
     )
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
 
 
 @triton.jit
@@ -114,7 +104,8 @@ def _multimem_all_gather_3_kernel(
     local_ptr_1,
     local_ptr_2,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     numel_0,
     byte_offset_0,
     numel_1,
@@ -162,21 +153,16 @@ def _multimem_all_gather_3_kernel(
         WORLD_SIZE,
     )
     sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=True,
-    )
+    symm_mem_sync_end(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
 
 
 @triton.jit
 def _multimem_reduce_scatter_kernel(
     local_ptr,
     multicast_ptr,
-    signal_pad_ptrs,
+    barrier_mc_ptr,
+    barrier_local_ptr,
     numel,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
@@ -188,14 +174,8 @@ def _multimem_reduce_scatter_kernel(
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
     When REDUCE_F32=True, uses fp32 reduction instead of bf16x2 reduction.
     """
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=False,
-        hasSubsequentMemAccess=False,
-    )
+    symm_mem_sync_start(
+        barrier_mc_ptr, barrier_local_ptr, tl.num_programs(axis=0), RANK, WORLD_SIZE)
     sync_threads()
 
     pid = tl.program_id(axis=0)
@@ -286,7 +266,7 @@ def multimem_all_gather(
     _multimem_all_gather_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         numel=output_tensor.numel(),
         byte_offset=byte_offset,
         BLOCK_SIZE=config["BLOCK_SIZE"],
@@ -338,7 +318,7 @@ def multimem_all_gather_fused(
         input_1.data_ptr(),
         input_2.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         numel_0=output_0.numel(),
         byte_offset_0=byte_offset_0,
         numel_1=output_1.numel(),
@@ -388,7 +368,7 @@ def multimem_reduce_scatter(
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
-        symm_mem_hdl.signal_pad_ptrs_dev,
+        *barrier_ptrs(symm_mem_hdl),
         numel=input_tensor.numel(),
         BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,

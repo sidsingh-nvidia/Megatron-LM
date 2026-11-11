@@ -30,6 +30,12 @@ try:
 except ImportError:
     HAVE_TRITON = False
 
+from megatron.core.inference.communication.torch_symm_triton.barrier import (
+    BARRIER_STATE_BYTES,
+    MAX_BARRIER_WORLD_SIZE,
+    register_barrier_state,
+)
+
 
 def _ensure_signal_pad_size(world_size: int) -> None:
     """Grow torch's signal pad so the Triton collectives' barrier slots fit for this group.
@@ -74,11 +80,23 @@ class SymmetricMemoryBuffer:
             self.symm_mem_hdl = None
         else:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            assert process_group.size() <= MAX_BARRIER_WORLD_SIZE, (
+                f"symmetric-memory barriers support at most {MAX_BARRIER_WORLD_SIZE} ranks"
+            )
             try:
                 symm_mem.enable_symm_mem_for_group(process_group.group_name)
                 _ensure_signal_pad_size(process_group.size())
-                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
-                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+                # Data in [0, numel), then the barrier state of symm_mem_sync_start / _end, so
+                # tensor byte offsets stay relative to the buffer start.
+                allocation = symm_mem.empty(
+                    numel + BARRIER_STATE_BYTES, dtype=torch.uint8, device='cuda'
+                )
+                self.symm_mem_hdl = symm_mem.rendezvous(allocation, process_group)
+                allocation[numel:].zero_()
+                torch.cuda.synchronize()
+                torch.distributed.barrier(group=process_group)
+                self.symm_buffer = allocation[:numel]
+                register_barrier_state(self.symm_mem_hdl, numel)
             except RuntimeError as e:
                 self.init_failure_reason = f"{type(e).__name__}: {e}"
                 self.symm_buffer = None
