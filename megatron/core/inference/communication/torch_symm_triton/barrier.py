@@ -121,18 +121,49 @@ def symm_mem_sync(
 # cost grows with the grid (13.6 us at 152 blocks on 64 ranks). The barriers below synchronize
 # each rank once per kernel: one multimem.red arrival per rank, waited on in local memory.
 #
-# Every symmetric buffer whose kernels use them reserves BARRIER_STATE_BYTES at its start,
-# zeroed at allocation; kernels get its multicast and local addresses. Layout (uint32 words):
-#   [0, ws)        end slots:   slot q counts rank q's arrivals at end barriers
-#   [ws, 2 ws)     start slots: slot q counts rank q's arrivals at start barriers
-#   2 ws           start sign-in counter (local)
-#   2 ws + 1       end sign-in counter (local)
-# Only rank q adds to slot q, a rank is at most one barrier of each kind ahead of any peer (it
-# cannot pass the next one without this rank's arrival), and every arrival is taken exactly once,
-# so slots hold 0, 1 or 2 and return to zero: no state outlives a barrier. Start and end barriers
-# use separate slots because their arrivals come from different threads (block 0 vs the last
-# block), which need not land in order; arrivals of one kind come from successive kernels, which
-# do. Collectives on the same buffer must not run concurrently.
+# Every SymmetricMemoryBuffer reserves BARRIER_STATE_BYTES after its data, zeroed at allocation;
+# barrier_ptrs(hdl) gives its multicast address (a write lands on every rank's copy) and this
+# rank's local address. Layout, as uint32 words (ws = world size):
+#
+#     words: [ end slot 0 .. end slot ws-1 | start slot 0 .. start slot ws-1 | start ctr | end ctr ]
+#             ^ slot q counts rank q's       ^ same, for start barriers         ^ local block
+#               arrivals at end barriers                                         sign-in counters
+#
+# End barrier (symm_mem_sync_end), 3 ranks, rank 1's view:
+#
+#     rank 1's blocks   b0   b1   b2 ... b151      every block: end ctr += 1, then exits ...
+#                        \    |    |    /
+#                         end ctr reaches 152      ... except the last one to sign in, which:
+#                                 |
+#        1. multimem.red.release: end slot 1 += 1 on ranks 0, 1 and 2 (one instruction)
+#                                 |
+#        2. threads 0..2 wait on rank 1's own copy, then take one arrival each:
+#               end slot 0 > 0 ?  -1     (rank 0 has arrived)
+#               end slot 1 > 0 ?  -1     (rank 1: its own add, step 1)
+#               end slot 2 > 0 ?  -1     (rank 2 has arrived)
+#
+#     rank 1's end slots over one barrier:
+#                         start   1 lands   0 lands   2 lands   consumed
+#        slot [0,1,2]:  [0,0,0] -> [0,1,0] -> [1,1,0] -> [1,1,1] -> [0,0,0]
+#
+#     A fast rank may arrive for the next barrier before a slow one consumes this one: its slot
+#     goes 1 -> 2, the slow rank takes one, and 1 stays for the next barrier. It cannot get further
+#     ahead: passing the next barrier needs the slow rank's arrival. So slots hold 0, 1 or 2.
+#
+# Start barrier (symm_mem_sync_start, relaxed): block 0 arrives for the rank (start slot rank += 1
+# on every rank); every block waits, without consuming, until each peer's start slot is nonzero,
+# skipping its own rank's slot, so no block ever waits on a block of its own rank. The last block
+# to sign in on the start counter then takes one arrival from every start slot.
+#
+#     rank 1:  block 0: start slot 1 += 1 everywhere --.
+#              blocks 0..151: wait start slot 0 > 0,    |  then the last to sign in takes one
+#                             wait start slot 2 > 0  <--'  from start slots 0, 1 and 2
+#
+# Only rank q adds to slot q and every arrival is taken exactly once, so all slots return to zero:
+# no state outlives a barrier. Start and end use separate slots because their arrivals come from
+# different threads (block 0 vs the last block), which need not land in order; arrivals of one
+# kind come from successive kernels, which do. Collectives on the same buffer must not run
+# concurrently.
 
 BARRIER_STATE_BYTES = 1024
 MAX_BARRIER_WORLD_SIZE = BARRIER_STATE_BYTES // 8 - 1
