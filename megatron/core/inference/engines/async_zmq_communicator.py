@@ -239,6 +239,33 @@ class AsyncZMQCommunicator:
             result = struct.unpack(fmt, msg)
             return result[0] if n == 1 else result
 
+    def sync_all_reduce_max_and_sum(
+        self, max_vals: tuple[int, ...], sum_vals: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Like sync_all_reduce_max, but also SUM-reduces sum_vals in the same round trip.
+
+        Returns (maxes, sums), tuples matching the lengths of max_vals and sum_vals.
+        """
+        n_max = len(max_vals)
+        local_vals = (*max_vals, *sum_vals)
+        if self.world_size <= 1:
+            return tuple(max_vals), tuple(sum_vals)
+
+        fmt = f'!{len(local_vals)}q'
+        if self.is_leader:
+            rows = [local_vals]
+            while len(rows) < self.world_size:
+                rows.append(struct.unpack(fmt, self.gather_sock.recv()))
+            reduced = tuple(
+                (max if i < n_max else sum)(row[i] for row in rows)
+                for i in range(len(local_vals))
+            )
+            self.bcast_sock.send(struct.pack(fmt, *reduced))
+        else:
+            self.gather_sock.send(struct.pack(fmt, *local_vals))
+            reduced = struct.unpack(fmt, self.bcast_sock.recv())
+        return reduced[:n_max], reduced[n_max:]
+
     def close(self):
         """
         Close the ZMQ sockets.

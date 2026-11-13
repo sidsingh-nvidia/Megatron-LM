@@ -765,3 +765,185 @@ def multimem_all_gatherv_3tensor(
     )
 
     return output_tensor_0, output_tensor_1, output_tensor_2
+
+
+@triton.jit
+def _gather_rows_v(
+    local_ptr,
+    multicast_ptr,
+    output_byte_offset,
+    token_offset,
+    rank_token_offset,
+    tid,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    BITS: tl.constexpr,
+):
+    """Multicast one token row of one tensor to its rank_token_offset slot (see the 3-tensor kernel)."""
+    numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
+    for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
+        local_offsets = token_offset * numel_per_token + channel_offset + tid
+        mask = channel_offset + tid < numel_per_token
+        global_offsets = rank_token_offset * numel_per_token + local_offsets
+        if BITS == 128:
+            multicast_ptrs = (
+                multicast_ptr.to(tl.pointer_type(tl.uint64))
+                + output_byte_offset // 8
+                + global_offsets * 2
+            )
+            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
+            x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
+            st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+        else:
+            multicast_ptrs = (
+                multicast_ptr.to(tl.pointer_type(tl.uint64))
+                + output_byte_offset // 8
+                + global_offsets
+            )
+            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
+            x, y = ld_64(local_ptrs, mask=mask)
+            st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
+
+
+@triton.jit
+def _multimem_all_gatherv_2tensor_kernel(
+    local_ptr_0,
+    multicast_ptr_0,
+    output_byte_offset_0,
+    local_ptr_1,
+    multicast_ptr_1,
+    output_byte_offset_1,
+    signal_pad_ptrs,
+    local_tokens,
+    rank_token_offset_ptr,
+    ep_max_tokens_ptr,
+    HIDDEN_SIZE_0: tl.constexpr,
+    HIDDEN_SIZE_1: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD_0: tl.constexpr,
+    NUMEL_PER_THREAD_1: tl.constexpr,
+    BITS_0: tl.constexpr,
+    BITS_1: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Two-tensor variant of _multimem_all_gatherv_3tensor_kernel (one shared barrier).
+
+    Used to gather hidden states plus the packed (expert id << 16 | bf16 prob) routing that the
+    TRT-LLM routed MoE consumes, in place of hidden + int64 routing + fp32 probs.
+    """
+    pid = tl.program_id(axis=0)
+    ep_max_tokens = tl.load(ep_max_tokens_ptr)
+    if pid >= ep_max_tokens:
+        return
+
+    tid = tl.arange(0, BLOCK_SIZE)
+    rank_token_offset = tl.load(rank_token_offset_ptr)
+    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+        _gather_rows_v(
+            local_ptr_0, multicast_ptr_0, output_byte_offset_0, token_offset, rank_token_offset,
+            tid, HIDDEN_SIZE_0, BLOCK_SIZE, NUMEL_PER_THREAD_0, BITS_0,
+        )
+        _gather_rows_v(
+            local_ptr_1, multicast_ptr_1, output_byte_offset_1, token_offset, rank_token_offset,
+            tid, HIDDEN_SIZE_1, BLOCK_SIZE, NUMEL_PER_THREAD_1, BITS_1,
+        )
+
+    sync_threads()
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
+
+
+def multimem_all_gatherv_2tensor(
+    output_tensor_0: torch.Tensor,
+    output_tensor_1: torch.Tensor,
+    input_tensor_0: torch.Tensor,
+    input_tensor_1: torch.Tensor,
+    symm_mem_hdl_0: _SymmetricMemory,
+    symm_mem_hdl_1: _SymmetricMemory,
+    rank_token_offset: torch.Tensor,
+    ep_max_tokens: torch.Tensor,
+    per_rank_max_tokens: int,
+    output_byte_offset_0: int = 0,
+    output_byte_offset_1: int = 0,
+    **kwargs,
+) -> tuple:
+    """Variable-count multicast all-gather of two tensors in one kernel launch.
+
+    Same contract as multimem_all_gatherv_3tensor, for two [local_tokens, hidden_size_i]
+    tensors; the barrier uses symm_mem_hdl_0's signal pads.
+    """
+    assert HAVE_TRITON, "Triton is required for multimem all-gather-v2."
+    for i, (inp, out) in enumerate(((input_tensor_0, output_tensor_0), (input_tensor_1, output_tensor_1))):
+        assert inp.ndim == 2 and out.ndim == 2 and inp.shape[1] == out.shape[1], (
+            f"input_tensor_{i} {tuple(inp.shape)} / output_tensor_{i} {tuple(out.shape)} must be "
+            "2-D [tokens, hidden_size] with matching hidden_size."
+        )
+    assert input_tensor_0.shape[0] == input_tensor_1.shape[0], "inputs need the same local_tokens."
+    assert is_device_nvls_capable(
+        input_tensor_0.device
+    ), "multimem_all_gatherv_2tensor requires a Hopper+ GPU with NVLink (SM >= 9)."
+    assert (
+        rank_token_offset.numel() == 1
+        and rank_token_offset.dtype == torch.int32
+        and rank_token_offset.is_cuda
+    ), "rank_token_offset must be a scalar int32 CUDA tensor."
+    assert (
+        symm_mem_hdl_0.rank == symm_mem_hdl_1.rank
+        and symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size
+    ), "Both symmetric memory handles must belong to the same EP group."
+
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
+
+    def _tensor_params(inp):
+        hidden_size = inp.shape[1]
+        row_bytes = hidden_size * inp.element_size()
+        assert row_bytes % 8 == 0, (
+            f"Row size ({hidden_size} elements x {inp.element_size()} bytes) = "
+            f"{row_bytes} bytes is not 8-byte aligned; cannot use NVLS."
+        )
+        bits = 128 if row_bytes % 16 == 0 else 64
+        numel_per_thread = bits // (inp.element_size() * 8)
+        numel_per_token = (hidden_size + numel_per_thread - 1) // numel_per_thread
+        block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
+        return hidden_size, bits, numel_per_thread, block_size
+
+    hidden_size_0, bits_0, numel_per_thread_0, block_size_0 = _tensor_params(input_tensor_0)
+    hidden_size_1, bits_1, numel_per_thread_1, block_size_1 = _tensor_params(input_tensor_1)
+    block_size = max(block_size_0, block_size_1)
+    num_warps = max(1, block_size // WARP_SIZE)
+    num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
+
+    _multimem_all_gatherv_2tensor_kernel[(num_blocks, 1, 1)](
+        input_tensor_0.data_ptr(),
+        symm_mem_hdl_0.multicast_ptr,
+        output_byte_offset_0,
+        input_tensor_1.data_ptr(),
+        symm_mem_hdl_1.multicast_ptr,
+        output_byte_offset_1,
+        symm_mem_hdl_0.signal_pad_ptrs_dev,
+        local_tokens=input_tensor_0.shape[0],
+        rank_token_offset_ptr=rank_token_offset,
+        ep_max_tokens_ptr=ep_max_tokens,
+        HIDDEN_SIZE_0=hidden_size_0,
+        HIDDEN_SIZE_1=hidden_size_1,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD_0=numel_per_thread_0,
+        NUMEL_PER_THREAD_1=numel_per_thread_1,
+        BITS_0=bits_0,
+        BITS_1=bits_1,
+        RANK=symm_mem_hdl_0.rank,
+        WORLD_SIZE=symm_mem_hdl_0.world_size,
+        num_warps=num_warps,
+    )
+    return output_tensor_0, output_tensor_1
