@@ -28,6 +28,11 @@
 #                   reduce-scatter-v (vLLM backend nvlink_allgather_reducescatter, loaded as a plugin
 #                   from NVLINK_AGRS_PLUGIN over allgather_reducescatter); needs DP > 1  (default: 0)
 #   NVLINK_AGRS_PLUGIN  plugin directory (default: tmp/vllm-nvls/tools/nvlink_agrs_plugin)
+#   PROFILE         1 = run vllm serve under nsys (installed from NVIDIA's devtools apt repo if the
+#                   image has none) with vLLM's CUDA profiler, as in vLLM's profiling guide:
+#                   capture range = cudaProfilerApi, driven by the client's /start_profile and
+#                   /stop_profile (CLIENT=smoke PROFILE=1). Traces: <exp dir>/trace_node<N>*.nsys-rep
+#                   (default: 0)
 # Other launch_minf.sh knobs (EP, DISPATCHER, BUFFER_GB, ...) do not apply and are ignored.
 
 SCRIPT=inference-bench/server/launch_vllm.sh
@@ -58,6 +63,25 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export PYTHONNOUSERSITE=1
 export TRITON_CACHE_DIR=/tmp/triton_cache TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache
 export VLLM_CACHE_ROOT=/tmp/vllm_cache
+# PROFILE=1: nsys around vllm serve (vLLM profiling guide). The worker processes must be spawned,
+# not forked, for nsys to follow them.
+if [ "${PROFILE:-0}" == "1" ]; then
+    if ! command -v nsys > /dev/null; then
+        echo "PROFILE=1: installing nsight-systems-cli"
+        export DEBIAN_FRONTEND=noninteractive
+        {
+            apt-get update
+            apt-get install -y --no-install-recommends gnupg
+            echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" \
+                > /etc/apt/sources.list.d/nvidia-devtools.list
+            apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub
+            apt-get update
+            apt-get install -y nsight-systems-cli
+        } > "${EXP_DIR}/nsys_install_node${SLURM_NODEID:-0}.log" 2>&1
+        command -v nsys > /dev/null || { echo "PROFILE=1: nsys install failed; see ${EXP_DIR}/nsys_install_node${SLURM_NODEID:-0}.log"; exit 1; }
+    fi
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+fi
 # NVLINK_AGRS=1: the vLLM general plugin replaces allgather_reducescatter's all2all manager with
 # nvlink_allgather_reducescatter (the image's vLLM fixes the --all2all-backend choices at import).
 if [ "${NVLINK_AGRS:-0}" == "1" ]; then
@@ -123,6 +147,7 @@ ARGS=(
 )
 # NVLINK_AGRS=1 runs over allgather_reducescatter, whose manager the plugin replaces.
 [ "${NVLINK_AGRS:-0}" == "1" ] && ARGS+=(--all2all-backend allgather_reducescatter)
+[ "${PROFILE:-0}" == "1" ] && ARGS+=(--profiler-config.profiler cuda)
 # The API server (node 0) splits reasoning from the answer; headless nodes run no API server.
 [ "${NODE_RANK}" == "0" ] && ARGS+=(--reasoning-parser nemotron_v3)
 [ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--quantization mxfp8)
@@ -157,18 +182,31 @@ if [ "${NODE_RANK}" == "0" ]; then
 EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
 TOKENIZER=${HF_MODEL}
-FRAMEWORK=vllm MODEL=${MODEL:-nanov3p5} NODES=${NUM_NODES} TP=${TP} DP=${DP} EP=$((TP * DP)) PREFIX_CACHING=${PREFIX_CACHING:-1} FP8_RECIPE=${FP8_RECIPE:-} NVLINK_AGRS=${NVLINK_AGRS:-0}
+FRAMEWORK=vllm MODEL=${MODEL:-nanov3p5} NODES=${NUM_NODES} TP=${TP} DP=${DP} EP=$((TP * DP)) PREFIX_CACHING=${PREFIX_CACHING:-1} FP8_RECIPE=${FP8_RECIPE:-} NVLINK_AGRS=${NVLINK_AGRS:-0} PROFILE=${PROFILE:-0}
 CMD=vllm serve ${ARGS[*]}
 EOF
 fi
 
-vllm serve "${ARGS[@]}" > "${LOG}" 2>&1 &
+PRE=()
+if [ "${PROFILE:-0}" == "1" ]; then
+    PRE=(nsys profile -t cuda,nvtx --trace-fork-before-exec=true --cuda-graph-trace=node
+         --capture-range=cudaProfilerApi --capture-range-end=repeat --sample=none --cpuctxsw=none
+         -o "${EXP_DIR}/trace_node${NODE_RANK}" --force-overwrite true)
+fi
+"${PRE[@]}" vllm serve "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
 # Serve until <exp dir>/done appears (written by client.sh) or the server dies.
 serve_until_done() {
     while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
-    kill "${SERVER_PID}" 2>/dev/null
+    # Under nsys, give it time to write the report of the last capture range, then stop it with
+    # SIGINT, which nsys handles by finalizing rather than dropping the report.
+    if [ "${PROFILE:-0}" == "1" ]; then
+        sleep 60
+        kill -INT "${SERVER_PID}" 2>/dev/null
+    else
+        kill "${SERVER_PID}" 2>/dev/null
+    fi
     wait "${SERVER_PID}"
     exit 0
 }
