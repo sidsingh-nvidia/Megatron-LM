@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, replace
 
 import torch
@@ -35,9 +34,6 @@ except ImportError as exc:
     _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR = exc
 
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
-logger = logging.getLogger(__name__)
-_LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
 def require_flashinfer_cutlass_mxfp8() -> None:
@@ -380,26 +376,6 @@ def quantize_routed_mxfp8_input(
     return quantized_hidden, hidden_scale
 
 
-def select_routed_mxfp8_active_rows(
-    full_rows: int, *, token_capacity: int | None, use_bounded_rows: bool
-) -> tuple[int, str]:
-    """Select the graph-stable row count for one routed-MoE invocation.
-
-    The controller enables a bounded prefix only for a decode-only graph whose
-    static EP-wide token bound fits the configured capacity. All other graphs
-    retain the full dispatcher buffer so prompt tokens are never truncated.
-    """
-    if full_rows <= 0:
-        raise ValueError(f"full_rows must be positive; got {full_rows}")
-    if token_capacity is None:
-        return full_rows, "full"
-    if token_capacity <= 0:
-        raise ValueError(f"token_capacity must be positive; got {token_capacity}")
-    if use_bounded_rows:
-        return min(token_capacity, full_rows), "bounded-decode"
-    return full_rows, "full"
-
-
 def flashinfer_cutlass_mxfp8_moe(
     hidden_states: torch.Tensor,
     routing_map: torch.Tensor,
@@ -525,18 +501,10 @@ def flashinfer_routed_mxfp8_moe(
     local_expert_offset: int,
     activation_type: int,
     out: torch.Tensor | None = None,
-    token_capacity: int | None = None,
-    use_bounded_rows: bool = False,
 ) -> torch.Tensor:
-    """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
+    """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel on every input row.
 
-    When token_capacity is set and the controller marks the current graph safe,
-    only that fixed prefix is processed. Prefill, mixed steps, and too-large decode
-    configurations process the full input.
-    Invalid rows in the bounded prefix must already have expert ID -1.
-
-    The row choice is made when each CUDA graph is built, so graph replay sees fixed
-    shapes/addresses.
+    Rows whose routing entries are -1 contribute zero output.
     """
     if hidden_states.shape[-1] != fc1_weight.logical_cols:
         raise ValueError(
@@ -552,30 +520,10 @@ def flashinfer_routed_mxfp8_moe(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
         )
 
-    full_rows = hidden_states.shape[0]
-    active_rows, policy = select_routed_mxfp8_active_rows(
-        full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
-    )
-    if token_capacity is not None:
-        policy_key = (policy, token_capacity, full_rows)
-        if policy_key not in _LOGGED_TOKEN_POLICIES:
-            _LOGGED_TOKEN_POLICIES.add(policy_key)
-            logger.info(
-                "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
-                "configured_capacity=%d",
-                policy,
-                active_rows,
-                full_rows,
-                token_capacity,
-            )
-
-    selected_hidden_states = hidden_states[:active_rows]
-    selected_routing_map = routing_map[:active_rows]
-    selected_probabilities = probabilities[:active_rows]
     quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
-        selected_hidden_states, fc1_weight.padded_cols
+        hidden_states, fc1_weight.padded_cols
     )
-    packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
+    packed_routing = pack_routed_mxfp8_routing(routing_map, probabilities)
     output = flashinfer_routed_mxfp8_moe_prequantized(
         quantized_hidden,
         hidden_scale,
@@ -584,7 +532,7 @@ def flashinfer_routed_mxfp8_moe(
         fc2_weight,
         num_experts=num_experts,
         local_expert_offset=local_expert_offset,
-        top_k=selected_routing_map.shape[1],
+        top_k=routing_map.shape[1],
         activation_type=activation_type,
     )
 

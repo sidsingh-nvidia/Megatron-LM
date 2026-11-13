@@ -34,7 +34,6 @@ from megatron.core.inference.text_generation_controllers.mtp_controller_mixin im
     MTPControllerMixin,
 )
 from megatron.core.inference.utils import (
-    InferenceMode,
     detokenize_tokens,
     get_attention_mask,
     get_language_model,
@@ -938,18 +937,6 @@ class TextGenerationController(MTPControllerMixin):
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
-        decode_token_upper_bound = (
-            context.max_requests
-            * (self.num_speculative_tokens + 1)
-            * self.model_config.expert_model_parallel_size
-        )
-        # The bound covers the tokens of all EP ranks, so every EP rank must be decoding.
-        InferenceMode.set_bounded_mxfp8_rows(
-            context.is_ep_decode_only()
-            and token_capacity is not None
-            and decode_token_upper_bound <= token_capacity
-        )
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:

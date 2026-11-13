@@ -1569,7 +1569,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm', 'trtllm_bf16_routed'] = (
+        "vllm"
+    )
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
@@ -1582,6 +1584,10 @@ class TransformerConfig(ModelParallelConfig):
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
       permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
+    - 'trtllm_bf16_routed': FlashInfer's TRT-LLM BF16 routed MoE kernel (BF16 only).
+      Keeps a BlockMajorK copy of the expert weights. Under the 'nvls' dispatcher the
+      context runs an EP consensus every step so the kernel only processes a host-known
+      bound on the gathered rows.
     """
 
     moe_training_matches_inference: bool = False
@@ -1615,16 +1621,6 @@ class TransformerConfig(ModelParallelConfig):
     Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
     routing with an expert bias in both training and inference."""
 
-    inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
-    NVFP4 MoE (inference_moe_nvfp4_recipe).
-
-    Decode-only dynamic-inference graphs use this fixed prefix when their
-    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer. Requires
-    the NVLS inference dispatcher and EP > 1.
-    """
-
     inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
     """NVFP4 recipe for routed experts during inference; None keeps them in BF16.
     Options:
@@ -1657,7 +1653,7 @@ class TransformerConfig(ModelParallelConfig):
     - 'deepep': DeepEP (>= 2.5) dispatch/combine over NVLink, in its non-expand layout:
       each rank receives a compact list of the tokens routed to it. Requires DeepEP and
       NCCL >= 2.32.3, an EP group inside one NVLink domain, inference_grouped_gemm_backend
-      'vllm' with BF16 experts, inference_moe_combine_precision='bf16', and an MoE hidden
+      'vllm' or 'trtllm_bf16_routed' with BF16 experts, inference_moe_combine_precision='bf16', and an MoE hidden
       size (moe_latent_size or hidden_size) that is a multiple of 256.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
@@ -2373,16 +2369,22 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
-            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            # grouped-GEMM backends, the TRT-LLM BF16 routed backend, and SwiGLU by FlashInfer
+            # per-token NVFP4.
             if (
                 self.gated_linear_unit
                 and self.inference_grouped_gemm_backend
-                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                not in (
+                    InferenceGroupedGemmBackend.TORCH,
+                    InferenceGroupedGemmBackend.VLLM,
+                    InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
+                )
                 and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
-                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch, vllm or "
+                    "trtllm_bf16_routed, "
                     "or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
@@ -2427,11 +2429,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
                     )
-                if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
-                        "unclamped routed backend, not CUTLASS ClampedRelu2."
-                    )
 
             if mxfp8_enabled:
                 if not self.fp8_param:
@@ -2441,24 +2438,18 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+                # Its per-step MoE row bounds (and expert offsets) are sized over the EP group
+                # only; main's NVLS dispatcher gathers over expert TP x EP.
+                if self.expert_tensor_parallel_size != 1:
                     raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
-                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
+                        "inference_grouped_gemm_backend='trtllm_bf16_routed' does not support "
+                        "expert tensor parallelism; set expert_tensor_parallel_size=1."
                     )
-                if (
-                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
-                    or self.inference_moe_token_dispatcher_type != "nvls"
-                    or self.expert_model_parallel_size <= 1
-                ):
+                if mxfp8_enabled:
                     raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity requires "
-                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
-                        "inference_moe_token_dispatcher_type='nvls' and "
-                        "expert_model_parallel_size > 1"
+                        "inference_grouped_gemm_backend='trtllm_bf16_routed' supports BF16 "
+                        "experts only; use 'flashinfer' for MXFP8."
                     )
 
             if self.inference_moe_token_dispatcher_type == "nvl_a2a":
@@ -2483,14 +2474,19 @@ class TransformerConfig(ModelParallelConfig):
                         "expert tensor parallelism; set expert_tensor_parallel_size=1."
                     )
                 # The expert output must land token-major in the dispatcher's bf16 buffer,
-                # which only the vLLM BF16 path writes.
+                # which only the vLLM and TRT-LLM BF16 paths write.
                 if (
-                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM
+                    self.inference_grouped_gemm_backend
+                    not in (
+                        InferenceGroupedGemmBackend.VLLM,
+                        InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
+                    )
                     or mxfp8_enabled
                 ):
                     raise ValueError(
                         "inference_moe_token_dispatcher_type='deepep' supports only "
-                        "inference_grouped_gemm_backend='vllm' with BF16 experts."
+                        "inference_grouped_gemm_backend='vllm' or 'trtllm_bf16_routed' with "
+                        "BF16 experts."
                     )
                 if self.inference_moe_combine_precision != "bf16":
                     raise ValueError(

@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -356,15 +355,11 @@ def flashinfer_routed_nvfp4_moe(
     local_expert_offset: int,
     activation_type: int,
     out: torch.Tensor | None = None,
-    token_capacity: int | None = None,
-    use_bounded_rows: bool = False,
 ) -> torch.Tensor:
     """Run the FlashInfer per-token NVFP4 squared-ReLU or SwiGLU MoE.
 
     Rows whose routing entries are -1 contribute zero output, so a graph-stable
-    dispatcher buffer may be passed in full. When token_capacity is set and the
-    controller marks the current graph safe, only that fixed prefix is quantized
-    and processed, as for routed MXFP8; rows past it are left untouched in out.
+    dispatcher buffer may be passed in full.
     """
     require_flashinfer_routed_nvfp4()
     expected_activation = ActivationType.Swiglu if weights.gated else ActivationType.Relu2
@@ -383,12 +378,6 @@ def flashinfer_routed_nvfp4_moe(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
         )
 
-    active_rows, _ = select_routed_mxfp8_active_rows(
-        hidden_states.shape[0], token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
-    )
-    hidden_states = hidden_states[:active_rows]
-    routing_map = routing_map[:active_rows]
-    probabilities = probabilities[:active_rows]
     quantized_hidden, hidden_scale, per_token_scale = quantize_routed_nvfp4_input(
         hidden_states, weights.padded_hidden_size
     )
