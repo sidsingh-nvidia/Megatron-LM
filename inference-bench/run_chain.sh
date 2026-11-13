@@ -3,7 +3,7 @@
 # client ends (any outcome), so a per-user running-job cap (short QoS: 2) never strands a server
 # without its client. KEY=VALUE arguments after the configs apply to every run.
 #
-#   inference-bench/run_chain.sh inference-bench/configs/pd_interference/superv3_{narrow,wide}_{agg,pd}.env
+#   inference-bench/run_chain.sh inference-bench/configs/{agg,disagg}/superv3_{narrow,wide}_ep.env
 set -euo pipefail
 CONFIGS=(); OVERRIDES=()
 for arg in "$@"; do

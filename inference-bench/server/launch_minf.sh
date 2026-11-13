@@ -33,8 +33,10 @@
 #                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
 #   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1
 #                      (default: 50; ultrav3: 25)
-#   DISPATCHER         MoE EP dispatcher: nccl | nvls                (default: nvls)
-#   GEMM_BACKEND       routed-expert grouped GEMM: vllm | flashinfer | torch   (default: vllm)
+#   DISPATCHER         MoE EP dispatcher: nccl | nvls | nvl_a2a | deepep   (default: nvls)
+#   COMBINE_PRECISION  MoE combine precision: fp32 | bf16 (bf16 for nvl_a2a / deepep)   (default: fp32)
+#   GEMM_BACKEND       routed-expert grouped GEMM: vllm | flashinfer | torch | trtllm_bf16_routed
+#                      (default: vllm)
 #   ASYNC              1 = async scheduling                         (default: 1)
 #   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 1)
 #   SAMPLING           sampling backend: flashinfer | torch         (default: flashinfer)
@@ -206,6 +208,7 @@ ARGS=(
     # Parallelism (SHARD_ARGS) and MoE dispatch.
     "${SHARD_ARGS[@]}"
     --inference-moe-token-dispatcher-type "${DISPATCHER:-nvls}"
+    --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
     --moe-grouped-gemm
     --inference-grouped-gemm-backend "${GEMM_BACKEND:-vllm}"
@@ -306,7 +309,7 @@ SLURM_JOB_ID=${SLURM_JOB_ID}
 IMAGE=${INFERENCE_BENCH_SERVE_IMAGE:-}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${POOL_NODES} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
-DISPATCHER=${DISPATCHER:-nvls} GEMM_BACKEND=${GEMM_BACKEND:-vllm}
+DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-vllm}
 ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} FP8_RECIPE=${FP8_RECIPE:-} SHARED_EXPERT_OVERLAP=${SHARED_EXPERT_OVERLAP:-1}
 PD=${PD:-0} PREFILL_NODES=${PREFILL_NODES:-} PREFILL_GPUS=${PREFILL_GPUS:-0} SHARDS=${SHARDS:-} GPUS=${POOL_GPUS}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}

@@ -37,13 +37,16 @@ themselves (or `$INFERENCE_BENCH_CONFIG`) for the paths. The examples below assu
 
 ## Run configs
 
-`configs/math/` holds the settings of the paper's math-workload runs, one `KEY=value` file each; `run.sh` submits the
-server and its client sweep from one (the client waits for the server, sweeps, then shuts it down):
+`configs/agg/` holds the aggregated runs (the paper's math-workload runs) and `configs/disagg/` the
+prefill/decode-disaggregated ones (`PD=1`; each lists the prefill and decode pools' nodes and TP / EP / ETP),
+one `KEY=value` file each; `run.sh` submits the server and its client sweep from one (the client waits for the
+server, sweeps, then shuts it down):
 
 ```bash
-inference-bench/run.sh inference-bench/configs/math/ultrav3_wide_ep.env
-inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
-inference-bench/run.sh inference-bench/configs/math/superv3_wide_ep.env FRAMEWORK=vllm        # same run on vLLM
+inference-bench/run.sh inference-bench/configs/agg/ultrav3_wide_ep.env
+inference-bench/run.sh inference-bench/configs/agg/superv3_narrow_ep.env GEMM_BACKEND=vllm   # override a knob
+inference-bench/run.sh inference-bench/configs/agg/superv3_wide_ep.env FRAMEWORK=vllm        # same run on vLLM
+inference-bench/run.sh inference-bench/configs/disagg/superv3_narrow_ep.env                 # disaggregated
 ```
 
 `FRAMEWORK=vllm` serves the config's MODEL with `server/launch_vllm.sh` on the same nodes (EXP_NAME
@@ -81,7 +84,7 @@ server-default sampling and no output cap, so 100k-token answers stay in the mix
 
 ```bash
 # a paper config: server + client, the client starts when the server is up
-inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env
+inference-bench/run.sh inference-bench/configs/agg/superv3_narrow_ep.env
 # any model / knob from the command line; e.g. a quick nano Pareto
 inference-bench/run.sh inference-bench/configs/nanov3p5_smoke.env CLIENT=steady \
     BENCH="1 2 4 8 16 32 64 128 256" STEADY_WARMUP=30 STEADY_WINDOW=180 TIME=1:00:00 \

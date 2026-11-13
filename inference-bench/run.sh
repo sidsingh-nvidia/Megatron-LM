@@ -3,8 +3,8 @@
 # client sweep (server/client.sh) from a run config.
 #
 # Run from the Megatron-LM repo root:
-#   inference-bench/run.sh inference-bench/configs/math/ultrav3_wide_ep.env
-#   inference-bench/run.sh inference-bench/configs/math/superv3_narrow_ep.env GEMM_BACKEND=vllm BENCH="4 8"
+#   inference-bench/run.sh inference-bench/configs/agg/ultrav3_wide_ep.env
+#   inference-bench/run.sh inference-bench/configs/agg/superv3_narrow_ep.env GEMM_BACKEND=vllm BENCH="4 8"
 #
 # A config is a KEY=value file of launcher / client.sh knobs plus:
 #   FRAMEWORK minf (Megatron Core dynamic inference) | vllm   (default: minf)
