@@ -972,12 +972,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # metrics. None when no EP-wide consensus ran for the step (unknown).
         self.step_ep_any_prefill: Optional[bool] = None
 
-        # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        # are we using an inference_optimized NVLink ep dispatcher ('nvls' or 'nvl_a2a',
+        # which share the NVLS buffers and step metadata) for MoEs?
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
             get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+            and model_config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -1063,6 +1064,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 tp_ep_group=self.expert_tensor_and_model_parallel_group,
                 ep_invariant_combine=model_config.moe_ep_invariant_combine,
+                combine_dtype=(
+                    torch.bfloat16
+                    if model_config.inference_moe_combine_precision == 'bf16'
+                    else torch.float32
+                ),
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
