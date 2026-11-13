@@ -12,6 +12,7 @@ is hardcoded in the script.
 import asyncio
 import os
 import sys
+import traceback
 from argparse import ArgumentParser
 
 import torch
@@ -159,6 +160,14 @@ def main():
         asyncio.run(_serve(args, model, tokenizer, inference_config))
     except KeyboardInterrupt:
         print("Server process interrupted by user.")
+    except Exception:
+        # Print the error and exit now: destroy_process_group (below) waits for the other ranks,
+        # which are blocked in collectives with this one, so it would hang and hold the error
+        # back until the job is killed.
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os._exit(1)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
