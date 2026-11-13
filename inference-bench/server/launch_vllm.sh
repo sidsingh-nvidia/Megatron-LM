@@ -24,6 +24,10 @@
 #                   as FP8_RECIPE=mxfp8 does for launch_minf.sh; unset = BF16  (default: unset)
 #   EXTRA_ARGS      extra `vllm serve` flags, e.g. "--max-num-seqs 512"; later flags win, so
 #                   "--all2all-backend allgather_reducescatter" restores vLLM's default EP dispatch
+#   NVLINK_AGRS     1 = EP dispatch / combine with MInf's NVLink-multicast all-gather-v /
+#                   reduce-scatter-v (vLLM backend nvlink_allgather_reducescatter, loaded as a plugin
+#                   from NVLINK_AGRS_PLUGIN over allgather_reducescatter); needs DP > 1  (default: 0)
+#   NVLINK_AGRS_PLUGIN  plugin directory (default: tmp/vllm-nvls/tools/nvlink_agrs_plugin)
 # Other launch_minf.sh knobs (EP, DISPATCHER, BUFFER_GB, ...) do not apply and are ignored.
 
 SCRIPT=inference-bench/server/launch_vllm.sh
@@ -54,6 +58,14 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export PYTHONNOUSERSITE=1
 export TRITON_CACHE_DIR=/tmp/triton_cache TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache
 export VLLM_CACHE_ROOT=/tmp/vllm_cache
+# NVLINK_AGRS=1: the vLLM general plugin replaces allgather_reducescatter's all2all manager with
+# nvlink_allgather_reducescatter (the image's vLLM fixes the --all2all-backend choices at import).
+if [ "${NVLINK_AGRS:-0}" == "1" ]; then
+    NVLINK_AGRS_PLUGIN=${NVLINK_AGRS_PLUGIN:-${PWD}/tmp/vllm-nvls/tools/nvlink_agrs_plugin}
+    [ -d "${NVLINK_AGRS_PLUGIN}" ] || { echo "NVLINK_AGRS=1: no plugin at ${NVLINK_AGRS_PLUGIN}"; exit 1; }
+    export PYTHONPATH=${NVLINK_AGRS_PLUGIN}${PYTHONPATH:+:${PYTHONPATH}}
+    export VLLM_NVLINK_AGRS=1
+fi
 # FlashInfer autotune results (keyed by FlashInfer version, GPU and model / parallel config) persist
 # across jobs when cluster.env sets a shared directory; otherwise every job retunes (~10 min).
 [ -n "${INFERENCE_BENCH_FI_AUTOTUNE_DIR:-}" ] && export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=${INFERENCE_BENCH_FI_AUTOTUNE_DIR}
@@ -109,6 +121,8 @@ ARGS=(
     # it and skips EP communication (tokens replicated across TP; the TP all-reduce combines).
     --all2all-backend flashinfer_nvlink_one_sided
 )
+# NVLINK_AGRS=1 runs over allgather_reducescatter, whose manager the plugin replaces.
+[ "${NVLINK_AGRS:-0}" == "1" ] && ARGS+=(--all2all-backend allgather_reducescatter)
 # The API server (node 0) splits reasoning from the answer; headless nodes run no API server.
 [ "${NODE_RANK}" == "0" ] && ARGS+=(--reasoning-parser nemotron_v3)
 [ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--quantization mxfp8)
@@ -143,7 +157,7 @@ if [ "${NODE_RANK}" == "0" ]; then
 EXP_NAME=${EXP_NAME:-run}
 SLURM_JOB_ID=${SLURM_JOB_ID}
 TOKENIZER=${HF_MODEL}
-FRAMEWORK=vllm MODEL=${MODEL:-nanov3p5} NODES=${NUM_NODES} TP=${TP} DP=${DP} EP=$((TP * DP)) PREFIX_CACHING=${PREFIX_CACHING:-1} FP8_RECIPE=${FP8_RECIPE:-}
+FRAMEWORK=vllm MODEL=${MODEL:-nanov3p5} NODES=${NUM_NODES} TP=${TP} DP=${DP} EP=$((TP * DP)) PREFIX_CACHING=${PREFIX_CACHING:-1} FP8_RECIPE=${FP8_RECIPE:-} NVLINK_AGRS=${NVLINK_AGRS:-0}
 CMD=vllm serve ${ARGS[*]}
 EOF
 fi
