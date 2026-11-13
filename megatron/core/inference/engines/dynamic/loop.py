@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 import torch
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.engines.step_time_metrics import classify_step, classify_step_mix
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
@@ -143,6 +144,43 @@ class EngineLoopMixin:
         async with self._cond:
             self._cond.notify_all()
 
+    def _observe_step_time(self, decode_only, step_time: float) -> None:
+        """Record a timed step in the step-time histogram, classed by the forward it launched.
+
+        The timed window ends with the forward launched this step, and the EP consensus that
+        set context.step_ep_any_prefill ran while preparing that same forward.
+        """
+        # Async scheduling reports the consumed and launched forwards; legacy, one bool.
+        launched_decode_only = getattr(decode_only, "launched", decode_only)
+        if launched_decode_only is None:  # no forward launched (idle step)
+            return
+        step_class = classify_step(
+            local_prefill=not launched_decode_only,
+            ep_any_prefill=self.context.step_ep_any_prefill,
+        )
+        self._step_time_histogram.observe(step_class, step_time * 1e3)
+
+    def _observe_step_mix(self, decode_only) -> None:
+        """Count every launched forward by step class (local batch mix + EP consensus).
+
+        Host-only: reads the batch dimensions and EP consensus the context set while preparing
+        the launched forward, so it adds no GPU synchronization.
+        """
+        counter = getattr(self, "_step_mix_counter", None)
+        batch = getattr(self.context, "batch_dimensions", None)
+        if counter is None or batch is None:  # partially constructed engines (tests)
+            return
+        launched_decode_only = getattr(decode_only, "launched", decode_only)
+        if launched_decode_only is None:  # no forward launched (idle step)
+            counter.idle()
+            return
+        step_class = classify_step_mix(
+            local_prefill=not launched_decode_only,
+            local_decode_requests=batch.decode_req_count,
+            ep_any_prefill=self.context.step_ep_any_prefill,
+        )
+        counter.observe(step_class, batch.token_count)
+
     async def async_forward(self) -> Tuple[Optional[Dict], Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -226,6 +264,7 @@ class EngineLoopMixin:
         controller_result: DynamicBatchControllerStepResult = (
             await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
+        self._observe_step_mix(controller_result.decode_only)
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
@@ -237,6 +276,7 @@ class EngineLoopMixin:
             self.step_end_event.record()
             self.step_end_event.synchronize()
             step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+            self._observe_step_time(controller_result.decode_only, step_time)
         else:
             step_time = 0.0
         self.context.step_count += 1
