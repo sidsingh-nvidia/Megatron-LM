@@ -92,6 +92,11 @@ def _build_model_and_inference_config(args):
         world_size = dist.get_world_size()
         shards = build_inference_pg_collections_for_shards(world_size, args.inference_shards)
         local_shard = next(shard for shard in shards if shard.pg_collection is not None)
+        if local_shard.spec.role == "prefill":
+            # Prefill pools run the vLLM grouped GEMM (the context pins its token-count hint to
+            # the full buffer height, i.e. its throughput config); the configured backend (e.g.
+            # trtllm_bf16_routed with per-step EP row bounds) serves the decode pool.
+            args.inference_grouped_gemm_backend = "vllm"
         model = get_model_for_inference(
             pg_collection=local_shard.pg_collection,
             checkpoint_group=local_shard.process_group,

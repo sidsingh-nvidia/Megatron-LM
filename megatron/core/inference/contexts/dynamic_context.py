@@ -24,6 +24,7 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     ep_collectives_max_num_blocks,
 )
 from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig, KVCacheManagementMode
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
@@ -987,6 +988,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         )
 
+        # Native prefill/decode disaggregation: this rank's pool role, None when aggregated.
+        self._disagg_role = (
+            resolve_inference_shard(
+                inference_config.disaggregation_shards,
+                torch.distributed.get_world_size(),
+                torch.distributed.get_rank(),
+            ).spec.role
+            if inference_config.disaggregation_shards and torch.distributed.is_initialized()
+            else None
+        )
+
         # The TRT-LLM routed MoE kernel's cost scales with the rows it is handed, so under
         # NVLS it needs a host-known bound on the gathered rows every step. One EP consensus
         # per step picks it (see _match_graph_with_ep_moe_row_bound):
@@ -1126,6 +1138,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     else torch.float32
                 ),
             )
+            if self._disagg_role == "prefill":
+                # A prefill pool runs large prefill batches: give the MoE grouped GEMM the full
+                # gathered-buffer height as its token-count hint every step, so the vLLM kernel
+                # always takes its large-batch (throughput) launch config. The GPU-side valid
+                # token count still bounds the work.
+                NVLSAllGatherVDispatcher.set_host_rows_bound(
+                    self.round_up_tokens(self.max_tokens)
+                    // tp_size
+                    * get_pg_size(self.expert_tensor_and_model_parallel_group)
+                )
         elif self._deepep_dispatcher:
             DeepEPDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
