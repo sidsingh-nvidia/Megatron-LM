@@ -1043,9 +1043,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
         )
 
+        # A PD decode pool captures only decode graphs: its steps are decode-only, except for
+        # rare eviction-recovery prefills, which run eager.
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
             and not (force_disable_non_decode_cuda_graphs)
+            and self._disagg_role != "decode"
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
@@ -1085,13 +1088,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ),
             )
         )
+        if self._disagg_role == "prefill":
+            # A PD prefill pool captures only prefill graphs (no decode request): it hands each
+            # request off after its first token. They cover every prefill step (P = max_requests,
+            # D = 0 at every token count), including under strict hybrid matching.
+            self.cuda_graph_batch_dimensions_list = [
+                dims for dims in self.cuda_graph_batch_dimensions_list if dims.decode_req_count == 0
+            ]
         if self._ep_moe_row_bound:
-            # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one.
+            # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one. A PD
+            # decode pool keeps only the tight decode graphs: every decode step takes the one sized
+            # by the EP-wide max token count, and a step where any rank prefills (eviction
+            # recovery) finds no loose graph, so every rank runs it eager, bounded by the EP-wide
+            # token sum (see _match_graph_with_ep_moe_row_bound).
             graphs = []
             for dims in self.cuda_graph_batch_dimensions_list:
                 if dims.prefill_req_count == 0:
                     graphs.append(dims)
-                graphs.append(dataclasses.replace(dims, loose_moe_row_bound=True))
+                if self._disagg_role != "decode":
+                    graphs.append(dataclasses.replace(dims, loose_moe_row_bound=True))
             self.cuda_graph_batch_dimensions_list = graphs
             # Loose bound: the largest graph's local (post-SP) rows on every EP rank.
             self._moe_loose_rows_bound = (
