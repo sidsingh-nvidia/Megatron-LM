@@ -24,6 +24,7 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     ep_collectives_max_num_blocks,
 )
 from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig, KVCacheManagementMode
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
@@ -1031,9 +1032,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
         )
 
+        # Native prefill/decode disaggregation: this rank's pool role, None when aggregated. A
+        # decode pool runs only decode steps and a prefill pool hands each request off after its
+        # first token, so each captures only its own step kind (no mixed graphs).
+        self._disagg_role = (
+            resolve_inference_shard(
+                inference_config.disaggregation_shards,
+                torch.distributed.get_world_size(),
+                torch.distributed.get_rank(),
+            ).spec.role
+            if inference_config.disaggregation_shards and torch.distributed.is_initialized()
+            else None
+        )
+
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
             and not (force_disable_non_decode_cuda_graphs)
+            and self._disagg_role != "decode"
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
@@ -1073,6 +1088,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ),
             )
         )
+        if self._disagg_role == "prefill":
+            # Prefill-only graphs: every prefill step has no decode request.
+            self.cuda_graph_batch_dimensions_list = [
+                dims for dims in self.cuda_graph_batch_dimensions_list if dims.decode_req_count == 0
+            ]
         if self._ep_moe_row_bound:
             # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one.
             graphs = []
