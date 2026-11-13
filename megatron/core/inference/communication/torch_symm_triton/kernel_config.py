@@ -24,13 +24,41 @@ rank, capped at max_num_blocks.
 
 from dataclasses import dataclass
 
+# See ep_collectives_max_num_blocks.
+_SMALL_EP_MAX_SIZE = 8
+_SMALL_EP_BLOCKS_PER_SM = 4
 
-@dataclass(frozen=True)
+
+def ep_collectives_max_num_blocks(num_sms: int, ep_size: int) -> int:
+    """Grid cap for the EP collectives that process one token per block.
+
+    These are the NVLS all-gather-v / reduce-scatter-v and the all-to-all-v dispatch /
+    combine kernels. Each block has one token in flight, so the bytes in flight per GPU
+    are about num_blocks x (ranks the token reaches) x row size. At small EP a token
+    reaches few ranks (about 4 at EP=4 with top-22 of 512 experts), so one block per SM
+    leaves NVLink underused and large batches become latency-bound: on GB300 at EP=4, four
+    blocks per SM cut the all-to-all-v layer time at 128K tokens from 1.62 ms to 0.73 ms.
+    From EP=16 on, one block per SM already keeps the link busy, and extra blocks only
+    add barrier traffic.
+
+    Depends only on values that are identical on every rank, as the grid must be.
+
+    Args:
+        num_sms: streaming multiprocessors per GPU.
+        ep_size: expert-parallel world size.
+    """
+    blocks_per_sm = _SMALL_EP_BLOCKS_PER_SM if ep_size <= _SMALL_EP_MAX_SIZE else 1
+    return blocks_per_sm * num_sms
+
+
+@dataclass
 class SymmMemKernelConfig:
     """Launch limits for the symmetric-memory collectives.
 
-    Frozen because the signal pads are sized from max_num_blocks at allocation time;
-    raising it afterwards would let launches overflow pads that already exist.
+    The inference context sets max_num_blocks once at startup, before any symmetric-memory
+    buffer is allocated. Do not change it after that: the signal pads are sized from
+    max_num_blocks at allocation time, so raising it would let launches overflow pads that
+    already exist.
     """
 
     max_num_blocks: int = 128
