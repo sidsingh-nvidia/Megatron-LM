@@ -53,8 +53,10 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     exit ${status}
 fi
 
-# Find the server's experiment directory (rank 0 writes config.env at startup).
-EXP_DIR=
+# Find the server's experiment directory (rank 0 writes config.env at startup). A client colocated
+# in the server job (COLOCATE_CLIENT=1) is handed it as CLIENT_EXP_DIR instead: the directory exists
+# before any rank starts, so a server that dies at startup is seen through its done file.
+EXP_DIR=${CLIENT_EXP_DIR:-}
 until [ -n "${EXP_DIR}" ]; do
     EXP_DIR=$(dirname "$(grep -lx "SLURM_JOB_ID=${SERVER_JOB}" inference-bench/experiments/*/config.env 2>/dev/null | head -1)" 2>/dev/null)
     [ "${EXP_DIR}" == "." ] && EXP_DIR=

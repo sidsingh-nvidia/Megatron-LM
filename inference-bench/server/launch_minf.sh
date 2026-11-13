@@ -119,6 +119,7 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         CLIENT_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | tail -1)
         cp inference-bench/server/client.sh "${EXP_DIR}/client.sh"
         BENCH="${CLIENT_BENCH:?COLOCATE_CLIENT=1 needs CLIENT_BENCH}" SERVER_JOB="${SLURM_JOB_ID}" \
+            CLIENT_EXP_DIR="${EXP_DIR}" \
             srun --overlap -N 1 -n 1 -w "${CLIENT_NODE}" \
             --container-image "${INFERENCE_BENCH_SERVE_IMAGE}" \
             --container-mounts "${INFERENCE_BENCH_MOUNTS}" \
@@ -133,8 +134,12 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         --container-mounts "${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
         --container-workdir="${PWD}" bash "${EXP_DIR}/launch_minf.sh"
     status=$?
-    # The client touches DONE_FILE when its sweep ends, which stops the server; let it finish.
-    [ -n "${CLIENT_PID}" ] && wait "${CLIENT_PID}"
+    # The client touches DONE_FILE when its sweep ends, which stops the server. If the server
+    # stopped first (e.g. a startup failure), touch it so a client still waiting exits too.
+    if [ -n "${CLIENT_PID}" ]; then
+        touch "${DONE_FILE}"
+        wait "${CLIENT_PID}"
+    fi
     exit ${status}
 fi
 
