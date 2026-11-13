@@ -91,9 +91,15 @@ def complete(server, prompt, osl, timeout):
 
 
 def post(server, path):
+    """POST with an empty body; the JSON reply, or the status and text when it isn't JSON (vLLM's
+    /start_profile and /stop_profile reply with an empty body)."""
     req = urllib.request.Request(f"{server}{path}", data=b"", method="POST")
     with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read())
+        body = resp.read()
+        try:
+            return json.loads(body)
+        except ValueError:
+            return f"HTTP {resp.status} {body.decode(errors='replace')!r}"
 
 
 def run_batch(server, prompts, osl, timeout):
