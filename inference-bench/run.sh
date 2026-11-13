@@ -14,6 +14,8 @@
 #          groups are smaller than the job, e.g. narrow EP, for faster scheduling)
 #   QOS    server QoS                                  (default: SBATCH_QOS from cluster.env)
 #   TIME   time limit of both jobs                     (default: 2:00:00)
+#   COLOCATE_CLIENT 1 = run the client inside the server job, on its last node, instead of
+#          a separate 1-node client job (FRAMEWORK=minf)   (default: 0)
 #   PD     1 = prefill/decode disaggregation (FRAMEWORK=minf only): one server job of
 #          PREFILL_NODES (default 1) prefill-pool nodes plus NODES decode-pool nodes, the
 #          decode pool hosting the frontend. Any PREFILL_<KNOB> overrides <KNOB> for the
@@ -49,6 +51,15 @@ SERVER_OPTS=(-N "${JOB_NODES}" -t "${TIME:-2:00:00}")
 [ -n "${QOS:-}" ] && SERVER_OPTS+=(-q "${QOS}")
 [ -n "${AFTER:-}" ] && SERVER_OPTS+=(--dependency=afterany:"${AFTER}")
 
+# COLOCATE_CLIENT=1 (FRAMEWORK=minf): no client job; the server job runs client.sh on its last
+# node (see launch_minf.sh), so the run needs no extra node.
+if [ "${COLOCATE_CLIENT:-0}" == "1" ]; then
+    [ "${FRAMEWORK:-minf}" == "minf" ] || { echo "COLOCATE_CLIENT=1 needs FRAMEWORK=minf"; exit 1; }
+    SERVER_JOB=$(CLIENT_BENCH="${BENCH}" env -u BENCH sbatch --parsable "${SERVER_OPTS[@]}" \
+        --export=ALL inference-bench/server/launch_minf.sh)
+    echo "${EXP_NAME}: server ${SERVER_JOB} (${JOB_NODES} nodes), client colocated"
+    exit 0
+fi
 # Without BENCH the server only serves; the sweep runs from the client's own node.
 SERVER_JOB=$(env -u BENCH sbatch --parsable "${SERVER_OPTS[@]}" --export=ALL \
     inference-bench/server/launch_${FRAMEWORK:-minf}.sh)

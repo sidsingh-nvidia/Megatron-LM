@@ -111,13 +111,31 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         echo "MODEL=ultrav3 needs at least 2 nodes (sbatch -N 2)"
         exit 1
     fi
+    # COLOCATE_CLIENT=1 (set by run.sh): run client.sh in this job, as an overlapping step on its
+    # last node (away from rank 0's frontend and coordinator), instead of a separate client job.
+    # The client gets the sweep as CLIENT_BENCH, since BENCH would make rank 0 run client.py.
+    CLIENT_PID=
+    if [ "${COLOCATE_CLIENT:-0}" == "1" ]; then
+        CLIENT_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | tail -1)
+        cp inference-bench/server/client.sh "${EXP_DIR}/client.sh"
+        BENCH="${CLIENT_BENCH:?COLOCATE_CLIENT=1 needs CLIENT_BENCH}" SERVER_JOB="${SLURM_JOB_ID}" \
+            srun --overlap -N 1 -n 1 -w "${CLIENT_NODE}" \
+            --container-image "${INFERENCE_BENCH_SERVE_IMAGE}" \
+            --container-mounts "${INFERENCE_BENCH_MOUNTS}" \
+            --container-workdir="${PWD}" bash "${EXP_DIR}/client.sh" > "${EXP_DIR}/client.out" 2>&1 &
+        CLIENT_PID=$!
+        echo "Client colocated on ${CLIENT_NODE}; output in ${EXP_DIR}/client.out"
+    fi
     # One task per GPU on every node; global rank 0 hosts the HTTP server.
     srun -l -N "${NUM_NODES}" -n $((4 * NUM_NODES)) --ntasks-per-node 4 --cpus-per-task 36 \
         --container-image "${INFERENCE_BENCH_SERVE_IMAGE:?set in cluster.env}" \
         --container-name "inference_bench_${SLURM_JOB_ID}" \
         --container-mounts "${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
         --container-workdir="${PWD}" bash "${EXP_DIR}/launch_minf.sh"
-    exit $?
+    status=$?
+    # The client touches DONE_FILE when its sweep ends, which stops the server; let it finish.
+    [ -n "${CLIENT_PID}" ] && wait "${CLIENT_PID}"
+    exit ${status}
 fi
 
 # ── Inner: one rank ────────────────────────────────────────────────────────────
