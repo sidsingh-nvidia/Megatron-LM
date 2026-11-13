@@ -1615,16 +1615,6 @@ class TransformerConfig(ModelParallelConfig):
     Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
     routing with an expert bias in both training and inference."""
 
-    inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
-    NVFP4 MoE (inference_moe_nvfp4_recipe).
-
-    Decode-only dynamic-inference graphs use this fixed prefix when their
-    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer. Requires
-    the NVLS inference dispatcher and EP > 1.
-    """
-
     inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
     """NVFP4 recipe for routed experts during inference; None keeps them in BF16.
     Options:
@@ -2427,11 +2417,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
                     )
-                if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
-                        "unclamped routed backend, not CUTLASS ClampedRelu2."
-                    )
 
             if mxfp8_enabled:
                 if not self.fp8_param:
@@ -2439,26 +2424,6 @@ class TransformerConfig(ModelParallelConfig):
                         "fp8_param must be enabled when using "
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
-                    )
-
-            if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
-                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
-                    )
-                if (
-                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
-                    or self.inference_moe_token_dispatcher_type != "nvls"
-                    or self.expert_model_parallel_size <= 1
-                ):
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity requires "
-                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
-                        "inference_moe_token_dispatcher_type='nvls' and "
-                        "expert_model_parallel_size > 1"
                     )
 
             if self.inference_moe_token_dispatcher_type == "nvl_a2a":

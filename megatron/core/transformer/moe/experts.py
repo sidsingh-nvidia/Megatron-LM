@@ -1482,7 +1482,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         # DeepEP delivers local expert ids and combines out of its own bf16 buffer.
         self._deepep_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep'
-        self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     @torch.inference_mode(False)
     def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
@@ -1822,8 +1821,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                     activation_type=self._flashinfer_activation_type.value,
                     out=out,
-                    token_capacity=self._flashinfer_mxfp8_token_capacity,
-                    use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
                 )
             return output, None
         if self._nvfp4_weights is not None:
@@ -1836,8 +1833,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_mxfp8_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
         output = fused_moe.cutlass_fused_moe(
