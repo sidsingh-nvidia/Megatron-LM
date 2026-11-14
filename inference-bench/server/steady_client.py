@@ -224,6 +224,17 @@ def percentile(values, q):
     return v[min(len(v) - 1, int(q * len(v)))] if v else float("nan")
 
 
+def post_profile(server, path):
+    """POST a profile control; the reply's JSON, or its status and text (vLLM replies empty)."""
+    req = urllib.request.Request(f"{server}{path}", data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = resp.read()
+        try:
+            return json.loads(body)
+        except ValueError:
+            return f"HTTP {resp.status} {body.decode(errors='replace')!r}"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", required=True)
@@ -251,6 +262,14 @@ def main():
                          "at high concurrency)")
     ap.add_argument("--dataset", choices=["math", "wildchat"], default="math",
                     help="math: the 160-problem math blend; wildchat: WildChat-1M first user turns")
+    ap.add_argument("--profile-level", type=int, default=0,
+                    help="concurrency level to profile (must be the last level): after its warmup "
+                         "and --profile-after seconds, POST /start_profile, wait --profile-window "
+                         "seconds, POST /stop_profile, then end the sweep (the profiled window is "
+                         "not recorded; MInf shuts its server down when profiling stops)")
+    ap.add_argument("--profile-after", type=float, default=120.0,
+                    help="seconds into the profiled level (after warmup) before capturing")
+    ap.add_argument("--profile-window", type=float, default=5.0, help="seconds captured")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -375,6 +394,16 @@ def main():
         level_start = time.time()
         print(f"{level_start:.3f} level c={c}: warming up", flush=True)
         if stop.wait(args.warmup):
+            break
+        if c == args.profile_level:
+            # Capture a short window of this level's steady state, then end the sweep.
+            if stop.wait(args.profile_after):
+                break
+            print(f"{time.time():.3f} level c={c}: start_profile: "
+                  f"{post_profile(args.server, '/start_profile')}", flush=True)
+            stop.wait(args.profile_window)
+            print(f"{time.time():.3f} level c={c}: stop_profile: "
+                  f"{post_profile(args.server, '/stop_profile')}", flush=True)
             break
         m0, t0 = read_metrics(args.server), time.time()
         for window in range(args.windows):

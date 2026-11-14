@@ -24,6 +24,8 @@
 # STEADY_WINDOWS (consecutive windows per level, one record each; default 1),
 # STEADY_IGNORE_EOS (1 = ignore EOS; with MAX_GEN_TOKENS every request has exactly that OSL),
 # STEADY_SAMPLE_INTERVAL (seconds between per-engine gauge samples into steady.engines.jsonl; 0 = off),
+# STEADY_PROFILE_LEVEL / STEADY_PROFILE_AFTER / STEADY_PROFILE_WINDOW (with PROFILE=1: profile
+# that steady level, the last one, for WINDOW s starting AFTER s past its warmup; default -, 120, 5),
 # STEADY_DATASET (steady prompts: math | wildchat; default math), STEADY_STREAM_INTERVAL (with
 # STEADY_STREAM=1: tokens per streamed chunk after the first; default 1), STEADY_STREAM (1 = stream
 # responses, which also records TTFT; default 0),
@@ -118,6 +120,7 @@ elif [ "${CLIENT:-steady}" == "steady" ]; then
         --sample-interval "${STEADY_SAMPLE_INTERVAL:-0}" \
         $([ "${STEADY_STREAM:-0}" == "1" ] && echo --stream --stream-interval "${STEADY_STREAM_INTERVAL:-1}") \
         $([ "${STEADY_IGNORE_EOS:-0}" == "1" ] && echo --ignore-eos) \
+        $([ "${PROFILE:-0}" == "1" ] && echo --profile-level "${STEADY_PROFILE_LEVEL:-0}" --profile-after "${STEADY_PROFILE_AFTER:-120}" --profile-window "${STEADY_PROFILE_WINDOW:-5}") \
         --out "${EXP_DIR}/steady.jsonl" \
         2>&1 | tee "${EXP_DIR}/bench.log"
     status=${PIPESTATUS[0]}
