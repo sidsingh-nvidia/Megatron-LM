@@ -316,7 +316,9 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 [ "${PROMPT_LOGPROBS:-0}" == "1" ] || ARGS+=(--skip-prompt-log-probs)
 ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
 # FP8_RECIPE=mxfp8: MXFP8 expert weights (quantized from the BF16 checkpoint at load).
-[ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather)
+# --stream-ckpt-dequant: load straight into the MXFP8 params; without it the load first dequantizes
+# every param to BF16 (both copies at once: OOM for Ultra at EP8).
+[ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather --stream-ckpt-dequant)
 [ "${SHARED_EXPERT_OVERLAP:-1}" == "1" ] && ARGS+=(--moe-shared-expert-overlap)
 
 # Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
