@@ -24,6 +24,7 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     ep_collectives_max_num_blocks,
 )
 from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig, KVCacheManagementMode
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
@@ -987,6 +988,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type in ('nvls', 'nvl_a2a')
         )
 
+        # Native prefill/decode disaggregation: this rank's pool role, None when aggregated.
+        self._disagg_role = (
+            resolve_inference_shard(
+                inference_config.disaggregation_shards,
+                torch.distributed.get_world_size(),
+                torch.distributed.get_rank(),
+            ).spec.role
+            if inference_config.disaggregation_shards and torch.distributed.is_initialized()
+            else None
+        )
+
         # The TRT-LLM routed MoE kernel's cost scales with the rows it is handed, so under
         # NVLS it needs a host-known bound on the gathered rows every step. One EP consensus
         # per step picks it (see _match_graph_with_ep_moe_row_bound):
@@ -1031,9 +1043,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
         )
 
+        # A PD decode pool captures only decode graphs: its steps are decode-only, except for
+        # rare eviction-recovery prefills, which run eager.
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
             and not (force_disable_non_decode_cuda_graphs)
+            and self._disagg_role != "decode"
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
@@ -1073,13 +1088,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ),
             )
         )
+        if self._disagg_role == "prefill":
+            # A PD prefill pool captures only prefill graphs (no decode request): it hands each
+            # request off after its first token. They cover every prefill step (P = max_requests,
+            # D = 0 at every token count), including under strict hybrid matching.
+            self.cuda_graph_batch_dimensions_list = [
+                dims for dims in self.cuda_graph_batch_dimensions_list if dims.decode_req_count == 0
+            ]
         if self._ep_moe_row_bound:
-            # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one.
+            # Decode graphs with both MoE row bounds, mixed / prefill graphs with the loose one. A PD
+            # decode pool keeps only the tight decode graphs: every decode step takes the one sized
+            # by the EP-wide max token count, and a step where any rank prefills (eviction
+            # recovery) finds no loose graph, so every rank runs it eager, bounded by the EP-wide
+            # token sum (see _match_graph_with_ep_moe_row_bound).
             graphs = []
             for dims in self.cuda_graph_batch_dimensions_list:
                 if dims.prefill_req_count == 0:
                     graphs.append(dims)
-                graphs.append(dataclasses.replace(dims, loose_moe_row_bound=True))
+                if self._disagg_role != "decode":
+                    graphs.append(dataclasses.replace(dims, loose_moe_row_bound=True))
             self.cuda_graph_batch_dimensions_list = graphs
             # Loose bound: the largest graph's local (post-SP) rows on every EP rank.
             self._moe_loose_rows_bound = (
@@ -1126,6 +1153,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     else torch.float32
                 ),
             )
+            if self._disagg_role == "prefill":
+                # A prefill pool runs large prefill batches: give the MoE grouped GEMM the full
+                # gathered-buffer height as its token-count hint every step, so the vLLM kernel
+                # always takes its large-batch (throughput) launch config. The GPU-side valid
+                # token count still bounds the work.
+                NVLSAllGatherVDispatcher.set_host_rows_bound(
+                    self.round_up_tokens(self.max_tokens)
+                    // tp_size
+                    * get_pg_size(self.expert_tensor_and_model_parallel_group)
+                )
         elif self._deepep_dispatcher:
             DeepEPDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
