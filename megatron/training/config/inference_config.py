@@ -87,6 +87,10 @@ class InferenceSetupConfig:
     the KV cache (CPU + GPU memory) depends on the value set for the unified virtual memory (UVM)
     level (via inference_dynamic_batching_unified_memory_level)."""
 
+    inference_dynamic_batching_prefill_buffer_size_gb: float | None = None
+    """With prefill/decode disaggregation, the prefill pool's buffer size (GB); None uses
+    inference_dynamic_batching_buffer_size_gb for both pools."""
+
     inference_dynamic_batching_paused_buffer_size_gb: float | None = None
     """Memory used to derive the paused-request block retention budget. This does not reserve blocks
     from active requests: active requests may use the entire shared pool of usable KV cache blocks.
@@ -430,6 +434,7 @@ class InferenceSetupConfig:
             verbose=verbose,
             block_size_tokens=self.inference_dynamic_batching_block_size,
             buffer_size_gb=self.inference_dynamic_batching_buffer_size_gb,
+            prefill_buffer_size_gb=self.inference_dynamic_batching_prefill_buffer_size_gb,
             paused_buffer_size_gb=self.inference_dynamic_batching_paused_buffer_size_gb,
             mamba_memory_ratio=self.inference_dynamic_batching_mamba_memory_ratio,
             num_cuda_graphs=(

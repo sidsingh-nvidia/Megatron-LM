@@ -509,6 +509,13 @@ class InferenceConfig:
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
+    prefill_buffer_size_gb: Optional[float] = None
+    """
+    With prefill/decode disaggregation, `buffer_size_gb` for the prefill pool's ranks, which hold
+    more expert weights (narrower EP) and keep requests only until their KV / state is handed off.
+    None: both pools use `buffer_size_gb`.
+    """
+
     paused_buffer_size_gb: Optional[int] = None
     """
     Memory used to derive the paused-request block retention budget. This does not reserve blocks

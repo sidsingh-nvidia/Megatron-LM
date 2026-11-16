@@ -714,7 +714,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._uses_torch_memory_saver: bool = False
 
         # Initialize block allocator.
-        buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
+        buffer_size_gb = inference_config.buffer_size_gb
+        if (
+            inference_config.prefill_buffer_size_gb is not None
+            and inference_config.disaggregation_shards
+            and torch.distributed.is_initialized()
+            and resolve_inference_shard(
+                inference_config.disaggregation_shards,
+                torch.distributed.get_world_size(),
+                torch.distributed.get_rank(),
+            ).spec.role
+            == "prefill"
+        ):
+            buffer_size_gb = inference_config.prefill_buffer_size_gb
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
         paused_buffer_size_bytes = (
             0
             if inference_config.paused_buffer_size_gb is None
