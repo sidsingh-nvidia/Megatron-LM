@@ -135,10 +135,13 @@ async def _serve(args, model, tokenizer, inference_config):
 
 
 def main():
-    args = parse_and_validate_args(
-        extra_args_provider=add_serve_args,
-        args_defaults={'no_load_rng': True, 'no_load_optim': True},
-    )
+    # Validate with grad disabled: that is how validate_args recognizes inference, which
+    # --fp8-param-gather (MXFP8 weights) requires.
+    with torch.no_grad():
+        args = parse_and_validate_args(
+            extra_args_provider=add_serve_args,
+            args_defaults={'no_load_rng': True, 'no_load_optim': True},
+        )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args))
@@ -154,7 +157,10 @@ def main():
         configure_nvtx_profiling(True)
 
     tokenizer = get_tokenizer()
-    model, inference_config = _build_model_and_inference_config(args)
+    # Build and load without autograd, as the legacy tool did (it ran under inference_mode); MXFP8
+    # quantizes the loaded weights in place here.
+    with torch.no_grad():
+        model, inference_config = _build_model_and_inference_config(args)
 
     try:
         asyncio.run(_serve(args, model, tokenizer, inference_config))
