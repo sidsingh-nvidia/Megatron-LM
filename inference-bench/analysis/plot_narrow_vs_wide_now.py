@@ -77,16 +77,20 @@ def main():
                         help="MInf wide and narrow runs, then optionally vLLM wide [and narrow]; \"-\" skips a slot")
         ap.add_argument(f"--extra-{model}", nargs="*", default=[], metavar="LABEL=RUN",
                         help="more runs, e.g. vLLM variants, each drawn as its own series")
+    ap.add_argument("--no-step", action="store_true",
+                    help="drop the clean-decode-step panel (it needs the EP-consensus step classes)")
+    ap.add_argument("--agg-name", default="MInf", help="series name of the first two (MInf) runs")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__),
                                                   "narrow_vs_wide_now.png"))
     args = ap.parse_args()
     models = [(m, getattr(args, m)) for m in ("superv3", "ultrav3") if getattr(args, m)]
 
-    fig, axes = plt.subplots(len(models), 3, figsize=(16, 4.2 * len(models)), squeeze=False)
+    ncols = 2 if args.no_step else 3
+    fig, axes = plt.subplots(len(models), ncols, figsize=(5.4 * ncols, 4.2 * len(models)), squeeze=False)
     for row, (model, runs) in enumerate(models):
         assert 2 <= len(runs) <= 4, f"--{model}: MInf wide narrow [vLLM wide [narrow]]"
         series = []
-        for name, color, pair in (("MInf", MINF, runs[:2]), ("vLLM", VLLM, runs[2:])):
+        for name, color, pair in ((args.agg_name, MINF, runs[:2]), ("vLLM", VLLM, runs[2:])):
             for kind, run, marker, ls in zip(("wide", "narrow"), pair, ("o", "^"), ("-", "--")):
                 if run == "-":  # placeholder: no run for this slot
                     continue
@@ -96,7 +100,7 @@ def main():
             label, run = spec.split("=", 1)
             series.append((f"{label}: {layout(run)} ({total_gpus(run)} GPUs)", load(run), color,
                            marker, "-"))
-        pareto, tpot, step = axes[row]
+        pareto, tpot, step = (*axes[row], None) if args.no_step else axes[row]
         for label, pts, color, marker, ls in series:
             per_gpu, tput, inter, t, clean = zip(*pts)
             pareto.plot(inter, tput, color=color, marker=marker, ls=ls, lw=2, ms=7, label=label)
@@ -105,11 +109,11 @@ def main():
                                 fontsize=7, color="#555555")
             tpot.plot(per_gpu, t, color=color, marker=marker, ls=ls, lw=2, ms=7, label=label)
             measured = [(c, v) for c, v in zip(per_gpu, clean) if v is not None]
-            if measured:
+            if measured and step is not None:
                 step.plot(*zip(*measured), color=color, marker=marker, ls=ls, lw=2, ms=7,
                           label=label)
         if len(series) == 2:  # MInf only: narrow / wide at each shared load
-            for ax, col in ((tpot, 3), (step, 4)):
+            for ax, col in [(tpot, 3)] + ([(step, 4)] if step is not None else []):
                 wide_v = {p[0]: p[col] for p in series[0][1] if p[col] is not None}
                 for p in series[1][1]:
                     if p[0] in wide_v and p[col] is not None:
@@ -122,23 +126,25 @@ def main():
         pareto.set_ylabel("Throughput (tokens/s/GPU, all GPUs)")
         ratio = " (labels: narrow / wide)" if len(series) == 2 else ""
         tpot.set_title(f"{TITLES[model]}: median TPOT{ratio}", fontsize=10, loc="left")
-        step.set_title(f"{TITLES[model]}: MInf clean decode step{ratio}", fontsize=10, loc="left")
-        step.set_ylabel("Mean clean decode step (ms)")
+        if step is not None:
+            step.set_title(f"{TITLES[model]}: MInf clean decode step{ratio}", fontsize=10, loc="left")
+            step.set_ylabel("Mean clean decode step (ms)")
         loads = sorted({c for _, pts, *_ in series for c, *_ in pts})
-        for ax in (tpot, step):
+        for ax in [a for a in (tpot, step) if a is not None]:
             ax.set_xscale("log", base=2)
             ax.set_xticks(loads, [f"{c:g}" for c in loads])
             ax.set_xlabel("Requests in flight per GPU (PD: per decode GPU)")
         tpot.set_ylabel("Median TPOT (ms)")
-        for ax in (pareto, tpot, step):
+        for ax in [a for a in (pareto, tpot, step) if a is not None]:
             ax.set_ylim(0, ax.get_ylim()[1] * 1.08)
             ax.grid(color="#EEEEEE", lw=0.8)
             ax.spines[["top", "right"]].set_visible(False)
     # One legend for every panel, below them: series labels are too long to sit inside a panel.
     handles, labels = axes[0][1].get_legend_handles_labels()
+    ncol_legend = 1 if args.no_step else min(len(labels), 3)  # two panels are too narrow for three
     fig.legend(handles, labels, frameon=False, fontsize=9, loc="lower center",
-               ncol=min(len(labels), 3), bbox_to_anchor=(0.5, 0))
-    legend_rows = -(-len(labels) // 3)
+               ncol=ncol_legend, bbox_to_anchor=(0.5, 0))
+    legend_rows = -(-len(labels) // ncol_legend)
     fig.tight_layout(rect=(0, 0.06 * legend_rows / len(models), 1, 1))
     fig.savefig(args.out, dpi=200)
     print(args.out)
