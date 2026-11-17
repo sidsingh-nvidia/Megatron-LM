@@ -29,6 +29,7 @@
 #                      expert-data-parallel copies, so EP < world / ETP keeps a copy per group of
 #                      EP x ETP GPUs (narrow EP)                         (default: world / ETP)
 #   BUFFER_GB          dynamic-batching KV/state buffer per GPU   (default: 50; ultrav3: 25)
+#   PREFILL_BUFFER_GB  with PD=1: the prefill pool's buffer (BUFFER_GB is then the decode pool's)
 #   MAMBA_RATIO        fraction of BUFFER_GB for live Mamba states; with ~100 MB of state per
 #                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
 #   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1
@@ -301,6 +302,9 @@ superv3)
     ;;
 esac
 ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}}")
+# PD: PREFILL_BUFFER_GB sizes the prefill pool's buffer; BUFFER_GB then applies to the decode pool.
+[ "${PD:-0}" == "1" ] && [ -n "${PREFILL_BUFFER_GB:-}" ] && \
+    ARGS+=(--inference-dynamic-batching-prefill-buffer-size-gb "${PREFILL_BUFFER_GB}")
 [ "${ASYNC:-1}" == "1" ] && ARGS+=(--inference-dynamic-batching-async-sched-mode async)
 [ "${PREFIX_CACHING:-1}" == "1" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching
@@ -334,7 +338,7 @@ TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${POOL_NODES} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
 DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-vllm}
 ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} FP8_RECIPE=${FP8_RECIPE:-} SHARED_EXPERT_OVERLAP=${SHARED_EXPERT_OVERLAP:-1}
-PD=${PD:-0} PREFILL_NODES=${PREFILL_NODES:-} PREFILL_GPUS=${PREFILL_GPUS:-0} SHARDS=${SHARDS:-} GPUS=${POOL_GPUS}
+PD=${PD:-0} PREFILL_NODES=${PREFILL_NODES:-} PREFILL_GPUS=${PREFILL_GPUS:-0} PREFILL_BUFFER_GB=${PREFILL_BUFFER_GB:-} SHARDS=${SHARDS:-} GPUS=${POOL_GPUS}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
 CMD=python ${SERVER} ${ARGS[*]}

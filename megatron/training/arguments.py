@@ -1944,6 +1944,12 @@ def _add_inference_args(parser):
                        'level is 1, then additional memory is utilized on the '
                        'CPU and the total memory equals `buffer_size_gb + '
                        'paused_buffer_size_gb`.')
+    group.add_argument('--inference-dynamic-batching-prefill-buffer-size-gb',
+                       type=float, default=None,
+                       help='With prefill/decode disaggregation (--inference-shards), the '
+                       'prefill pool\'s on-GPU KV cache block pool; the decode pool keeps '
+                       '`--inference-dynamic-batching-buffer-size-gb`. Default: the same size '
+                       'for both pools.')
     group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
                        type=float, default=None,
                        help='Memory used to derive the paused-request block retention '
