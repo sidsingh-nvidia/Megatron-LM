@@ -353,6 +353,7 @@ class EngineLoopMixin:
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests after applying all final-step metadata.
+            nvtx_range_push("post_process_requests")
             active_request_ids, finished_requests = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
@@ -371,6 +372,7 @@ class EngineLoopMixin:
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
                 completed_requests=step_result.get("completed_requests"),
             )
+            nvtx_range_pop("post_process_requests")
 
         else:
             active_request_ids: list[int] = []

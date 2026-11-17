@@ -80,6 +80,8 @@
 #   PREFILL_NODES      with PD=1: prefill-pool nodes                         (default: 1)
 #   DONE_FILE          file that stops the server when it appears  (default: <exp dir>/done)
 #   EXP_DIR            experiment directory (default: a new timestamped one)
+#   OMP_THREADS        OpenMP threads per server rank (exported as OMP_NUM_THREADS; default: unset,
+#                      i.e. every core)
 #   PROFILE            1 = run every rank under nsys (capture range = cudaProfilerApi) and have the
 #                      client wrap the timed iterations of the first BENCH batch size in
 #                      /start_profile + /stop_profile; the server exits when profiling stops.
@@ -347,8 +349,19 @@ CMD=python ${SERVER} ${ARGS[*]}
 EOF
 fi
 
+# OMP_THREADS caps each rank's CPU (OpenMP) threads. srun, unlike torchrun, leaves
+# OMP_NUM_THREADS unset, so torch uses every core per rank; per-step bookkeeping ops over large
+# tensors (the attention block table) then pay a multi-threaded launch on every step.
+if [ -n "${OMP_THREADS:-}" ]; then
+    export OMP_NUM_THREADS=${OMP_THREADS}
+fi
+echo "rank ${RANK}: OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
+
 PRE=()
 if [ "${PROFILE:-0}" == "1" ]; then
+    # Enable Megatron's own NVTX ranges (engine bookkeeping etc.); torch.cuda.nvtx ranges
+    # are always emitted.
+    ARGS+=(--profile --nvtx-ranges)
     PRE=(nsys profile -t cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none
          --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown
          --force-overwrite true -o "${EXP_DIR}/trace_rank${RANK}")

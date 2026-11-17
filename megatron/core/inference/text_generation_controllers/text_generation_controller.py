@@ -2063,7 +2063,9 @@ class TextGenerationController(MTPControllerMixin):
                 `None` when no CUDA work was recorded.
         """
         if event is not None:
+            range_push("async_sched_event_wait")
             event.synchronize()
+            range_pop()
 
     def _acquire_async_sched_routing_buffer_slot(
         self, shape: torch.Size
@@ -2791,7 +2793,9 @@ class TextGenerationController(MTPControllerMixin):
                 the speculative forward.
         """
         context = self.inference_wrapped_model.inference_context
+        range_push("context.prepare_requests")
         context.prepare_requests()
+        range_pop()
         input_ids, position_ids, _ = self._dynamic_step_context_init(
             transfer_bookkeeping_to_gpu=False
         )

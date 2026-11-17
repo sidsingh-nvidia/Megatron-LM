@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
+from torch.cuda.nvtx import range_pop, range_push  # type: ignore
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
@@ -3245,6 +3246,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
 
         # Block table: [0:real_bs] real, [real_bs:padded_bs] = dummy block.
+        range_push("mha_block_table")
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
             self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
@@ -3257,6 +3259,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # masked_fill_ over the pinned int32 view: no index_put/nonzero
             # temporaries on the per-step CPU path.
             _real_rows.masked_fill_(_real_rows < 0, self.kv_block_allocator.dummy_block_idx)
+        range_pop()
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -4853,6 +4856,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         return self._next_decode_block_counts(active_slice) > 0
 
     def can_prepare_requests(self) -> bool:
+        """Return whether requests can be prepared without lifecycle changes (NVTX-annotated)."""
+        range_push("can_prepare_requests")
+        try:
+            return self._can_prepare_requests()
+        finally:
+            range_pop()
+
+    def _can_prepare_requests(self) -> bool:
         """Return whether requests can be prepared without lifecycle changes.
 
         Returns:
@@ -4908,6 +4919,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
             block_ids = None
             if num_new_blocks > 0:
+                range_push("prepare_requests/allocate_blocks")
                 if num_new_blocks > self.kv_block_allocator.get_allocatable_count():
                     raise RuntimeError(
                         "Async scheduling cannot pause requests to allocate new blocks."
@@ -4919,6 +4931,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                         "Async scheduling cannot evict requests to allocate new blocks."
                     )
                 self._initialize_mha_value_pages(block_ids)
+                range_pop()
 
             self.active_token_count = active_request_count * tokens_per_request
             active_token_slice = slice(0, self.active_token_count)
@@ -4965,6 +4978,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._mtp_map_next_decode_tokens(active_slice)
 
     def commit_sampled_tokens(
+        self, sampled_tokens_cpu: Tensor, sampled_mtp_tokens_cpu: Optional[Tensor] = None
+    ) -> None:
+        """Commit sampled CPU token IDs to the prepared request state (NVTX-annotated)."""
+        range_push("commit_sampled_tokens")
+        try:
+            self._commit_sampled_tokens(sampled_tokens_cpu, sampled_mtp_tokens_cpu)
+        finally:
+            range_pop()
+
+    def _commit_sampled_tokens(
         self, sampled_tokens_cpu: Tensor, sampled_mtp_tokens_cpu: Optional[Tensor] = None
     ) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
