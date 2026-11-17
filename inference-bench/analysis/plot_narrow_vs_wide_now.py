@@ -28,25 +28,44 @@ EXTRA_STYLES = [("#009E73", "s"), ("#CC79A7", "D"), ("#E69F00", "v")]
 TITLES = {"superv3": "Super", "ultrav3": "Ultra"}
 
 
+def prefill_gpus(run):
+    """GPUs of a PD run's prefill pool (0 for aggregated runs); NODES counts only the decode pool."""
+    m = re.search(r"\bPREFILL_GPUS=(\d+)", open(os.path.join(pf.EXPERIMENTS, run, "config.env")).read())
+    return int(m.group(1)) if m else 0
+
+
 def layout(run):
-    """Parallelism of a run from its config.env, as in the paper: 'TP8×DP8, EP64'."""
+    """Parallelism of a run from its config.env, as in the paper: 'TP8×DP8, EP64'; PD runs give the
+    prefill pool too."""
     cfg = open(os.path.join(pf.EXPERIMENTS, run, "config.env")).read()
     tp, ep = (int(re.search(rf"\b{k}=(\d+)", cfg).group(1)) for k in ("TP", "EP"))
     dp = pf.gpus_of(run) // tp
-    return f"TP{tp}" + (f"×DP{dp}" if dp > 1 else "") + f", EP{ep}"
+    text = f"TP{tp}" + (f"×DP{dp}" if dp > 1 else "") + f", EP{ep}"
+    shards = re.search(r"\bSHARDS=tp=(\d+),dp=\d+,ep=(\d+),[^ ]*role=prefill", cfg)
+    if prefill_gpus(run) and shards:
+        text = f"prefill TP{shards.group(1)}, EP{shards.group(2)} + decode {text}"
+    return text
+
+
+def total_gpus(run):
+    """GPUs the run holds: the decode (or aggregated) GPUs plus any prefill pool."""
+    return pf.gpus_of(run) + prefill_gpus(run)
 
 
 def load(run):
     """Per-level records: load per GPU, throughput per GPU, p90 interactivity, median TPOT, and
-    the mean clean decode step (decode-only steps, all coordinators; None if not recorded)."""
-    gpus = pf.gpus_of(run)
+    the mean clean decode step (decode-only steps, all coordinators; None if not recorded).
+    Load is per decode (or aggregated) GPU; throughput is per GPU of the whole run, prefill pool
+    included. A PD decode pool's steps are all clean decodes ("decode")."""
+    gpus, all_gpus = pf.gpus_of(run), total_gpus(run)
     out = []
     for line in open(os.path.join(pf.EXPERIMENTS, run, "steady.jsonl")):
         r = json.loads(line)
         if r["concurrency"] == gpus:  # one request per GPU: dropped, as in the paper's figures
             continue
-        clean = r.get("step_time_ms", {}).get("all", {}).get("decode_clean", {}).get("mean_ms")
-        out.append((r["concurrency"] / gpus, r["output_tok_s"] / gpus, r[pf.INTERACTIVITY],
+        steps = r.get("step_time_ms", {}).get("all", {})
+        clean = (steps.get("decode_clean") or steps.get("decode") or {}).get("mean_ms")
+        out.append((r["concurrency"] / gpus, r["output_tok_s"] / all_gpus, r[pf.INTERACTIVITY],
                     r["tpot_ms_p50"], clean))
     return sorted(out)
 
@@ -55,7 +74,7 @@ def main():
     ap = argparse.ArgumentParser()
     for model in ("superv3", "ultrav3"):
         ap.add_argument(f"--{model}", nargs="+",
-                        help="MInf wide and narrow runs, then optionally vLLM wide [and narrow]")
+                        help="MInf wide and narrow runs, then optionally vLLM wide [and narrow]; \"-\" skips a slot")
         ap.add_argument(f"--extra-{model}", nargs="*", default=[], metavar="LABEL=RUN",
                         help="more runs, e.g. vLLM variants, each drawn as its own series")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__),
@@ -69,11 +88,13 @@ def main():
         series = []
         for name, color, pair in (("MInf", MINF, runs[:2]), ("vLLM", VLLM, runs[2:])):
             for kind, run, marker, ls in zip(("wide", "narrow"), pair, ("o", "^"), ("-", "--")):
-                series.append((f"{name}, {kind} EP: {layout(run)} ({pf.gpus_of(run)} GPUs)", load(run), color,
+                if run == "-":  # placeholder: no run for this slot
+                    continue
+                series.append((f"{name}, {kind} EP: {layout(run)} ({total_gpus(run)} GPUs)", load(run), color,
                                marker, ls))
         for (color, marker), spec in zip(EXTRA_STYLES, getattr(args, f"extra_{model}")):
             label, run = spec.split("=", 1)
-            series.append((f"{label}: {layout(run)} ({pf.gpus_of(run)} GPUs)", load(run), color,
+            series.append((f"{label}: {layout(run)} ({total_gpus(run)} GPUs)", load(run), color,
                            marker, "-"))
         pareto, tpot, step = axes[row]
         for label, pts, color, marker, ls in series:
@@ -98,7 +119,7 @@ def main():
         pareto.set_title(f"{TITLES[model]}: throughput vs p90 interactivity", fontsize=10,
                          loc="left")
         pareto.set_xlabel("p90 interactivity (tokens/s/user)")
-        pareto.set_ylabel("Throughput (tokens/s/GPU)")
+        pareto.set_ylabel("Throughput (tokens/s/GPU, all GPUs)")
         ratio = " (labels: narrow / wide)" if len(series) == 2 else ""
         tpot.set_title(f"{TITLES[model]}: median TPOT{ratio}", fontsize=10, loc="left")
         step.set_title(f"{TITLES[model]}: MInf clean decode step{ratio}", fontsize=10, loc="left")
@@ -107,7 +128,7 @@ def main():
         for ax in (tpot, step):
             ax.set_xscale("log", base=2)
             ax.set_xticks(loads, [f"{c:g}" for c in loads])
-            ax.set_xlabel("Requests in flight per GPU")
+            ax.set_xlabel("Requests in flight per GPU (PD: per decode GPU)")
         tpot.set_ylabel("Median TPOT (ms)")
         for ax in (pareto, tpot, step):
             ax.set_ylim(0, ax.get_ylim()[1] * 1.08)
