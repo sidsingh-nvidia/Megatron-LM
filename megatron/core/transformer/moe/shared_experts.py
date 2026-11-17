@@ -203,6 +203,10 @@ class SharedExpertMLP(MLP):
                 SharedExpertMLP.stream = torch.cuda.Stream()
             self.stream = SharedExpertMLP.stream
 
+            # Inference overlap: whether the launched forward left its TP reduce-scatter
+            # for inference_overlap_join (see inference_overlap_launch).
+            self._inference_overlap_reduce_pending = False
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
@@ -210,6 +214,66 @@ class SharedExpertMLP(MLP):
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
             output = output * gate_score
+        return output
+
+    def _inference_can_split_tp_comm(self) -> bool:
+        """Whether the TP all-gather / reduce-scatter can run outside the side stream."""
+        fc1, fc2 = self.linear_fc1, self.linear_fc2
+        return (
+            not self.training
+            and hasattr(fc1, "gather_input")
+            and hasattr(fc2, "reduce_scatter_output")
+            and fc1.tp_size > 1
+        )
+
+    def inference_overlap_launch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Launch the inference forward on SharedExpertMLP.stream; join with inference_overlap_join.
+
+        The TP all-gather and reduce-scatter spin-wait on peer GPUs, as do the routed EP
+        collectives on the main stream. Two streams of spin-waiting collectives can deadlock
+        when GPUs schedule them in different orders, so only the GEMMs and activation run on
+        the side stream: the all-gather runs here on the calling stream, and the reduce-scatter
+        runs in inference_overlap_join after the streams join.
+
+        The gathered input may live in the TP symmetric buffer, so no TP collective may run on
+        the calling stream between this launch and the join.
+
+        Args:
+            hidden_states: [S/TP, B, H] sequence-parallel input.
+
+        Returns:
+            The side-stream output, to be passed to inference_overlap_join.
+        """
+        split = self._inference_can_split_tp_comm()
+        if split:
+            hidden_states = self.linear_fc1.gather_input(hidden_states)
+        stream = SharedExpertMLP.stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            if split:
+                self.linear_fc1.defer_tp_comm = True
+                self.linear_fc2.defer_tp_comm = True
+            try:
+                output = apply_module(self)(hidden_states)
+            finally:
+                self.linear_fc1.defer_tp_comm = False
+                self.linear_fc2.defer_tp_comm = False
+        self._inference_overlap_reduce_pending = split
+        return output
+
+    def inference_overlap_join(self, output: torch.Tensor) -> torch.Tensor:
+        """Join SharedExpertMLP.stream and finish the output launched by inference_overlap_launch.
+
+        Args:
+            output: the tensor returned by inference_overlap_launch.
+
+        Returns:
+            The [S/TP, B, H] shared-expert output on the calling stream.
+        """
+        torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+        if self._inference_overlap_reduce_pending:
+            output = self.linear_fc2.reduce_scatter_output(output)
+            self._inference_overlap_reduce_pending = False
         return output
 
     def sharded_state_dict(

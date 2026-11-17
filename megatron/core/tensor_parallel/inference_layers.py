@@ -401,6 +401,10 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         # reduce-scatter in between (e.g. the MTP eh_proj projection).
         self.barrier_before_all_gather = False
 
+        # When True, forward takes an already-gathered input and skips the all-gather
+        # (the caller runs it via gather_input, e.g. on another stream).
+        self.defer_tp_comm = False
+
     def set_barrier_before_all_gather(self, value: bool = True) -> None:
         """Request a barrier before this layer's input all-gather reuses the buffer.
 
@@ -409,6 +413,15 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         eh_proj projection), so the kernel synchronizes ranks before overwriting.
         """
         self.barrier_before_all_gather = value
+
+    def gather_input(self, x: torch.Tensor) -> torch.Tensor:
+        """All-gather the sequence-parallel input the way forward does, without the GEMM.
+
+        For use with defer_tp_comm. The result may be the TP symmetric buffer itself.
+        """
+        if self.tp_size == 1:
+            return x
+        return self._all_gather(x, self._maybe_allocate_symmetric_buffer(x))
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -454,7 +467,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
-        if self.tp_size == 1:
+        if self.tp_size == 1 or self.defer_tp_comm:
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
@@ -520,6 +533,16 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # reduce-scatter + add + rms-norm + all-gather
         self.next_layer_norm_weights = None
         self.config = config
+
+        # When True, forward returns this rank's unreduced partial output and skips the
+        # reduce-scatter (the caller runs it via reduce_scatter_output, e.g. on another stream).
+        self.defer_tp_comm = False
+
+    def reduce_scatter_output(self, x: torch.Tensor) -> torch.Tensor:
+        """Reduce-scatter a partial output produced with defer_tp_comm."""
+        if self.tp_size == 1:
+            return x
+        return inference_reduce_scatter_to_sequence_parallel_region(x, self.tp_group, self.config)
 
     def _matmul_reduce_scatter(self, x, residual=None):
         """
@@ -609,7 +632,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         if self.training:
             return super().forward(x)
 
-        if self.tp_size == 1:
+        if self.tp_size == 1 or self.defer_tp_comm:
             x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
