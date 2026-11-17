@@ -3238,7 +3238,10 @@ class TextGenerationController(MTPControllerMixin):
     async def _run_async_sched_step_overlap(
         self, *, finalize_requests=None
     ) -> DynamicBatchControllerStepResult:
-        """Run ``prepare -> sample -> forward -> resolve`` with one token per request.
+        """Run ``sample -> prepare -> forward -> resolve`` with one token per request.
+
+        Sampling launches before prepare so the GPU samples the pending logits while the
+        CPU prepares the successor forward.
 
         Args:
             finalize_requests: Engine callback assembling finished results before release.
@@ -3253,7 +3256,17 @@ class TextGenerationController(MTPControllerMixin):
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_forward.cuda_graph_request_count
 
-            resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
+            sequence_lengths = context.get_active_sequence_lengths()
+            resolved_sequence_lengths = sequence_lengths + 1
+
+            # -------------------------------------------------------------------------
+            # Sample
+            # -------------------------------------------------------------------------
+            # Sample at the positions of the pending logits, before prepare advances them.
+            sample_result = self._run_async_sched_sample(sequence_lengths=sequence_lengths)
+
+            log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
+            log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
 
             # -------------------------------------------------------------------------
             # Prepare
@@ -3268,20 +3281,9 @@ class TextGenerationController(MTPControllerMixin):
                 consumed_decode_only and launched_decode_only
             ), "Async overlap requires decode-only consumed and launched work."
 
-            # -------------------------------------------------------------------------
-            # Sample
-            # -------------------------------------------------------------------------
-            # Prepare has advanced the live lengths; sample using the positions
-            # of the pending logits, not those of the successor forward.
-            sample_result = self._run_async_sched_sample(
-                sequence_lengths=resolved_sequence_lengths - 1
-            )
-
-            # Populate the next forward's input-ID view directly from GPU samples.
+            # Populate the next forward's input-ID view directly from GPU samples; this
+            # needs the padded layout prepare established.
             context.copy_async_sched_sample_to_forward(sample_result.sampled_tokens_gpu)
-
-            log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
-            log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
 
             # -------------------------------------------------------------------------
             # Forward
