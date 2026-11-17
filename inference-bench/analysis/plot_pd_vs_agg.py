@@ -18,11 +18,14 @@ from plot_narrow_vs_wide_now import MINF, layout, load, total_gpus
 
 plt.rcParams["font.family"] = ["Gill Sans", "Gill Sans MT", "URW Gothic", "Open Sans", "DejaVu Sans"]
 PD = "#009E73"  # bluish green, the PD series colour in the other Ultra figures
+EXTRA = "#E69F00"  # orange (Okabe-Ito): extra PD runs, off the CDF row's dataset colours
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", nargs=3, action="append", required=True, metavar=("NAME", "AGG", "PD"))
+    ap.add_argument("--extra-pd", nargs=3, action="append", default=[], metavar=("DATASET", "LABEL", "RUN"),
+                    help="another PD run drawn in DATASET's column (e.g. a narrower decode pool)")
     ap.add_argument("--title", default="NVIDIA Nemotron 3 Ultra 550B-A55B: wide-EP deployment\n"
                     "aggregated vs disaggregated (PD) serving")
     ap.add_argument("--out", required=True)
@@ -33,7 +36,7 @@ def main():
     assert len(args.dataset) == 2, "the layout has two dataset columns"
     # A thin row between the CDF and the TPOT row holds the aggregated / PD disagg legend.
     fig = plt.figure(figsize=(12.4, 12.8))
-    grid = fig.add_gridspec(4, 4, height_ratios=[1, 0.07, 1, 1])
+    grid = fig.add_gridspec(4, 4, height_ratios=[1, 0.07 if len(args.extra_pd) == 0 else 0.16, 1, 1])
     osl_ax = fig.add_subplot(grid[0, 1:3])
     legend_ax = fig.add_subplot(grid[1, :])
     legend_ax.axis("off")
@@ -41,6 +44,8 @@ def main():
     for col, (name, agg, pd) in enumerate(args.dataset):
         series = [(f"Aggregated: {layout(agg)} ({total_gpus(agg)} GPUs)", load(agg), MINF, "o"),
                   (f"PD disagg: {layout(pd)} ({total_gpus(pd)} GPUs)", load(pd), PD, "s")]
+        series += [(f"{label}: {layout(run)} ({total_gpus(run)} GPUs)", load(run), EXTRA, "D")
+                   for ds, label, run in args.extra_pd if ds == name]
         tpot, pareto = axes[1][col], axes[2][col]
         for label, pts, color, marker in series:
             per_gpu, tput, inter, t, _ = zip(*pts)
@@ -86,9 +91,13 @@ def main():
     osl_ax.set_title("Dataset output lengths (CDF, finished requests)", fontsize=10.5, loc="left",
                      fontweight="bold")
     # Same two series in every TPOT / Pareto panel: one large legend, above those panels.
-    handles, labels = axes[1][0].get_legend_handles_labels()
-    legend_ax.legend(handles, labels, frameon=False, fontsize=13, loc="center", ncol=2, markerscale=1.4,
-                     handlelength=3)
+    # Every series of every column, once (extra PD runs may appear in one column only).
+    seen = {}
+    for ax in axes[1]:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            seen.setdefault(l, h)
+    legend_ax.legend(list(seen.values()), list(seen), frameon=False, fontsize=12.5, loc="center",
+                     ncol=1 if len(seen) > 2 else 2, markerscale=1.4, handlelength=3)
     fig.suptitle(args.title, fontsize=18, fontweight="bold", x=0.5, ha="center", y=0.995, linespacing=1.3)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(args.out, dpi=200)
