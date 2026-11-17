@@ -1664,11 +1664,11 @@ def test_async_sched_step_overlap_order():
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
     assert call_order == [
-        "prepare",
         "sample",
-        "copy_input",
         "log_probs",
         "copy_log_probs",
+        "prepare",
+        "copy_input",
         "publish",
         "forward",
         "wait:sample",
