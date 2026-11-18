@@ -261,6 +261,38 @@ class SharedExpertMLP(MLP):
         self._inference_overlap_reduce_pending = split
         return output
 
+    def inference_overlap_launch_ordered(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Launch the full inference forward on SharedExpertMLP.stream, ordered after dispatch.
+
+        Call after the routed dispatch has been enqueued on the calling stream. The side stream
+        waits for everything enqueued so far (the dispatch included), runs the whole forward
+        (TP all-gather, GEMMs, TP reduce-scatter), and records an event that
+        inference_overlap_wait_before_combine makes the calling stream wait on before the
+        combine. Every GPU then runs dispatch, the shared expert's collectives and the combine
+        in the same order, one spin-waiting collective at a time, while the shared GEMMs still
+        overlap the routed expert GEMMs. Join with inference_overlap_join.
+
+        Args:
+            hidden_states: [S/TP, B, H] sequence-parallel input.
+
+        Returns:
+            The side-stream output, to be passed to inference_overlap_join.
+        """
+        stream = SharedExpertMLP.stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            output = apply_module(self)(hidden_states)
+        if getattr(self, "_inference_overlap_done", None) is None:
+            self._inference_overlap_done = torch.cuda.Event()
+        self._inference_overlap_done.record(stream)
+        self._inference_overlap_reduce_pending = False
+        return output
+
+    def inference_overlap_wait_before_combine(self) -> None:
+        """Make the calling stream wait for the forward launched by
+        inference_overlap_launch_ordered, so the combine starts after its collectives."""
+        torch.cuda.current_stream().wait_event(self._inference_overlap_done)
+
     def inference_overlap_join(self, output: torch.Tensor) -> torch.Tensor:
         """Join SharedExpertMLP.stream and finish the output launched by inference_overlap_launch.
 

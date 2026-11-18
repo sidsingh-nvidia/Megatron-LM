@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -258,6 +259,11 @@ class MoELayer(BaseMoELayer):
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
     """
+
+    # Event-ordered shared-expert overlap state (set by _setup_inference_mode); class defaults
+    # keep layers built without the inference dispatcher on the unordered paths.
+    _shared_expert_event_ordering: bool = False
+    _pending_shared_expert_input: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -528,6 +534,16 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
+        # MCORE_SHARED_EXPERT_OVERLAP_ORDERING=event (experimental): the layer launches the whole
+        # overlapped shared expert (its TP all-gather and reduce-scatter included) on the side
+        # stream after the routed dispatch, and the combine waits for it, so the spin-waiting
+        # collectives of the two streams never run concurrently. Otherwise the shared expert's
+        # TP comms run on the main stream (SharedExpertMLP.inference_overlap_launch).
+        self._shared_expert_event_ordering = (
+            os.environ.get("MCORE_SHARED_EXPERT_OVERLAP_ORDERING", "") == "event"
+        )
+        if self._shared_expert_event_ordering and self.layer_number == 1:
+            print("MoELayer: shared-expert overlap uses event ordering", flush=True)
         # Wire shared-expert overlap into the NVLink inference dispatchers. The dispatcher
         # launches the shared-expert forward on SharedExpertMLP.stream concurrently with
         # dispatch+experts+combine and adds it back in combine_postprocess.
@@ -542,11 +558,13 @@ class MoELayer(BaseMoELayer):
             # The dispatcher only sees latent-dim tensors, so we move the launch+add
             # into preprocess/postprocess on the layer and tell the dispatcher to
             # skip its own internal launch+add.
-            if self.config.moe_latent_size:
+            if self.config.moe_latent_size or self._shared_expert_event_ordering:
                 self._inference_token_dispatcher._external_shared_expert_launch = True
         # Inference only: side-stream shared-expert output for latent-MoE + NVLS overlap
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
+        # Event ordering: preprocess stashes the shared expert's input; dispatch launches it.
+        self._pending_shared_expert_input: Optional[torch.Tensor] = None
 
     def select_token_dispatcher(self) -> None:
         """Select the inference token dispatcher if active, otherwise use training dispatcher."""
@@ -621,6 +639,13 @@ class MoELayer(BaseMoELayer):
         # hidden_states. The corresponding join+add runs in postprocess after
         # fc2_latent_proj. Skipped on the training / NCCL paths.
         if (
+            self._shared_expert_event_ordering
+            and self.shared_expert_overlap
+            and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+        ):
+            # Launched by dispatch(), after the routed dispatch is enqueued.
+            self._pending_shared_expert_input = hidden_states
+        elif (
             self.config.moe_latent_size
             and self.shared_expert_overlap
             and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
@@ -668,7 +693,15 @@ class MoELayer(BaseMoELayer):
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        result = self.token_dispatcher.token_dispatch(hidden_states, probs)
+        if self._pending_shared_expert_input is not None:
+            self._latent_shared_expert_output = (
+                self.shared_experts.inference_overlap_launch_ordered(
+                    self._pending_shared_expert_input
+                )
+            )
+            self._pending_shared_expert_input = None
+        return result
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
@@ -733,6 +766,8 @@ class MoELayer(BaseMoELayer):
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication).
         """
+        if self._shared_expert_event_ordering and self._latent_shared_expert_output is not None:
+            self.shared_experts.inference_overlap_wait_before_combine()
         output = self.token_dispatcher.token_combine(output)
         return output
 
