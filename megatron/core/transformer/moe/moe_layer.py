@@ -34,7 +34,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -626,10 +625,9 @@ class MoELayer(BaseMoELayer):
             and self.shared_expert_overlap
             and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
         ):
-            stream = SharedExpertMLP.stream
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+            self._latent_shared_expert_output = self.shared_experts.inference_overlap_launch(
+                hidden_states
+            )
         elif self.config.moe_latent_size:
             if self.shared_expert_overlap:
                 if self.training:
@@ -760,8 +758,9 @@ class MoELayer(BaseMoELayer):
         ):
             # This codepath is for inference-only shared-expert overlap of latent MoEs.
             # Must happen post-fc2_latent_proj so dimensions match.
-            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-            output = output + self._latent_shared_expert_output
+            output = output + self.shared_experts.inference_overlap_join(
+                self._latent_shared_expert_output
+            )
             self._latent_shared_expert_output = None
         return self.token_dispatcher.finalize_layer_output(output)
 
