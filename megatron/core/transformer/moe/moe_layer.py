@@ -264,6 +264,7 @@ class MoELayer(BaseMoELayer):
     # keep layers built without the inference dispatcher on the unordered paths.
     _shared_expert_event_ordering: bool = False
     _pending_shared_expert_input: Optional[torch.Tensor] = None
+    _event_ordering_logged: bool = False
 
     def __init__(
         self,
@@ -542,7 +543,8 @@ class MoELayer(BaseMoELayer):
         self._shared_expert_event_ordering = (
             os.environ.get("MCORE_SHARED_EXPERT_OVERLAP_ORDERING", "") == "event"
         )
-        if self._shared_expert_event_ordering and self.layer_number == 1:
+        if self._shared_expert_event_ordering and not MoELayer._event_ordering_logged:
+            MoELayer._event_ordering_logged = True
             print("MoELayer: shared-expert overlap uses event ordering", flush=True)
         # Wire shared-expert overlap into the NVLink inference dispatchers. The dispatcher
         # launches the shared-expert forward on SharedExpertMLP.stream concurrently with
