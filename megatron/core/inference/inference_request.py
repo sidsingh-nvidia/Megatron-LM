@@ -17,6 +17,8 @@ from megatron.core.inference.config import ImageProcessingConfig, VideoProcessin
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
+from torch.cuda.nvtx import range_pop as _nvtx_pop  # noqa: E402
+from torch.cuda.nvtx import range_push as _nvtx_push  # noqa: E402
 
 
 def serialize_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
@@ -846,7 +848,9 @@ class DynamicInferenceRequest(InferenceRequest):
     payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        _nvtx_push("request/deepcopy_sampling_params")
         self.sampling_params = copy.deepcopy(self.sampling_params)
+        _nvtx_pop()
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = self.prompt_tokens
 
@@ -857,7 +861,9 @@ class DynamicInferenceRequest(InferenceRequest):
             and self.prompt_tokens is not None
             and not self.precomputed_block_hashes
         ):
+            _nvtx_push("request/compute_block_hashes")
             self._compute_block_hashes()
+            _nvtx_pop()
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.

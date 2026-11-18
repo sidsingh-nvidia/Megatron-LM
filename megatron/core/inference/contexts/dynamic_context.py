@@ -3936,6 +3936,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def check_availability(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
     ) -> Tuple[bool, bool, bool]:
+        """Check if the request can be added to the context (NVTX-annotated)."""
+        range_push("check_availability")
+        try:
+            return self._check_availability(req, prefill_chunk_length)
+        finally:
+            range_pop()
+
+    def _check_availability(
+        self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
+    ) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
 
@@ -4055,17 +4065,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), "Prefill chunk length is greater than remaining prompt length"
 
         if prefill_chunk_length < req.remaining_prompt_length:
+            range_push("ctx_add/chunk_next_token")
             self.chunked_prefill_next_prompt_token.copy_(
                 req.remaining_prompt_tokens[prefill_chunk_length]
             )
             self.chunked_prefill_next_prompt_token_id = int(
                 req.remaining_prompt_tokens[prefill_chunk_length]
             )
+            range_pop()
 
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
         # =========================================================================
+        range_push("ctx_add/prefix_match")
         match = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
+        range_pop()
         matched_block_ids = match.matched_block_ids
         num_blocks_from_pool = match.num_blocks_from_pool
         already_allocated_blocks = match.already_allocated_blocks
@@ -4086,6 +4100,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # counts first removes matched blocks from the evictable set (see
         # evict_lru_blocks / get_evictable_block_count), so eviction falls back to
         # genuinely unused cached blocks.
+        range_push("ctx_add/alloc_blocks")
         matched_tensor = None
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
@@ -4101,6 +4116,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     self.kv_block_allocator.pc_state.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
             self._initialize_mha_value_pages(new_block_ids)
+        range_pop()
 
         # Track prefix cache hits only after allocation succeeds. Matched blocks
         # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
@@ -4141,6 +4157,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_ids[current_id] = req.request_id
 
         # Handle request metadata.
+        range_push("ctx_add/metadata")
         assert (
             req.get_metadata_types() == self.request_metadata_types
         ), "Request added to context with invalid metadata types"
@@ -4156,8 +4173,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
 
             self.request_metadata[label][current_id] = m
+        range_pop()
 
         # Handle length and block assignments.
+        range_push("ctx_add/token_tables")
         self.request_query_lengths[current_id] = effective_prefill_chunk_length
         self.request_in_prefill_status_tensor[current_id] = 1
         self.request_output_lengths[current_id] = (
@@ -4274,7 +4293,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
+        range_pop()
+
         # Register hashes for completely filled blocks (skip matched blocks).
+        range_push("ctx_add/register_hashes")
         # Two disjoint ranges may need registration:
         #   Range 1: [previously_complete, min(already_allocated_blocks, num_complete_blocks))
         #       — the partial block from a prior chunk that this chunk's tokens completed
@@ -4361,6 +4383,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # exclusion above so no registered descendant can outlive an unowned ancestor.
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
+        range_pop()
+
+        range_push("ctx_add/mamba")
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
@@ -4395,6 +4420,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 matched_block_ids,
                 overall_required_blocks,
             )
+
+        range_pop()
 
         # Extend the request's run of matched blocks, so a later chunk knows not to
         # rewrite the partial block it inherits from this one. Only extend when this

@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 from torch import Tensor
+from torch.cuda.nvtx import range_pop as _nvtx_pop
+from torch.cuda.nvtx import range_push as _nvtx_push
 
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
@@ -520,12 +522,16 @@ class RequestIntakeMixin:
                 prompt_token_ids = self.controller.tokenize_prompt(
                     self.controller.tokenizer, prompt
                 )
+            _nvtx_push("add_request/prompt_to_gpu")
             tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
             )
+            _nvtx_pop()
         elif isinstance(prompt, list):
             # Convert List[int] -> Tensor.
+            _nvtx_push("add_request/prompt_to_gpu")
             tokens = torch.tensor(prompt, dtype=torch.int64, device=torch.cuda.current_device())
+            _nvtx_pop()
         elif isinstance(prompt, torch.Tensor):
             # Prompt already tokenized.
             assert prompt.dtype == torch.int64, prompt.dtype
@@ -578,6 +584,7 @@ class RequestIntakeMixin:
                 self.context.remove_vlm_request_data(request_id)
                 raise
         else:
+            _nvtx_push("add_request/build_request")
             request = DynamicInferenceRequest(
                 request_id=request_id,
                 prompt=prompt_str,
@@ -594,7 +601,12 @@ class RequestIntakeMixin:
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
-        return self._admit_request(request)
+            _nvtx_pop()
+        _nvtx_push("add_request/register")
+        try:
+            return self._admit_request(request)
+        finally:
+            _nvtx_pop()
 
     def _admit_request(
         self, request: DynamicInferenceRequest
@@ -665,10 +677,12 @@ class RequestIntakeMixin:
         self._encode_waiting_images()
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
+        _nvtx_push("schedule_waiting_requests")
         if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
         else:
             self.schedule_non_chunked_prefill()
+        _nvtx_pop()
         waiting_after = set(self.waiting_request_ids)
 
         # Re-stamp kv_cache_epoch on requests that were just scheduled.
@@ -744,6 +758,14 @@ class RequestIntakeMixin:
         )
 
     def _should_run_async_sched_overlap(self) -> bool:
+        """Return whether this step should use overlap ordering (NVTX-annotated)."""
+        _nvtx_push("should_run_async_sched_overlap")
+        try:
+            return self._should_run_async_sched_overlap_impl()
+        finally:
+            _nvtx_pop()
+
+    def _should_run_async_sched_overlap_impl(self) -> bool:
         """Return whether this step should use overlap ordering.
 
         Returns:
@@ -987,7 +1009,10 @@ class RequestIntakeMixin:
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
 
-            if self._can_schedule_chunked_prefill(req):
+            _nvtx_push("sched/can_schedule")
+            can_schedule_req = self._can_schedule_chunked_prefill(req)
+            _nvtx_pop()
+            if can_schedule_req:
                 # How many tokens we can admit this step.
                 token_budget = self._chunked_prefill_token_budget()
 
@@ -1001,9 +1026,11 @@ class RequestIntakeMixin:
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                    _nvtx_push("sched/prefix_skip_match")
                     prefix_skip = self.context._compute_prefix_match(
                         req, remaining_len
                     ).prefix_skip_tokens
+                    _nvtx_pop()
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
@@ -1064,9 +1091,11 @@ class RequestIntakeMixin:
                 ):
                     break
 
+                _nvtx_push("sched/check_availability")
                 request_available, tokens_available, kv_available = self.context.check_availability(
                     req, prefill_chunk_length
                 )
+                _nvtx_pop()
                 if not (
                     (is_continuing_chunked_prefill or request_available)
                     and tokens_available
@@ -1076,27 +1105,39 @@ class RequestIntakeMixin:
                     break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
+                _nvtx_push("sched/pending_hashes")
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
+                _nvtx_pop()
 
                 if prefill_chunk_length >= remaining_len:
                     self.context.chunked_prefill_request_id = -1
+                    _nvtx_push("sched/context_add_request")
                     self.context.add_request(req)
+                    _nvtx_pop()
+                    _nvtx_push("sched/notify_task")
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
+                    _nvtx_pop()
+                    _nvtx_push("sched/finish_admit")
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add_context()
                     self.waiting_request_ids.popleft()
+                    _nvtx_pop()
                     can_schedule = True
                 else:
                     # Partial admit: schedule this chunk and keep the request at the queue head.
+                    _nvtx_push("sched/context_add_request")
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
+                    _nvtx_pop()
+                    _nvtx_push("sched/notify_task")
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
+                    _nvtx_pop()
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
                     req.finished_chunk_token_count += prefill_chunk_length
