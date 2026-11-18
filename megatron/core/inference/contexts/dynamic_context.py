@@ -14,6 +14,8 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 from torch.cuda.nvtx import range_pop, range_push  # type: ignore
 
+from megatron.core.inference import admission_opts
+
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
@@ -1412,6 +1414,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Paged attention can read masked V tails; initialize only newly private pages.
         if self.cache_mla_latent or len(block_ids) == 0:
             return
+        if admission_opts.enabled("batched_value_pages"):
+            self._pending_value_page_block_ids.append(torch.as_tensor(block_ids, dtype=torch.int64))
+            return
+        self._zero_value_pages(block_ids)
+
+    def _flush_pending_value_pages(self) -> None:
+        """Zero all value pages deferred by _initialize_mha_value_pages in one launch."""
+        if not self._pending_value_page_block_ids:
+            return
+        block_ids = torch.cat(self._pending_value_page_block_ids)
+        self._pending_value_page_block_ids.clear()
+        self._zero_value_pages(block_ids)
+
+    def _zero_value_pages(self, block_ids: Sequence[int] | Tensor) -> None:
+        """Zero the MHA value pages of `block_ids`."""
         device = self.memory_buffer.device
         block_ids = torch.as_tensor(block_ids, dtype=torch.int64)
         if block_ids.device != device:
@@ -1615,6 +1632,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_metadata = {
             label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
             for label, dtype in self.request_metadata_types
+        }
+        # numpy views sharing request_metadata's storage, for per-request scalar writes
+        # without creating a tensor per field (admission_opts "numpy_metadata").
+        self._request_metadata_np = {
+            label: tensor.numpy() for label, tensor in self.request_metadata.items()
         }
 
         # Static tensor addresses of active slices to enable fast inference
@@ -1978,6 +2000,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
+        # New KV blocks whose value pages still need zeroing (admission_opts
+        # "batched_value_pages"); flushed in one copy + kernel by initialize_attention_state.
+        self._pending_value_page_block_ids: list = []
         self._pending_mamba_restores: list = []
 
         # Allocate large non-graphed buffers.
@@ -3094,6 +3119,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
         self._execute_pending_mamba_ops()
+        self._flush_pending_value_pages()
 
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
@@ -4066,12 +4092,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if prefill_chunk_length < req.remaining_prompt_length:
             range_push("ctx_add/chunk_next_token")
-            self.chunked_prefill_next_prompt_token.copy_(
-                req.remaining_prompt_tokens[prefill_chunk_length]
-            )
-            self.chunked_prefill_next_prompt_token_id = int(
-                req.remaining_prompt_tokens[prefill_chunk_length]
-            )
+            if admission_opts.enabled("cpu_prompts"):
+                next_token_id = int(req.remaining_prompt_tokens[prefill_chunk_length])
+                self.chunked_prefill_next_prompt_token.fill_(next_token_id)
+                self.chunked_prefill_next_prompt_token_id = next_token_id
+            else:
+                self.chunked_prefill_next_prompt_token.copy_(
+                    req.remaining_prompt_tokens[prefill_chunk_length]
+                )
+                self.chunked_prefill_next_prompt_token_id = int(
+                    req.remaining_prompt_tokens[prefill_chunk_length]
+                )
             range_pop()
 
         # =========================================================================
@@ -4163,6 +4194,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), "Request added to context with invalid metadata types"
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
+        if admission_opts.enabled("numpy_metadata"):
+            for m, (label, _) in zip(metadata, metadata_types):
+                if isinstance(m, torch.Tensor):
+                    self.request_metadata[label][current_id] = m
+                else:
+                    self._request_metadata_np[label][current_id] = m
+            metadata_types = ()
         for m, m_type in zip(metadata, metadata_types):
             label, _ = m_type
             if not isinstance(m, torch.Tensor):

@@ -18,6 +18,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 from torch.cuda.nvtx import range_pop as _nvtx_pop  # noqa: E402
+
+from megatron.core.inference import admission_opts  # noqa: E402
 from torch.cuda.nvtx import range_push as _nvtx_push  # noqa: E402
 
 
@@ -849,7 +851,16 @@ class DynamicInferenceRequest(InferenceRequest):
 
     def __post_init__(self):
         _nvtx_push("request/deepcopy_sampling_params")
-        self.sampling_params = copy.deepcopy(self.sampling_params)
+        if admission_opts.enabled("shallow_sampling_params") and self.sampling_params is not None:
+            # Every SamplingParams field is a scalar or a list of scalars/strings, so a shallow
+            # copy plus fresh lists is an independent copy.
+            self.sampling_params = copy.copy(self.sampling_params)
+            for name in ("stop_token_ids", "stop_words"):
+                value = getattr(self.sampling_params, name, None)
+                if isinstance(value, list):
+                    setattr(self.sampling_params, name, list(value))
+        else:
+            self.sampling_params = copy.deepcopy(self.sampling_params)
         _nvtx_pop()
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = self.prompt_tokens

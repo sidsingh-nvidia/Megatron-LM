@@ -13,6 +13,8 @@ from torch import Tensor
 from torch.cuda.nvtx import range_pop as _nvtx_pop
 from torch.cuda.nvtx import range_push as _nvtx_push
 
+from megatron.core.inference import admission_opts
+
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -530,7 +532,15 @@ class RequestIntakeMixin:
         elif isinstance(prompt, list):
             # Convert List[int] -> Tensor.
             _nvtx_push("add_request/prompt_to_gpu")
-            tokens = torch.tensor(prompt, dtype=torch.int64, device=torch.cuda.current_device())
+            tokens = torch.tensor(
+                prompt,
+                dtype=torch.int64,
+                device=(
+                    "cpu"
+                    if admission_opts.enabled("cpu_prompts")
+                    else torch.cuda.current_device()
+                ),
+            )
             _nvtx_pop()
         elif isinstance(prompt, torch.Tensor):
             # Prompt already tokenized.
