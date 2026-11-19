@@ -196,6 +196,13 @@ def _warn_on_unloaded_checkpoint_tensors(
         )
 
 
+def get_num_kv_heads(args: Namespace) -> Optional[int]:
+    """KV heads (query groups) of the model's attention, or None for MLA, which has none."""
+    if args.multi_latent_attention:
+        return None
+    return args.num_query_groups if args.group_query_attention else args.num_attention_heads
+
+
 def get_model_for_inference(
     pg_collection: Optional[ProcessGroupCollection] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,

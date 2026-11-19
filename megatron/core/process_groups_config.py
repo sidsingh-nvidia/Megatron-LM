@@ -43,6 +43,8 @@ class ProcessGroupCollection:
         dynamic_tp_cp: TP x runtime-CP groups keyed by CP size (not TP x CP size)
         tp_cp: Tensor and context parallel group
         hcp: Hierarchical context parallel groups
+        dcp: Decode context parallel group (inference): the TP ranks that hold the same KV
+            head, which split that head's KV cache by token; size 1 when TP <= num KV heads
         ep: Expert model parallel group
         expt_tp: Expert tensor parallel group
         tp_ep: Tensor and expert parallel group
@@ -106,6 +108,9 @@ class ProcessGroupCollection:
 
     # _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
     hcp: List[torch.distributed.ProcessGroup] = field(init=False)
+
+    # Decode context parallel: a sub-group of TP, set only by inference shard construction.
+    dcp: torch.distributed.ProcessGroup = field(init=False)
 
     # Expert Parallelism Process Groups
     # _EXPERT_MODEL_PARALLEL_GROUP
@@ -336,6 +341,8 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
             'expt_dp_ag': lambda: None,
+            # MPU has no decode context parallel group; only inference shards build one.
+            'dcp': lambda: None,
             'tp_dp_cp': partial(
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,

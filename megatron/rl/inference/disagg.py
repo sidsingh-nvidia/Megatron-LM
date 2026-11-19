@@ -55,6 +55,9 @@ def build_disagg_inference_model(
         total_world_size=args.world_size,
         shards=args.inference_shards,
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        num_kv_heads=(
+            None if transformer_config.multi_latent_attention else transformer_config.num_query_groups
+        ),
     )
     local_shards = [shard for shard in shards if shard.pg_collection is not None]
     if len(local_shards) != 1:

@@ -15,6 +15,44 @@ from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_sh
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
+def get_decode_context_parallel_size(tp_size: int, num_kv_heads: Optional[int]) -> int:
+    """Number of TP ranks that hold the same KV head (1 when every rank has its own heads).
+
+    With fewer KV heads than TP ranks, attention gives TP rank ``r`` KV head
+    ``r // (tp_size // num_kv_heads)``, so each head is held by ``tp_size // num_kv_heads``
+    consecutive TP ranks. Decode context parallelism splits that head's KV cache by token across
+    those ranks instead of replicating it. ``num_kv_heads=None`` (e.g. MLA) means no KV heads to
+    share.
+    """
+    if num_kv_heads is None or num_kv_heads >= tp_size:
+        return 1
+    assert tp_size % num_kv_heads == 0, (
+        f"TP size ({tp_size}) must be a multiple of the number of KV heads ({num_kv_heads})"
+    )
+    return tp_size // num_kv_heads
+
+
+def register_decode_context_parallel_view(
+    decoder_grid: HyperCommGrid, dcp_size: int, use_tp_pp_dp_mapping: bool = False
+) -> None:
+    """Register the ``dcp`` view of ``decoder_grid``: TP split into ``dcp`` x ``tp_head``.
+
+    ``dcp`` varies fastest, so each ``dcp`` group is the ``dcp_size`` consecutive TP ranks that
+    hold one KV head (see :func:`get_decode_context_parallel_size`). The other dims are shared
+    with the base view, which checks that they enumerate the same rank groups.
+    """
+    sizes = dict(zip(decoder_grid.dim_names, decoder_grid.shape))
+    tp_size = sizes["tp"]
+    assert tp_size % dcp_size == 0, f"DCP size ({dcp_size}) must divide TP size ({tp_size})"
+    rest = ["cp", "pp", "dp"] if use_tp_pp_dp_mapping else ["cp", "dp", "pp"]
+    decoder_grid.register_view(
+        "dcp",
+        [dcp_size, tp_size // dcp_size] + [sizes[d] for d in rest],
+        ["dcp", "tp_head"] + rest,
+        shared_dims=rest,
+    )
+
+
 def build_inference_pg_collection(
     world_size: int,
     tp_size: Optional[int] = None,
@@ -24,6 +62,7 @@ def build_inference_pg_collection(
     expt_tp_size: Optional[int] = None,
     use_tp_pp_dp_mapping: bool = False,
     rank_offset: int = 0,
+    num_kv_heads: Optional[int] = None,
 ) -> ProcessGroupCollection:
     """Build a ProcessGroupCollection for one inference model.
 
@@ -45,6 +84,9 @@ def build_inference_pg_collection(
             collocated inference (shares ranks with training); use a non-zero
             offset for non-collocated setups where inference ranks are disjoint
             from training ranks.
+        num_kv_heads: Number of KV heads (query groups) of the model's attention, which sets
+            the decode context parallel group (see
+            :func:`get_decode_context_parallel_size`). ``None`` gives size-1 groups.
 
     Returns:
         ProcessGroupCollection configured for the inference model. On ranks
@@ -99,6 +141,10 @@ def build_inference_pg_collection(
     tp_cp_group = decoder_grid.create_pg(["tp", "cp"])
     dp_cp_group = decoder_grid.create_pg(["cp", "dp"])
     tp_dp_cp_group = decoder_grid.create_pg(["tp", "cp", "dp"])
+    register_decode_context_parallel_view(
+        decoder_grid, get_decode_context_parallel_size(tp_size, num_kv_heads), use_tp_pp_dp_mapping
+    )
+    dcp_group = decoder_grid.create_pg("dcp", view="dcp")
 
     if use_tp_pp_dp_mapping:
         expert_grid = HyperCommGrid(
@@ -151,6 +197,7 @@ def build_inference_pg_collection(
         pos_embd=pos_embd_group,
         dp=dp_group,
         tp_cp=tp_cp_group,
+        dcp=dcp_group,
         mp=mp_group,
         expt_tp=expt_tp_group,
         expt_dp=expt_dp_group,
@@ -201,6 +248,7 @@ def build_inference_pg_collections_for_shards(
     total_world_size: int,
     shards: Union[str, Sequence[InferenceShardSpec], Sequence[dict]],
     use_tp_pp_dp_mapping: bool = False,
+    num_kv_heads: Optional[int] = None,
 ) -> List[InferenceShard]:
     """Build one ProcessGroupCollection per heterogeneous inference shard.
 
@@ -220,6 +268,7 @@ def build_inference_pg_collections_for_shards(
             spec string, a list of :class:`InferenceShardSpec`, or a list of
             raw dicts. Normalized internally to validated specs.
         use_tp_pp_dp_mapping: Passed through to ``build_inference_pg_collection``.
+        num_kv_heads: Passed through to ``build_inference_pg_collection``.
 
     Returns:
         List of :class:`InferenceShard`, one per input spec.
@@ -245,6 +294,7 @@ def build_inference_pg_collections_for_shards(
             expt_tp_size=expt_tp,
             use_tp_pp_dp_mapping=use_tp_pp_dp_mapping,
             rank_offset=offset,
+            num_kv_heads=num_kv_heads,
         )
         shard_group = dist.new_group(ranks=list(range(offset, offset + shard_world)))
         in_shard = offset <= rank < offset + shard_world

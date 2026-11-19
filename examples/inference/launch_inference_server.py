@@ -30,6 +30,7 @@ from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
     get_model_for_inference,
+    get_num_kv_heads,
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -91,7 +92,9 @@ def _build_model_and_inference_config(args):
 
     if spec_declares_disaggregation(args.inference_shards):
         world_size = dist.get_world_size()
-        shards = build_inference_pg_collections_for_shards(world_size, args.inference_shards)
+        shards = build_inference_pg_collections_for_shards(
+            world_size, args.inference_shards, num_kv_heads=get_num_kv_heads(args)
+        )
         local_shard = next(shard for shard in shards if shard.pg_collection is not None)
         if local_shard.spec.role == "prefill":
             # Prefill pools run the vLLM grouped GEMM (the context pins its token-count hint to
