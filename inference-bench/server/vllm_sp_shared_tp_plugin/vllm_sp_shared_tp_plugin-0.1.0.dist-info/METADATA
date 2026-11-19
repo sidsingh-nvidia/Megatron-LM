@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: vllm-sp-shared-tp-plugin
+Version: 0.1.0
+Summary: Keeps Nemotron-H's MoE shared expert TP-sharded under vLLM's sequence-parallel MoE.
