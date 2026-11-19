@@ -5,7 +5,7 @@
 #
 # Serve Nemotron nano-3.5, Super v3 or Ultra v3 with vLLM (4 GPUs per node), as the vLLM
 # counterpart of launch_minf.sh: same experiment directory, same port (5000), and the same
-# handshake with client.sh (config.env, then <exp dir>/host when ready; <exp dir>/done stops it).
+# handshake with client.sh (config.env, then <exp dir>/host when ready; the client's scancel stops it).
 #
 # One vLLM engine spans the whole job: TP within each data-parallel rank, DP over the rest of the
 # GPUs, and --enable-expert-parallel, so the experts are sharded over all of them (EP = all GPUs).
@@ -61,8 +61,16 @@ NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 # A broken transformers under ~/.local would shadow the container's copy in the API-server workers.
 export PYTHONNOUSERSITE=1
-export TRITON_CACHE_DIR=/tmp/triton_cache TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache
-export VLLM_CACHE_ROOT=/tmp/vllm_cache
+# Per-job node-local scratch (cleared after the job) for compile caches, temp files and the live
+# log; nothing there is needed once the job ends.
+# (In the container $USER is root; SLURM_JOB_USER is the submitting user.)
+SCRATCH=${INFERENCE_BENCH_SCRATCH:-/raid/scratch}/${SLURM_JOB_USER:-${USER}}/${SLURM_JOB_ID:-local}
+export TMPDIR=${SCRATCH}/tmp_node${NODE_RANK}
+mkdir -p "${TMPDIR}"
+export TRITON_CACHE_DIR=${SCRATCH}/triton_cache TORCHINDUCTOR_CACHE_DIR=${SCRATCH}/inductor_cache
+export VLLM_CACHE_ROOT=${SCRATCH}/vllm_cache
+# Unbuffered, so a node stopped by SIGTERM loses none of its log.
+export PYTHONUNBUFFERED=1
 # PROFILE=1: nsys around vllm serve (vLLM profiling guide). The worker processes must be spawned,
 # not forked, for nsys to follow them.
 if [ "${PROFILE:-0}" == "1" ]; then
@@ -175,7 +183,14 @@ fi
 # shellcheck disable=SC2206  # EXTRA_ARGS is a flag list
 ARGS+=(${EXTRA_ARGS:-})
 
-LOG="${EXP_DIR}/server_node${NODE_RANK}.log"
+# Live log on node-local scratch; the EXIT trap (normal exit, failure, or SIGTERM from a client's
+# scancel) stops the server and copies the log to EXP_DIR as server_node<N>.log.
+LOG="${SCRATCH}/server_node${NODE_RANK}.log"
+# SIGTERM is the normal stop: exit 0 (after the EXIT trap below), since a non-zero exit would make
+# KillOnBadExit SIGKILL the other nodes while they copy their logs.
+trap 'exit 0' TERM
+trap '[ -n "${SERVER_PID:-}" ] && kill -TERM "${SERVER_PID}" 2>/dev/null
+      cp "${LOG}" "${EXP_DIR}/server_node${NODE_RANK}.log" 2>/dev/null' EXIT
 if [ "${NODE_RANK}" == "0" ]; then
     # client.sh finds this directory by the SLURM_JOB_ID line and reads TOKENIZER from it.
     cat > "${EXP_DIR}/config.env" <<EOF
@@ -196,28 +211,33 @@ fi
 "${PRE[@]}" vllm serve "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
-# Serve until <exp dir>/done appears (written by client.sh) or the server dies.
-serve_until_done() {
-    while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 2; done
-    # Under nsys, give it time to write the report of the last capture range, then stop it with
-    # SIGINT, which nsys handles by finalizing rather than dropping the report.
+# Serve until the server exits. Normally the client job's scancel ends the deployment (SIGTERM;
+# the EXIT trap stops the server). Under PROFILE the client skips scancel and touches
+# <exp dir>/done instead: each node waits for it, gives nsys time to write the report of the last
+# capture range, then stops it with SIGINT, which nsys handles by finalizing the report.
+serve() {
     if [ "${PROFILE:-0}" == "1" ]; then
+        while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${EXP_DIR}/done" ]; do sleep 10; done
         sleep 60
         kill -INT "${SERVER_PID}" 2>/dev/null
-    else
-        kill "${SERVER_PID}" 2>/dev/null
+        wait "${SERVER_PID}"
+        exit 0
     fi
     wait "${SERVER_PID}"
-    exit 0
+    local status=$?
+    # The server exited on its own: a failure. Tell a waiting client, and exit non-zero so Slurm
+    # stops every node (KillOnBadExit).
+    touch "${EXP_DIR}/server_failed" "${EXP_DIR}/done"
+    exit $(( status == 0 ? 1 : status ))
 }
 
-[ "${NODE_RANK}" != "0" ] && serve_until_done
+[ "${NODE_RANK}" != "0" ] && serve
 
 # Node 0: wait for the API server, then advertise it to client.sh.
 until grep -q "Application startup complete." "${LOG}" 2>/dev/null; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        echo "Server exited during startup; see ${LOG}"
-        touch "${EXP_DIR}/done"
+        echo "Server exited during startup; see ${EXP_DIR}/server_node${NODE_RANK}.log"
+        touch "${EXP_DIR}/server_failed" "${EXP_DIR}/done"
         exit 1
     fi
     sleep 5
@@ -225,4 +245,4 @@ done
 echo "Server ready."
 echo "Server reachable at: http://$(hostname):5000/v1"
 hostname > "${EXP_DIR}/host.tmp" && mv "${EXP_DIR}/host.tmp" "${EXP_DIR}/host"  # atomic: client.sh reads it
-serve_until_done
+serve
