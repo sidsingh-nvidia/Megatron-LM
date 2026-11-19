@@ -78,7 +78,8 @@
 #                      (default: TP / all prefill GPUs / ETP). Other knobs apply to both pools.
 #                                                                 (default: 0 = aggregated)
 #   PREFILL_NODES      with PD=1: prefill-pool nodes                         (default: 1)
-#   DONE_FILE          file that stops the server when it appears  (default: <exp dir>/done)
+#   DONE_FILE          file that stops the server when it appears; one watcher per job checks it
+#                      every 10 s (default: <exp dir>/done)
 #   EXP_DIR            experiment directory (default: a new timestamped one)
 #   PROFILE            1 = run every rank under nsys (capture range = cudaProfilerApi) and have the
 #                      client wrap the timed iterations of the first BENCH batch size in
@@ -133,10 +134,27 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         --container-image "${INFERENCE_BENCH_SERVE_IMAGE:?set in cluster.env}" \
         --container-name "inference_bench_${SLURM_JOB_ID}" \
         --container-mounts "${INFERENCE_BENCH_MOUNTS:?set in cluster.env}" \
-        --container-workdir="${PWD}" bash "${EXP_DIR}/launch_minf.sh"
+        --container-workdir="${PWD}" bash "${EXP_DIR}/launch_minf.sh" &
+    SRUN_PID=$!
+    # One watcher per job, not per rank: when DONE_FILE appears (the in-job sweep or a colocated
+    # client finished), SIGTERM every rank with scancel --signal (which signals the tasks without
+    # cancelling the job; signalling srun itself would SIGKILL them before their EXIT traps copy
+    # the logs). A separate client job does the same. A rank whose server dies exits non-zero, and
+    # KillOnBadExit ends the step. Under PROFILE the servers exit on their own once profiling
+    # stops; a SIGTERM could cut off nsys while it writes the reports.
+    while kill -0 "${SRUN_PID}" 2>/dev/null; do
+        if [ "${PROFILE:-0}" != "1" ] && [ -f "${DONE_FILE}" ]; then
+            scancel --signal=TERM "${SLURM_JOB_ID}"
+            break
+        fi
+        sleep 10
+    done
+    wait "${SRUN_PID}"
     status=$?
-    # The client touches DONE_FILE when its sweep ends, which stops the server. If the server
-    # stopped first (e.g. a startup failure), touch it so a client still waiting exits too.
+    # Stopped on DONE_FILE by this watcher or a client: the normal end, unless a server failed.
+    [ -f "${DONE_FILE}" ] && [ ! -f "${EXP_DIR}/server_failed" ] && status=0
+    # If the server stopped first (e.g. a startup failure), touch DONE_FILE so a client still
+    # waiting exits too.
     if [ -n "${CLIENT_PID}" ]; then
         touch "${DONE_FILE}"
         wait "${CLIENT_PID}"
@@ -155,8 +173,16 @@ JOB_NODES=${SLURM_JOB_NUM_NODES:-1}
 POOL_NODES=${JOB_NODES}
 [ "${PD:-0}" == "1" ] && POOL_NODES=$(( JOB_NODES - ${PREFILL_NODES:-1} ))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export TRITON_CACHE_DIR=/tmp/triton_cache_${RANK}
-export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache_${RANK}
+# Per-job node-local scratch (cleared after the job) for compile caches, temp files and the live
+# log; nothing there is needed once the job ends.
+# (In the container $USER is root; SLURM_JOB_USER is the submitting user.)
+SCRATCH=${INFERENCE_BENCH_SCRATCH:-/raid/scratch}/${SLURM_JOB_USER:-${USER}}/${SLURM_JOB_ID:-local}
+export TMPDIR=${SCRATCH}/tmp_rank${RANK}
+mkdir -p "${TMPDIR}"
+export TRITON_CACHE_DIR=${SCRATCH}/triton_cache_rank${RANK}
+export TORCHINDUCTOR_CACHE_DIR=${SCRATCH}/inductor_cache_rank${RANK}
+# Unbuffered, so a rank stopped by SIGTERM loses none of its log.
+export PYTHONUNBUFFERED=1
 
 if [ "${PD:-0}" == "1" ]; then
     # The KV hand-off needs prefix caching; math prompts share no prefixes, so the Mamba prefix
@@ -176,7 +202,7 @@ root = os.path.dirname(os.path.dirname(spec.origin)) if spec else ""
 print(next(iter(sorted(glob.glob(os.path.join(root, "nixl_cu13.libs", "libucs-*.so*")))), ""))')
     if [ -z "${NIXL_UCS}" ]; then
         echo "PD=1 needs NIXL (nixl + nixl-cu13); use the +nixl image or set NIXL_PYTHONPATH"
-        touch "${DONE_FILE}"
+        touch "${EXP_DIR}/server_failed" "${DONE_FILE}"
         exit 1
     fi
     export LD_PRELOAD="${NIXL_UCS}${LD_PRELOAD:+:${LD_PRELOAD}}"
@@ -325,12 +351,17 @@ ARGS+=(--inference-cuda-graph-max-tokens "${CUDA_GRAPH_MAX_TOKENS:-2048}")
 [ "${FP8_RECIPE:-}" == "mxfp8" ] && ARGS+=(--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather --stream-ckpt-dequant)
 [ "${SHARED_EXPERT_OVERLAP:-1}" == "1" ] && ARGS+=(--moe-shared-expert-overlap)
 
-# Log to node-local disk; frequent writes to lustre stall the rank (and, through EP, every rank).
-# Copied to EXP_DIR as server_rank<N>.log when the rank exits, including on failure.
-# The log lives in the container's /tmp; to follow it live:
-#   srun --jobid <id> --overlap --container-name inference_bench_<id> tail -f /tmp/inference_bench_server_rank0_<id>.log
-LOG="/tmp/inference_bench_server_rank${RANK}_${SLURM_JOB_ID:-local}.log"
-trap 'cp "${LOG}" "${EXP_DIR}/server_rank${RANK}.log" 2>/dev/null' EXIT
+# Log to node-local scratch; frequent writes to shared storage stall the rank (and, through EP,
+# every rank). When the rank exits -- normally, on failure, or on SIGTERM from the job's DONE_FILE
+# watcher or a client's scancel -- the EXIT trap stops the server and copies the log to EXP_DIR as
+# server_rank<N>.log. To follow it live:
+#   srun --jobid <id> --overlap tail -f /raid/scratch/<user>/<id>/server_rank0.log
+LOG="${SCRATCH}/server_rank${RANK}.log"
+# SIGTERM is the normal stop: exit 0 (after the EXIT trap below), since a non-zero exit would make
+# KillOnBadExit SIGKILL the other ranks while they copy their logs.
+trap 'exit 0' TERM
+trap '[ -n "${SERVER_PID:-}" ] && kill -TERM -- "-${SERVER_PID}" 2>/dev/null
+      cp "${LOG}" "${EXP_DIR}/server_rank${RANK}.log" 2>/dev/null' EXIT
 if [ "${RANK}" == "0" ]; then
     cat > "${EXP_DIR}/config.env" <<EOF
 EXP_NAME=${EXP_NAME:-run}
@@ -357,28 +388,21 @@ fi
 # to the server alone would leave running.
 setsid "${PRE[@]}" python "${SERVER}" "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
-stop_server() {
-    kill -TERM -- "-${SERVER_PID}" 2>/dev/null
-}
 
-# Serve until DONE_FILE (<exp dir>/done) appears (written by the in-job sweep or by client.sh) or the server
-# dies. Under PROFILE the server shuts itself down when profiling stops; killing it early would
-# cut off nsys while it writes the report.
-serve_until_done() {
-    if [ "${PROFILE:-0}" == "1" ]; then
-        wait "${SERVER_PID}"
-        exit 0
-    fi
-    while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${DONE_FILE}" ]; do sleep 2; done
-    # A rank whose server died ends the deployment (in PD, both pools).
-    kill -0 "${SERVER_PID}" 2>/dev/null || touch "${DONE_FILE}"
-    stop_server
-    # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
+# Serve until the server exits. Ranks do not poll for the end: the deployment is stopped by
+# SIGTERM (the job's DONE_FILE watcher, or scancel from a client job), on which the EXIT trap
+# stops the server. Under PROFILE the server shuts itself down when profiling stops.
+serve() {
     wait "${SERVER_PID}"
-    exit 0
+    local status=$?
+    [ "${PROFILE:-0}" == "1" ] && exit 0
+    # The server exited on its own: a failure. Tell a waiting client, and exit non-zero so Slurm
+    # stops every rank (KillOnBadExit), in PD both pools.
+    touch "${EXP_DIR}/server_failed" "${DONE_FILE}"
+    exit $(( status == 0 ? 1 : status ))
 }
 
-[ "${RANK}" != "0" ] && serve_until_done
+[ "${RANK}" != "0" ] && serve
 
 # Rank 0 hosts the HTTP frontends (all replicas are listening once the server logs that it
 # started them; /health then answers). Wait for it, then either run the client sweep or serve.
@@ -391,13 +415,8 @@ except Exception:
 }
 until server_ready; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        echo "Server exited during startup; see ${LOG}"
-        touch "${DONE_FILE}"
-        exit 1
-    fi
-    if [ -f "${DONE_FILE}" ]; then
-        echo "Stopped during startup (${DONE_FILE} appeared)"
-        stop_server
+        echo "Server exited during startup; see ${EXP_DIR}/server_rank${RANK}.log"
+        touch "${EXP_DIR}/server_failed" "${DONE_FILE}"
         exit 1
     fi
     sleep 5
@@ -421,6 +440,7 @@ if [ -n "${BENCH:-}" ]; then
         --pause "${BENCH_PAUSE:-0}" \
         $([ "${PROFILE:-0}" == "1" ] && { [ "${PROFILE_ALL:-0}" == "1" ] && echo --profile-all || echo --profile; }) \
         2>&1 | tee "${EXP_DIR}/bench.log"
+    # The job's watcher sees this and stops every rank.
     touch "${DONE_FILE}"
 fi
-serve_until_done
+serve
