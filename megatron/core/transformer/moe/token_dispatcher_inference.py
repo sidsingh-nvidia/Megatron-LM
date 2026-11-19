@@ -44,10 +44,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
 from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
@@ -523,37 +521,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
-        # When shared_expert_overlap is enabled, the shared expert forward is launched
-        # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
-        self._shared_expert_output: Optional[torch.Tensor] = None
-        # When True, the layer (not the dispatcher) is responsible for launching the
-        # shared expert and adding its output. Used for the latent-MoE inference path
-        # where the shared expert must run on full hidden_states (pre-latent) and the
-        # add must happen post-latent-back-projection — both outside the dispatcher's
-        # view. The dispatcher still tracks self.shared_experts so other side-effects
-        # (e.g. AGV CTA cap) keep working.
-        self._external_shared_expert_launch: bool = False
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
         """Store routing map and local token count; no inter-rank communication.
 
-        If shared_expert_overlap is enabled (set_shared_experts has been called)
-        AND _external_shared_expert_launch is False, launch the entire shared-
-        expert forward on SharedExpertMLP.stream so it runs concurrently with
-        AGV dispatch, expert GEMMs, and RSV combine.
-
-        When _external_shared_expert_launch is True (latent-MoE inference path),
-        the layer launches the shared expert before its fc1_latent_proj on the
-        full hidden_states; the dispatcher does not launch it here.
+        With shared-expert overlap, the MoE layer launches the shared expert after the
+        dispatch and adds it back after the combine (see MoELayer.dispatch / combine).
         """
         self.hidden_shape = hidden_states.shape
-        if self.shared_experts is not None and not self._external_shared_expert_launch:
-            stream = SharedExpertMLP.stream
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
@@ -701,19 +678,5 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):
-        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
-
-        If shared_expert_overlap is enabled AND _external_shared_expert_launch
-        is False, join SharedExpertMLP.stream and add the shared-expert output
-        produced concurrently during dispatch+combine.
-
-        When _external_shared_expert_launch is True (latent-MoE inference path),
-        the join+add happens in the layer's postprocess after fc2_latent_proj,
-        so we only restore the shape here.
-        """
-        output = hidden_states.view(self.hidden_shape)
-        if self._shared_expert_output is not None:
-            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-            output = output + self._shared_expert_output
-            self._shared_expert_output = None
-        return output
+        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H])."""
+        return hidden_states.view(self.hidden_shape)

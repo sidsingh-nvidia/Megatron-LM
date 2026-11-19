@@ -202,6 +202,8 @@ class SharedExpertMLP(MLP):
             if SharedExpertMLP.stream is None:
                 SharedExpertMLP.stream = torch.cuda.Stream()
             self.stream = SharedExpertMLP.stream
+            # Recorded on SharedExpertMLP.stream after an inference overlap launch.
+            self._inference_overlap_done: Optional[torch.cuda.Event] = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
@@ -210,6 +212,43 @@ class SharedExpertMLP(MLP):
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
             output = output * gate_score
+        return output
+
+    def inference_overlap_launch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Launch the inference forward on SharedExpertMLP.stream, ordered after the dispatch.
+
+        Call after the routed dispatch has been enqueued on the calling stream. The shared
+        expert's TP all-gather and reduce-scatter spin-wait on peer GPUs, as do the routed
+        dispatch and combine. Spin-waiting collectives on two concurrent streams can deadlock:
+        GPUs may schedule them in different orders, and each kernel needs every block resident
+        on every rank (with one rank stalled on the host, e.g. loading a kernel, the others
+        spin). So the side stream waits for everything enqueued so far, the dispatch included,
+        and inference_overlap_wait_before_combine holds the combine until this forward is done.
+        Every GPU then runs dispatch, the shared expert's collectives and the combine in the
+        same order, one at a time, while the shared GEMMs still overlap the routed experts.
+
+        Args:
+            hidden_states: [S/TP, B, H] sequence-parallel input.
+
+        Returns:
+            The side-stream output; pass it to inference_overlap_join.
+        """
+        stream = SharedExpertMLP.stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            output = apply_module(self)(hidden_states)
+        if self._inference_overlap_done is None:
+            self._inference_overlap_done = torch.cuda.Event()
+        self._inference_overlap_done.record(stream)
+        return output
+
+    def inference_overlap_wait_before_combine(self) -> None:
+        """Make the calling stream wait for the forward launched by inference_overlap_launch."""
+        torch.cuda.current_stream().wait_event(self._inference_overlap_done)
+
+    def inference_overlap_join(self, output: torch.Tensor) -> torch.Tensor:
+        """Join SharedExpertMLP.stream and return the overlapped output on the calling stream."""
+        torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
         return output
 
     def sharded_state_dict(
