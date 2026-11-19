@@ -239,6 +239,11 @@ class ShortcutMoEBlock(MegatronModule):
             else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+        # Inference overlap ordering of the two streams' collectives (see
+        # _forward_inference_overlap): dispatch, then the main stream's TP collectives, then
+        # the combine.
+        self.dispatch_done_event = torch.cuda.Event() if self.overlap_mode else None
+        self.main_collectives_done_event = torch.cuda.Event() if self.overlap_mode else None
 
     def setup_inference_overlap(self) -> None:
         """Create synchronization state and check stream ownership before graph capture.
@@ -249,6 +254,10 @@ class ShortcutMoEBlock(MegatronModule):
         """
         if self.route_ready_event is None:
             self.route_ready_event = torch.cuda.Event()
+        if self.dispatch_done_event is None:
+            self.dispatch_done_event = torch.cuda.Event()
+        if self.main_collectives_done_event is None:
+            self.main_collectives_done_event = torch.cuda.Event()
         if get_pg_size(self.tp_group) > 1:
             mlp = self.moe_layer.mlp
             if not isinstance(getattr(mlp, "router", None), InferenceTopKRouter) or not (
@@ -492,7 +501,7 @@ class ShortcutMoEBlock(MegatronModule):
         stream. CUDA graphs capture the input-ready fork and the join before
         the residual write.
 
-        Collective ownership, which makes TP>1 safe without ordering the two streams:
+        Collective ownership:
 
         - Main stream: every TP-group collective. That is the predecessor's and the shared
           expert's sequence-parallel all-gathers and reduce-scatters, on the "tp" symmetric
@@ -506,9 +515,16 @@ class ShortcutMoEBlock(MegatronModule):
           AllGather-V, so no TP gather is needed first. Expert-TP partial sums are added by
           the ReduceScatter-V.
 
-        Each stream therefore issues its collectives in program order, which is the same on
-        every rank, and nothing on the main stream waits on the shortcut stream before the
-        join. Configurations that would break this (shared-expert overlap, fused TP
+        Each stream issues its collectives in program order, the same on every rank. That is
+        not enough on its own: the collectives spin-wait on peer GPUs, and spin-waiting kernels
+        on two concurrent streams can deadlock when GPUs schedule them in different orders
+        (each needs all its blocks resident on every rank, and a rank stalled on the host, e.g.
+        loading a kernel, leaves its peers spinning). So the two streams' collectives are also
+        ordered against each other, the same way on every rank: the dispatch, then the main
+        stream's TP collectives (predecessor and shared expert), then the combine. The routed
+        expert GEMMs still overlap the predecessor and the shared expert.
+
+        Configurations that would put collectives elsewhere (shared-expert overlap, fused TP
         communication, batch-invariant collectives, non-NVLS dispatch) are rejected by
         `InferenceConfig.validate_shortcut_moe_model` and `setup_inference_overlap`.
         """
@@ -551,12 +567,14 @@ class ShortcutMoEBlock(MegatronModule):
                 dispatched_input, dispatched_probs = self._launch_dispatch(
                     route_input, route_probs, async_op=False
                 )
+                self.dispatch_done_event.record(shortcut_stream)
 
                 routed_output, _ = self.moe_layer.mlp.routed_experts_compute(
                     dispatched_input, dispatched_probs
                 )
-                combined_output = self._launch_combine(routed_output, async_op=False)
 
+        # The main stream's TP collectives start after the dispatch.
+        main_stream.wait_event(self.dispatch_done_event)
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
             compute_output = self._forward_compute_atomic(
                 hidden_states,
@@ -575,6 +593,11 @@ class ShortcutMoEBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 recompute_context=None,
             )
+            # The combine starts after the main stream's TP collectives.
+            self.main_collectives_done_event.record(main_stream)
+            with torch.cuda.stream(shortcut_stream):
+                shortcut_stream.wait_event(self.main_collectives_done_event)
+                combined_output = self._launch_combine(routed_output, async_op=False)
             combined_output = self._wait_combine(combined_output)
             return self._postprocess(
                 residual=residual,

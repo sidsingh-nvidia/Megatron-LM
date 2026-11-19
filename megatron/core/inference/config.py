@@ -909,8 +909,9 @@ class InferenceConfig:
             raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
         if model_config.context_parallel_size != 1:
             raise ValueError("inference_shortcut_moe_overlap requires CP=1")
-        # TP > 1 is safe because every TP-group collective stays on the main stream: see
-        # ShortcutMoEBlock._forward_inference_overlap. These checks keep it that way.
+        # TP > 1: every TP-group collective stays on the main stream, ordered between the
+        # shortcut stream's dispatch and combine (see ShortcutMoEBlock._forward_inference_overlap).
+        # These checks keep the collectives on those two streams.
         if model_config.tensor_model_parallel_size > 1 and not model_config.sequence_parallel:
             raise ValueError("inference_shortcut_moe_overlap with TP>1 requires sequence_parallel")
         if model_config.moe_shared_expert_overlap:
