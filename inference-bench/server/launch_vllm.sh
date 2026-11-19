@@ -28,6 +28,10 @@
 #                   reduce-scatter-v (vLLM backend nvlink_allgather_reducescatter, loaded as a plugin
 #                   from NVLINK_AGRS_PLUGIN over allgather_reducescatter); needs DP > 1  (default: 0)
 #   NVLINK_AGRS_PLUGIN  plugin directory (default: tmp/vllm-nvls/tools/nvlink_agrs_plugin)
+#   SP_SHARED_TP    1 = keep the Nemotron-H shared expert TP-sharded under sequence-parallel MoE
+#                   (EP with TP > 1 and DP > 1) instead of replicated, via the vLLM general plugin
+#                   in SP_SHARED_TP_PLUGIN (default: inference-bench/server/vllm_sp_shared_tp_plugin)
+#                   (default: 0)
 #   PROFILE         1 = run vllm serve under nsys (installed from NVIDIA's devtools apt repo if the
 #                   image has none) with vLLM's CUDA profiler, as in vLLM's profiling guide:
 #                   capture range = cudaProfilerApi, driven by the client's /start_profile and
@@ -89,6 +93,15 @@ if [ "${NVLINK_AGRS:-0}" == "1" ]; then
     [ -d "${NVLINK_AGRS_PLUGIN}" ] || { echo "NVLINK_AGRS=1: no plugin at ${NVLINK_AGRS_PLUGIN}"; exit 1; }
     export PYTHONPATH=${NVLINK_AGRS_PLUGIN}${PYTHONPATH:+:${PYTHONPATH}}
     export VLLM_NVLINK_AGRS=1
+fi
+# SP_SHARED_TP=1: under sequence-parallel MoE (EP with TP > 1 and DP > 1) vLLM replicates the
+# Nemotron-H shared expert on every TP rank; this vLLM general plugin keeps it TP-sharded on the
+# full token set and folds its reduction into the MoE output's all-reduce.
+if [ "${SP_SHARED_TP:-0}" == "1" ]; then
+    SP_SHARED_TP_PLUGIN=${SP_SHARED_TP_PLUGIN:-${PWD}/inference-bench/server/vllm_sp_shared_tp_plugin}
+    [ -d "${SP_SHARED_TP_PLUGIN}" ] || { echo "SP_SHARED_TP=1: no plugin at ${SP_SHARED_TP_PLUGIN}"; exit 1; }
+    export PYTHONPATH=${SP_SHARED_TP_PLUGIN}${PYTHONPATH:+:${PYTHONPATH}}
+    export VLLM_SP_SHARED_TP=1
 fi
 # FlashInfer autotune results (keyed by FlashInfer version, GPU and model / parallel config) persist
 # across jobs when cluster.env sets a shared directory; otherwise every job retunes (~10 min).
