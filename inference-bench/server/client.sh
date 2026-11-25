@@ -10,7 +10,8 @@
 # throughput from the server's /metrics and interactivity per finished request. CLIENT=smoke runs
 # the client.py GSM8K sweep (fixed BENCH_OSL with ignore_eos).
 # Waits for the server, writes bench.log / bench.json into the server's experiment directory,
-# then touches <exp dir>/done, which shuts the server job down.
+# then touches <exp dir>/done and scancels the server job. (A client colocated in the server job
+# only touches done; the server job's watcher then stops it.)
 #
 # Run from the Megatron-LM repo root:
 #   source inference-bench/cluster.env
@@ -52,6 +53,13 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
         --container-workdir="${PWD}" bash "${COPY}"
     status=$?
     rm -f "${COPY}"
+    # Stop the server job: SIGTERM every rank (scancel --signal signals the tasks without
+    # cancelling the job), whose EXIT trap stops its server and copies its log; the job then ends
+    # normally. Not under PROFILE, where the server must finish writing its traces: a profiled
+    # Megatron server exits on its own, and vLLM nodes stop themselves on <exp dir>/done.
+    if [ "${KEEP_SERVER:-0}" != "1" ] && [ "${PROFILE:-0}" != "1" ]; then
+        scancel --signal=TERM "${SERVER_JOB}"
+    fi
     exit ${status}
 fi
 
