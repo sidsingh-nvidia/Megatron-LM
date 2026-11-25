@@ -59,7 +59,7 @@ async def test_inference_client_lifecycle():
     recv_queue = [
         [msgpack.packb([Headers.CONNECT_ACK.value, "coordinator-instance"], use_bin_type=True)],
         [
-            msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY.value, [0]], use_bin_type=True),
             msgpack.packb({"foo": "bar"}, use_bin_type=True),
         ],
     ]
@@ -212,7 +212,7 @@ async def test_terminal_error_and_abort_acknowledgement():
 
     recv_queue.append(
         [
-            msgpack.packb([Headers.ENGINE_REPLY.value, 1], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY.value, [1]], use_bin_type=True),
             msgpack.packb({}, use_bin_type=True),
         ]
     )
@@ -237,7 +237,7 @@ async def test_abort_acknowledges_racing_normal_completion(completed_before_abor
     try:
         stream = client.add_request_streaming([1, 2], SamplingParams())
         reply = [
-            msgpack.packb([Headers.ENGINE_REPLY.value, stream.request_id]),
+            msgpack.packb([Headers.ENGINE_REPLY.value, [stream.request_id]]),
             msgpack.packb({"status": "COMPLETED", "generated_tokens": [3]}),
         ]
         if completed_before_abort:

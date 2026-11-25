@@ -220,7 +220,7 @@ def test_failed_prefill_preserves_engine_error_and_releases_capacity(error_type,
     if aborted:
         assert msgpack.unpackb(response[1]) == [Headers.REQUEST_ABORTED.value, 50, True]
     else:
-        assert msgpack.unpackb(response[1]) == [Headers.ENGINE_REPLY.value, 50]
+        assert msgpack.unpackb(response[1]) == [Headers.ENGINE_REPLY.value, [50]]
         assert response[2] == body
     assert 5 not in runtime.requests
     assert 5 not in runtime.hop1_request_ids

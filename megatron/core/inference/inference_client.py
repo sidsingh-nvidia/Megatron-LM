@@ -561,6 +561,37 @@ class InferenceClient:
         self.request_submission_times[request_id] = time.perf_counter()
         return stream
 
+    def _handle_engine_reply(self, request_id: int, body: bytes) -> None:
+        """Deliver one finished request to its stream or completion future."""
+        self._mark_source_safe(request_id)
+        if request_id in self.aborted_request_ids:
+            self.aborted_request_ids.discard(request_id)
+            return
+        reply = msgpack.unpackb(body, raw=False)
+        submitted = self.request_submission_times.pop(request_id, None)
+        if submitted is not None:
+            reply['latency'] = time.perf_counter() - submitted
+        # Streaming path: deliver final reply + sentinel and stop.
+        if request_id in self.streams:
+            stream = self.streams.pop(request_id)
+            completed_request = (
+                DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+            )
+            stream.put({"final": completed_request})
+            stream.finish()
+            return
+        completion_future = self.completion_futures.pop(request_id, None)
+        if completion_future is None:
+            logging.warning("Client: ignoring late ENGINE_REPLY for request %d", request_id)
+            return
+        if completion_future.done():
+            logging.warning(f"Client: The future for {request_id} has been cancelled!")
+            return
+        completed_request = (
+            DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+        )
+        completion_future.set_result(completed_request)
+
     @trace_async_exceptions
     async def _recv_task(self):
         """
@@ -581,48 +612,20 @@ class InferenceClient:
                 data = msgpack.unpackb(frames[0], raw=False)
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
-                    request_id = data[1]
-                    self._mark_source_safe(request_id)
-                    if request_id in self.aborted_request_ids:
-                        self.aborted_request_ids.discard(request_id)
-                        continue
-                    reply = msgpack.unpackb(frames[1], raw=False)
-                    submitted = self.request_submission_times.pop(request_id, None)
-                    if submitted is not None:
-                        reply['latency'] = time.perf_counter() - submitted
-                    # Streaming path: deliver final reply + sentinel and stop.
-                    if request_id in self.streams:
-                        stream = self.streams.pop(request_id)
-                        completed_request = (
-                            DynamicInferenceRequest.deserialize(reply)
-                            if self.deserialize
-                            else reply
-                        )
-                        stream.put({"final": completed_request})
-                        stream.finish()
-                        continue
-                    completion_future = self.completion_futures.pop(request_id, None)
-                    if completion_future is None:
-                        logging.warning(
-                            "Client: ignoring late ENGINE_REPLY for request %d", request_id
-                        )
-                        continue
-                    if completion_future.done():
-                        logging.warning(f"Client: The future for {request_id} has been cancelled!")
-                        continue
-                    completed_request = (
-                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
-                    )
-                    completion_future.set_result(completed_request)
+                    # One message carries this client's finished requests of an engine step:
+                    # data[1] lists their ids, in the order of the body frames.
+                    for request_id, body in zip(data[1], frames[1:]):
+                        self._handle_engine_reply(request_id, body)
                 elif header == Headers.METRICS_REPLY:
                     future = self.metrics_futures.pop(data[1], None)
                     if future is not None and not future.done():
                         future.set_result(data[2])
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
-                    request_id = data[1]
-                    stream = self.streams.get(request_id)
-                    if stream is not None:
-                        stream.put({"partial": msgpack.unpackb(frames[1], raw=False)})
+                    # Like ENGINE_REPLY: one message per engine step, one body per request.
+                    for request_id, body in zip(data[1], frames[1:]):
+                        stream = self.streams.get(request_id)
+                        if stream is not None:
+                            stream.put({"partial": msgpack.unpackb(body, raw=False)})
                 elif header == Headers.REQUEST_ERROR:
                     request_id, reason, source_safe = data[1:]
                     self.request_submission_times.pop(request_id, None)

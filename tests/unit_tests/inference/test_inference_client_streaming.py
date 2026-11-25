@@ -34,20 +34,20 @@ async def test_add_request_streaming_emits_partials_then_final():
     recv_queue = [
         [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
         [
-            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 0], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, [0]], use_bin_type=True),
             msgpack.packb(
                 {"request_id": 0, "new_tokens": [1, 2], "new_log_probs": [-0.1, -0.2]},
                 use_bin_type=True,
             ),
         ],
         [
-            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 0], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, [0]], use_bin_type=True),
             msgpack.packb(
                 {"request_id": 0, "new_tokens": [3], "new_log_probs": [-0.3]}, use_bin_type=True
             ),
         ],
         [
-            msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY.value, [0]], use_bin_type=True),
             msgpack.packb({"request_id": 0, "generated_tokens": [1, 2, 3]}, use_bin_type=True),
         ],
     ]
@@ -106,7 +106,7 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
     recv_queue = [
         [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
         [
-            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 42], use_bin_type=True),
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, [42]], use_bin_type=True),
             msgpack.packb({"request_id": 42, "new_tokens": [9]}, use_bin_type=True),
         ],
     ]

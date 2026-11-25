@@ -33,6 +33,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import (
+    IncrementalReasoningChatParser,
     StreamingChatParser,
     json_safe_logprobs,
     json_safe_top_n_logprobs,
@@ -1139,14 +1140,38 @@ def _streaming_chat_parsers(parsers, options, n):
         )
         return parsed_text, metadata
 
-    return [
-        StreamingChatParser(
+    def full_parser():
+        return StreamingChatParser(
             parse_streaming_text,
             marker_prefixes=marker_prefixes,
             named_tool_choice=options.is_named_tool_choice,
         )
-        for _ in range(n)
-    ]
+
+    if _incremental_reasoning_applies(parsers, options):
+        return [IncrementalReasoningChatParser(full_parser()) for _ in range(n)]
+    return [full_parser() for _ in range(n)]
+
+
+def _incremental_reasoning_applies(parsers, options):
+    """Whether `IncrementalReasoningChatParser` yields exactly the `StreamingChatParser` deltas.
+
+    True for one `<think>` reasoning parser plus any tool parsers when tools are not requested
+    (`apply_parsers` then discards tool-parser output, and no implicit reasoning end markers or
+    content markers apply), unless the reasoning is surfaced as content.
+    """
+    reasoning = [name for name in parsers if name in ("deepseek-r1-reasoning", "nemotron-v3-reasoning")]
+    others = [name for name in parsers if name not in reasoning]
+    return (
+        len(reasoning) == 1
+        and all(name in ("qwen3-coder-tool", "qwen3-coder-tool-combined") for name in others)
+        and not options.tools_requested
+        and not (
+            reasoning[0] == "nemotron-v3-reasoning"
+            and PARSER_MAPPING["nemotron-v3-reasoning"]._should_force_content(
+                options.chat_template_kwargs
+            )
+        )
+    )
 
 
 def _logprob_token(token, logprob, top_logprobs=None):
