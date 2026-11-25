@@ -478,11 +478,32 @@ class DataParallelInferenceCoordinator:
             status=Status.FAILED,
         )
         failed_request.add_event_fail()
-        metadata = msgpack.packb([Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True)
         body = msgpack.packb(failed_request.serialize(), use_bin_type=True)
         logging.error("Coordinator: failing request %d: %s", request_id, reason)
-        self._send_to_client([client_identity, metadata, body])
+        self._send_replies_to_clients(Headers.ENGINE_REPLY, [(client_identity, client_request_id, body)])
         return True
+
+    def _send_replies_to_clients(self, header, replies):
+        """Forward reply bodies to their clients, one message per client.
+
+        An engine step yields replies for many requests, owned by a few clients (frontends). Each
+        client gets one message ``[identity, msgpack([header, [client_request_id, ...]]), body,
+        ...]`` with its bodies in order, so the cost of this loop scales with engine steps times
+        clients rather than with requests -- or, for streaming partials, with generated tokens.
+
+        Args:
+            header (Headers): ENGINE_REPLY or ENGINE_REPLY_PARTIAL.
+            replies (list): ``(client_identity, client_request_id, body)`` tuples; bodies are
+                forwarded untouched.
+        """
+        by_client = {}
+        for client_identity, client_request_id, body in replies:
+            ids, bodies = by_client.setdefault(client_identity, ([], []))
+            ids.append(client_request_id)
+            bodies.append(body)
+        for client_identity, (ids, bodies) in by_client.items():
+            metadata = msgpack.packb([header.value, ids], use_bin_type=True)
+            self._send_to_client([client_identity, metadata, *bodies])
 
     def _broadcast_to_engines(self, payload):
         """Send a deserialized payload to every connected data parallel rank."""

@@ -240,6 +240,111 @@ class StreamingChatParser:
         return _finish_reason(result)
 
 
+class IncrementalReasoningChatParser:
+    """`StreamingChatParser` for `<think>` reasoning without tools, at a per-delta cost.
+
+    `StreamingChatParser.parse` re-parses the whole accumulated text on every streamed delta, so a
+    response costs time quadratic in its length. This produces the same deltas for the case it
+    covers -- a DeepSeek-R1-style reasoning parser (`<think>...</think>`), tools not requested
+    (any tool parser's result is then discarded), and reasoning not surfaced as content -- by
+    keeping the split points and the sent prefixes as offsets into the append-only text and
+    searching only what is new. The rare structural changes (a `<think>` that opens late, a
+    partial `</think>` resolving) fall back to the same string comparison as the full parser.
+    When the tool parser's trigger `<function=` appears, it hands off to `full_parser` (carrying
+    the sent state) for the rest of the stream, so tool syntax is handled exactly as before.
+    """
+
+    _OPEN, _CLOSE = "<think>", "</think>"
+    _TOOL_TRIGGER = "<function="
+
+    def __init__(self, full_parser):
+        self._full = full_parser
+        self._handed_off = False
+        self._open = None  # index of the first "<think>", once seen
+        self._open_scanned = 0  # "<think>" searched up to here
+        self._close = None  # index of the first "</think>" after the reasoning start
+        self._close_scanned = 0
+        self._trigger_scanned = 0
+        self._reasoning_sent = (0, 0)  # (start, end) offsets of the sent reasoning in the text
+        self._content_sent = (0, 0)
+        self._mismatched = set()  # (slice start, sent) pairs that can never match again
+        self.tools_streamed = False
+
+    def _find_new(self, text, marker, scanned, floor=0):
+        """Index of `marker` starting at or after `floor` in the text, searching only what is new."""
+        return text.find(marker, max(floor, scanned - len(marker) + 1))
+
+    def _emit(self, text, key, start, end, sent, deltas):
+        """Append the delta of text[start:end] over the sent slice, as StreamingChatParser does."""
+        sent_start, sent_end = sent
+        if sent_start == start and sent_end <= end:
+            # Same start in an append-only text: the sent slice is a prefix by construction.
+            delta = text[sent_end:end]
+        else:
+            # The structure moved (a late "<think>", a partial "</think>" resolving): compare the
+            # sent text against the current slice in place, as StreamingChatParser compares strings.
+            if (start, sent) in self._mismatched:
+                return sent
+            length = sent_end - sent_start
+            if not text.startswith(text[sent_start:sent_end], start, end):
+                if end - start >= length:
+                    # The compared characters are written for good in an append-only text, so
+                    # this slice start can never match the sent text again: stop re-checking.
+                    self._mismatched.add((start, sent))
+                return sent
+            delta = text[start + length : end]
+        if delta:
+            deltas.append({key: delta})
+            return (start, end)
+        return sent
+
+    def _hand_off(self, text):
+        self._full._reasoning_sent = text[self._reasoning_sent[0] : self._reasoning_sent[1]]
+        self._full._content_sent = text[self._content_sent[0] : self._content_sent[1]]
+        self._handed_off = True
+
+    def parse(self, text, *, finished=False):
+        """Return the structured deltas for the accumulated `text`."""
+        if not self._handed_off:
+            if self._find_new(text, self._TOOL_TRIGGER, self._trigger_scanned) >= 0:
+                self._hand_off(text)
+            self._trigger_scanned = len(text)
+        if self._handed_off:
+            deltas = self._full.parse(text, finished=finished)
+            self.tools_streamed = self._full.tools_streamed
+            return deltas
+
+        if self._open is None:
+            index = self._find_new(text, self._OPEN, self._open_scanned)
+            self._open_scanned = len(text)
+            if index >= 0:
+                # The reasoning now starts after this "<think>": search "</think>" from there.
+                self._open, self._close, self._close_scanned = index, None, index + len(self._OPEN)
+        start = 0 if self._open is None else self._open + len(self._OPEN)
+        if self._close is None:
+            index = self._find_new(text, self._CLOSE, self._close_scanned, floor=start)
+            self._close_scanned = len(text)
+            if index >= 0:
+                self._close = index
+
+        deltas = []
+        if self._close is None:
+            reasoning_end, content = len(text), (len(text), len(text))
+        else:
+            reasoning_end, content = self._close, (self._close + len(self._CLOSE), len(text))
+        self._reasoning_sent = self._emit(
+            text, "reasoning_content", start, reasoning_end, self._reasoning_sent, deltas
+        )
+        self._content_sent = self._emit(text, "content", *content, self._content_sent, deltas)
+        return deltas
+
+    def finish_reason(self, result):
+        """Return the OpenAI finish reason for this parsed choice."""
+        if self._handed_off:
+            return self._full.finish_reason(result)
+        return _finish_reason(result)
+
+
 def _status_name(record):
     status = record.get("status") if isinstance(record, dict) else None
     return getattr(status, "name", str(status)).upper()

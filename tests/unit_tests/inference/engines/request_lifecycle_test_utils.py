@@ -383,10 +383,10 @@ def _coordinator_projection(request):
     coordinator.tokenizer.detokenize.assert_called_once()
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
     assert frames[0] == client
-    header, returned_id = msgpack.unpackb(frames[1], raw=False)
+    header, returned_ids = msgpack.unpackb(frames[1], raw=False)
     returned = msgpack.unpackb(frames[2], raw=False)
     assert header == Headers.ENGINE_REPLY.value
-    assert returned_id == client_request_id
+    assert returned_ids == [client_request_id]
     assert request_id not in coordinator.request_id_to_client_id
     return DynamicInferenceRequest.deserialize(returned), unwrap_serialized_tensors(returned)
 

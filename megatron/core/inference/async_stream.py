@@ -38,19 +38,32 @@ class AsyncStream(Generic[T]):
         """The request associated with this stream."""
         return self._request_id
 
+    def _on_loop_thread(self) -> bool:
+        """Whether the caller runs on this stream's event loop (the frontend's case)."""
+        try:
+            return asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            return False
+
     def put(self, item: Union[T, Exception]) -> None:
         """Adds a new value to the stream"""
         if not self._finished:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
+            if self._on_loop_thread():
+                # Same thread: enqueue now. The threadsafe path defers the put to the next loop
+                # iteration and wakes the loop through its self-pipe (two syscalls per item).
+                self._queue.put_nowait(item)
+            else:
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
 
     def finish(self, exception: Optional[Union[BaseException, Type[BaseException]]] = None) -> None:
         """Completes the stream by adding a sentinel value"""
         if not self._finished:
             self._finished = True
-            self._loop.call_soon_threadsafe(
-                self._queue.put_nowait,
-                exception if self._is_raisable(exception) else STOP_ITERATION,
-            )
+            sentinel = exception if self._is_raisable(exception) else STOP_ITERATION
+            if self._on_loop_thread():
+                self._queue.put_nowait(sentinel)
+            else:
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, sentinel)
 
     @property
     def finished(self) -> bool:

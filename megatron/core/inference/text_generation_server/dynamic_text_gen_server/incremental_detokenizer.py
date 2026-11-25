@@ -54,7 +54,9 @@ class HuggingFaceFastIncrementalDetokenizer:
             model_eos_token_ids(tokenizer)
         )
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
-        self._text_fragments: list[str] = []
+        # The emitted text as one string, appended per delta (as vLLM's detokenizer does), so
+        # reading it per streamed token does not re-join every fragment so far.
+        self._text = ""
         self._text_length = 0
 
     def _new_decode_stream(self, prompt_token_ids: list[int] | None = None):
@@ -76,7 +78,7 @@ class HuggingFaceFastIncrementalDetokenizer:
 
         delta = "".join(fragments)
         if delta:
-            self._text_fragments.append(delta)
+            self._text += delta
             self._text_length += len(delta)
         return delta
 
@@ -100,7 +102,7 @@ class HuggingFaceFastIncrementalDetokenizer:
     @property
     def text(self) -> str:
         """Return all text emitted by the incremental decoder."""
-        return "".join(self._text_fragments)
+        return self._text
 
     @property
     def text_length(self) -> int:

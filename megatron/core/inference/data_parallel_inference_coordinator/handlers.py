@@ -636,6 +636,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         ), f"ENGINE_REPLY from never-connected sender {sender_identity!r}"
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
+    replies = []
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
         if (
             coordinator.is_disaggregated_inference()
@@ -663,11 +664,9 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             finished_request = msgpack.unpackb(body, raw=False)
             coordinator.finalize_text(finished_request)
             body = msgpack.packb(finished_request, use_bin_type=True)
-
-        reply_metadata = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
-        )
-        coordinator._send_to_client([client_identity, reply_metadata, body])
+        replies.append((client_identity, client_request_id, body))
+    # One message per client per engine step, not one per finished request.
+    coordinator._send_replies_to_clients(Headers.ENGINE_REPLY, replies)
 
 
 @message_handler(Headers.KV_READ_DONE)
@@ -772,6 +771,7 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         ), f"ENGINE_REPLY_PARTIAL from never-connected sender {sender_identity!r}"
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
+    replies = []
     for request_id, body in zip(metadata[1], bodies):
         client_identity = coordinator.request_id_to_client_id.get(request_id)
         client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
@@ -782,15 +782,9 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
             continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
-        coordinator._send_to_client(
-            [
-                client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id], use_bin_type=True
-                ),
-                body,
-            ]
-        )
+        replies.append((client_identity, client_request_id, body))
+    # One message per client per engine step, not one per request per token.
+    coordinator._send_replies_to_clients(Headers.ENGINE_REPLY_PARTIAL, replies)
 
 
 @message_handler(Headers.ABORT_REQUEST)
