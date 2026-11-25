@@ -272,9 +272,11 @@ ARGS=(
 
 case "${MODEL:-nanov3p5}" in
 nanov3p5)
-    TOKENIZER=${NANOV3P5_TOKENIZER:?set in cluster.env}
+    # Nemotron 3.5 Lightning 30B-A3B, the official HF release, converted with
+    # convert/convert_lightning_tp4ep4.sh (the same weights launch_vllm.sh serves).
+    TOKENIZER=${NANOV3P5_TOKENIZER:-nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16}
     ARGS+=(
-    --load "${NANOV3P5_CHECKPOINT:?set in cluster.env}"
+    --load "${NANOV3P5_CHECKPOINT:-${LIGHTNING_MCORE_OUT:?set NANOV3P5_CHECKPOINT in cluster.env}}"
     --tokenizer-model "${TOKENIZER}"
     --moe-permute-fusion
     --hybrid-layer-pattern 'MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E'
@@ -313,13 +315,23 @@ ultrav3)
     )
     ;;
 superv3)
-    # Nemotron 3 Super 120B-A12B (latent MoE); architecture comes from the checkpoint.
+    # Nemotron 3 Super 120B-A12B (latent MoE), the official HF release converted with
+    # convert/convert_superv3_tp4ep4.sh.
     TOKENIZER=nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     ARGS+=(
-    --pretrained-checkpoint "${SUPERV3_PRETRAINED_CHECKPOINT:?set in cluster.env}"
-    --load "${SUPERV3_CHECKPOINT:?set in cluster.env}"
-    --use-checkpoint-args
+    --load "${SUPERV3_CHECKPOINT:-${SUPERV3_MCORE_OUT:?set SUPERV3_CHECKPOINT in cluster.env}}"
     --tokenizer-model "${TOKENIZER}"
+    --hybrid-layer-pattern 'MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME/*E'
+    --vocab-size 131072 --make-vocab-size-divisible-by 128
+    --hidden-size 4096 --ffn-hidden-size 2688
+    --num-attention-heads 32 --group-query-attention --num-query-groups 2 --kv-channels 128
+    --normalization RMSNorm --norm-epsilon 1e-5 --disable-bias-linear --squared-relu
+    --position-embedding-type none --untie-embeddings-and-output-weights
+    --mamba-state-dim 128 --mamba-head-dim 64 --mamba-num-groups 8 --mamba-num-heads 128
+    --num-experts 512 --moe-ffn-hidden-size 2688 --moe-router-topk 22 --moe-latent-size 1024
+    --moe-shared-expert-intermediate-size 5376
+    --moe-router-score-function sigmoid --moe-router-enable-expert-bias
+    --moe-router-topk-scaling-factor 5.0
     )
     ;;
 *)

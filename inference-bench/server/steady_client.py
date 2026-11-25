@@ -23,6 +23,7 @@ and the in-flight requests carry over into the next level's steady state. Per le
 
 import argparse
 import json
+import multiprocessing
 import os
 import random
 import sys
@@ -270,8 +271,19 @@ def main():
     ap.add_argument("--profile-after", type=float, default=120.0,
                     help="seconds into the profiled level (after warmup) before capturing")
     ap.add_argument("--profile-window", type=float, default=5.0, help="seconds captured")
+    ap.add_argument("--procs", type=int, default=1,
+                    help="client processes; each runs its share of the in-flight requests as "
+                         "threads and reports finished requests to this one. One process reads "
+                         "every stream under one GIL, which caps streamed chunks/s at high "
+                         "concurrency")
+    ap.add_argument("--asyncio", action="store_true",
+                    help="drive the in-flight requests as asyncio tasks on one aiohttp session, "
+                         "as vllm bench serve (InferenceX) does, instead of one thread per request "
+                         "(not combined with --procs)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.asyncio and args.procs > 1:
+        ap.error("--asyncio runs in one process; drop --procs")
 
     if args.dataset == "math":
         rows = load_rows("hard_math")
@@ -281,53 +293,92 @@ def main():
         rows = [{"content": p} for p in load_wildchat(seed=args.seed)]
     print(f"{len(rows)} {args.dataset} prompts", flush=True)
     lock = threading.Lock()
-    next_row = [0]
     completed = []  # (start, end, completion_tokens, prompt_tokens, finish_reason, first token time)
     errors = [0]
     consecutive_errors = [0]
-    stop = threading.Event()
+    # Forked (no CUDA in the client), so --procs children share the prompts, the stop event, the
+    # next-prompt counter and the per-process thread targets with this process.
+    ctx = multiprocessing.get_context("fork")
+    stop = ctx.Event()
+    next_row = ctx.Value("q", 0)
+    procs = max(1, args.procs)
+    targets = [ctx.Value("i", 0) for _ in range(procs)]  # in-flight requests per process
+    results = ctx.Queue() if procs > 1 else None
     # This many request errors in a row with no success means the server is gone: stop instead
     # of hammering it (a dead server refuses connections instantly).
     max_consecutive_errors = 50
 
     requests_log = open(os.path.splitext(args.out)[0] + ".requests.jsonl", "a")
 
+    def sse_line(line, state):
+        """Fold one server-sent-event line into state = [first token time, usage, finish reason];
+        returns False at the end of the stream."""
+        line = line.strip()
+        if not line.startswith("data:"):
+            return True
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return False
+        chunk = json.loads(data)
+        state[1] = chunk.get("usage") or state[1]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if state[0] is None and (delta.get("content") or delta.get("reasoning_content")
+                                     or delta.get("reasoning")):
+                state[0] = time.time()
+            state[2] = choice.get("finish_reason") or state[2]
+        return True
+
     def request_streaming(req):
         """Read the server-sent events; returns (first token time, usage, finish reason)."""
-        first, usage, finish = None, {}, None
+        state = [None, {}, None]
         with urllib.request.urlopen(req, timeout=4 * 3600) as resp:
             for raw in resp:
-                line = raw.decode().strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
+                if not sse_line(raw.decode(), state):
                     break
-                chunk = json.loads(data)
-                usage = chunk.get("usage") or usage
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if first is None and (delta.get("content") or delta.get("reasoning_content")
-                                          or delta.get("reasoning")):
-                        first = time.time()
-                    finish = choice.get("finish_reason") or finish
-        return first, usage, finish
+        return tuple(state)
 
-    def worker():
+    def record_ok(rec):
+        """Book a finished request: its record and its line in <out>.requests.jsonl."""
+        with lock:
+            completed.append(rec)
+            consecutive_errors[0] = 0
+            # Every finished request (any level, warmup included) for its OSL / ISL.
+            requests_log.write(json.dumps({
+                "start": round(rec[0], 3), "end": round(rec[1], 3),
+                "output_tokens": rec[2], "prompt_tokens": rec[3], "finish_reason": rec[4],
+                # Streaming only: when the first content token arrived.
+                "first_token": round(rec[5], 3) if rec[5] is not None else None,
+            }) + "\n")
+            requests_log.flush()
+
+    def record_error():
+        with lock:
+            errors[0] += 1
+            consecutive_errors[0] += 1
+            if consecutive_errors[0] >= max_consecutive_errors:
+                stop.set()
+
+    def next_payload():
+        """The chat request for the next prompt (round robin over the prompts)."""
+        with next_row.get_lock():
+            row = rows[next_row.value % len(rows)]
+            next_row.value += 1
+        payload = {"messages": [{"role": "user", "content": row["content"]}]}
+        if args.max_tokens > 0:
+            payload["max_tokens"] = args.max_tokens
+        if args.ignore_eos:
+            payload["ignore_eos"] = True  # with --max-tokens: every request generates exactly that
+        if args.stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+            if args.stream_interval > 1:
+                payload["streaming_interval"] = args.stream_interval
+        return payload
+
+    def worker(report_ok, report_error):
         while not stop.is_set():
-            with lock:
-                row = rows[next_row[0] % len(rows)]
-                next_row[0] += 1
-            payload = {"messages": [{"role": "user", "content": row["content"]}]}
-            if args.max_tokens > 0:
-                payload["max_tokens"] = args.max_tokens
-            if args.ignore_eos:
-                payload["ignore_eos"] = True  # with --max-tokens: every request generates exactly that
-            if args.stream:
-                payload["stream"] = True
-                payload["stream_options"] = {"include_usage": True}
-                if args.stream_interval > 1:
-                    payload["streaming_interval"] = args.stream_interval
+            payload = next_payload()
             req = urllib.request.Request(f"{args.server}/v1/chat/completions",
                                          data=json.dumps(payload).encode(),
                                          headers={"Content-Type": "application/json"})
@@ -340,27 +391,88 @@ def main():
                         body = json.loads(resp.read())
                     first, usage = None, body.get("usage", {})
                     finish = body["choices"][0].get("finish_reason")
-                rec = (start, time.time(), usage.get("completion_tokens", 0),
-                       usage.get("prompt_tokens", 0), finish, first)
-                with lock:
-                    completed.append(rec)
-                    consecutive_errors[0] = 0
-                    # Every finished request (any level, warmup included) for its OSL / ISL.
-                    requests_log.write(json.dumps({
-                        "start": round(rec[0], 3), "end": round(rec[1], 3),
-                        "output_tokens": rec[2], "prompt_tokens": rec[3], "finish_reason": rec[4],
-                        # Streaming only: when the first content token arrived.
-                        "first_token": round(rec[5], 3) if rec[5] is not None else None,
-                    }) + "\n")
-                    requests_log.flush()
+                report_ok((start, time.time(), usage.get("completion_tokens", 0),
+                           usage.get("prompt_tokens", 0), finish, first))
             except Exception as e:  # noqa: BLE001
-                with lock:
-                    errors[0] += 1
-                    consecutive_errors[0] += 1
-                    if consecutive_errors[0] >= max_consecutive_errors:
-                        stop.set()
+                report_error()
                 print(f"request error: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 time.sleep(1)
+
+    def run_threads(target, report_ok, report_error):
+        """Keep `target` worker threads running (it only grows, level by level) until stop."""
+        threads = []
+        while not stop.is_set():
+            while len(threads) < target.value:
+                t = threading.Thread(target=worker, args=(report_ok, report_error), daemon=True)
+                t.start()
+                threads.append(t)
+            stop.wait(0.2)
+
+    def run_asyncio():
+        """--asyncio: the in-flight requests as tasks on one aiohttp session (vllm bench serve)."""
+        import asyncio
+
+        import aiohttp
+
+        url = f"{args.server}/v1/chat/completions"
+
+        async def aworker(session):
+            while not stop.is_set():
+                payload = next_payload()
+                start = time.time()
+                try:
+                    async with session.post(url, json=payload) as resp:
+                        resp.raise_for_status()
+                        if args.stream:
+                            state, buf, more = [None, {}, None], b"", True
+                            async for piece in resp.content.iter_any():
+                                buf += piece
+                                while more and b"\n" in buf:
+                                    line, buf = buf.split(b"\n", 1)
+                                    more = sse_line(line.decode(), state)
+                                if not more:
+                                    break
+                            first, usage, finish = state
+                        else:
+                            body = await resp.json()
+                            first, usage = None, body.get("usage", {})
+                            finish = body["choices"][0].get("finish_reason")
+                    record_ok((start, time.time(), usage.get("completion_tokens", 0),
+                               usage.get("prompt_tokens", 0), finish, first))
+                except Exception as e:  # noqa: BLE001
+                    record_error()
+                    print(f"request error: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                    await asyncio.sleep(1)
+
+        async def amain():
+            connector = aiohttp.TCPConnector(limit=0)
+            timeout = aiohttp.ClientTimeout(total=4 * 3600)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                tasks = []
+                while not stop.is_set():
+                    while len(tasks) < targets[0].value:
+                        tasks.append(asyncio.create_task(aworker(session)))
+                    await asyncio.sleep(0.2)
+                for task in tasks:
+                    task.cancel()
+
+        asyncio.run(amain())
+
+    def child(i):
+        """A --procs child: its share of the workers, reporting to the parent's queue."""
+        run_threads(targets[i], lambda rec: results.put(("ok", rec)),
+                    lambda: results.put(("error", None)))
+
+    def collect():
+        """Parent: book what the children report."""
+        while True:
+            kind, rec = results.get()
+            if kind == "ok":
+                record_ok(rec)
+            elif kind == "error":
+                record_error()
+            else:
+                return
 
     # Fail fast if the server is not up (e.g. its job ended before this client started).
     try:
@@ -384,13 +496,21 @@ def main():
                     f.flush()
 
         threading.Thread(target=sampler, daemon=True).start()
-    threads = []
+    if procs > 1:
+        # Fork before starting any thread here that takes `lock`, so no child inherits it held.
+        for i in range(procs):
+            ctx.Process(target=child, args=(i,), daemon=True).start()
+        threading.Thread(target=collect, daemon=True).start()
+    elif args.asyncio:
+        threading.Thread(target=run_asyncio, daemon=True).start()
+    else:
+        threading.Thread(target=run_threads, args=(targets[0], record_ok, record_error),
+                         daemon=True).start()
     out = open(args.out, "a")
     for c in sorted(args.concurrency):
-        while len(threads) < c:
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            threads.append(t)
+        # Spread this level's in-flight requests over the processes.
+        for i, target in enumerate(targets):
+            target.value = c // procs + (1 if i < c % procs else 0)
         level_start = time.time()
         print(f"{level_start:.3f} level c={c}: warming up", flush=True)
         if stop.wait(args.warmup):
@@ -486,6 +606,8 @@ def main():
             break
     failed = stop.is_set()
     stop.set()
+    if results is not None:
+        results.put(("end", None))
     out.close()
     if failed:
         sys.exit(f"stopped after {max_consecutive_errors} consecutive request errors; is the server up?")
