@@ -78,6 +78,9 @@
 #                      (default: TP / all prefill GPUs / ETP). Other knobs apply to both pools.
 #                                                                 (default: 0 = aggregated)
 #   PREFILL_NODES      with PD=1: prefill-pool nodes                         (default: 1)
+#   PREFILL_GPUS       with PD=1: prefill-pool GPUs instead of whole nodes, e.g. 2 for a 2 prefill +
+#                      2 decode split of one node; the prefill pool takes the first PREFILL_GPUS
+#                      ranks and the decode pool the rest            (default: 4 x PREFILL_NODES)
 #   DONE_FILE          file that stops the server when it appears; one watcher per job checks it
 #                      every 10 s (default: <exp dir>/done)
 #   EXP_DIR            experiment directory (default: a new timestamped one)
@@ -171,7 +174,7 @@ DONE_FILE=${DONE_FILE:-${EXP_DIR}/done}
 JOB_NODES=${SLURM_JOB_NUM_NODES:-1}
 # Decode (or aggregated) nodes; with PD=1 the first PREFILL_NODES nodes are the prefill pool.
 POOL_NODES=${JOB_NODES}
-[ "${PD:-0}" == "1" ] && POOL_NODES=$(( JOB_NODES - ${PREFILL_NODES:-1} ))
+[ "${PD:-0}" == "1" ] && [ -z "${PREFILL_GPUS:-}" ] && POOL_NODES=$(( JOB_NODES - ${PREFILL_NODES:-1} ))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Per-job node-local scratch (cleared after the job) for compile caches, temp files and the live
 # log; nothing there is needed once the job ends.
@@ -185,10 +188,11 @@ export TORCHINDUCTOR_CACHE_DIR=${SCRATCH}/inductor_cache_rank${RANK}
 export PYTHONUNBUFFERED=1
 
 if [ "${PD:-0}" == "1" ]; then
-    # The KV hand-off needs prefix caching; math prompts share no prefixes, so the Mamba prefix
-    # cache would only take memory (and the decode pool must not have one).
+    # The KV hand-off needs prefix caching. The Mamba prefix cache defaults off (math prompts
+    # share no prefixes); set MAMBA_PREFIX_GB for prefix-sharing loads such as agents. Only the
+    # prefill pool allocates it: decode engines skip it by role.
     PREFIX_CACHING=1
-    MAMBA_PREFIX_GB=0
+    MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-0}
     # The cluster sets UCX_TLS=tcp, which keeps NIXL off the GPU transports (cuda_ipc, cuda_copy,
     # RDMA); let UCX choose.
     unset UCX_TLS
@@ -212,6 +216,8 @@ fi
 if [ "${MODEL:-nanov3p5}" == "ultrav3" ]; then TP=${TP:-8}; else TP=${TP:-4}; fi
 ETP=${ETP:-1}
 POOL_GPUS=$((4 * POOL_NODES))
+# A same-node PD split (PREFILL_GPUS) leaves the decode pool the job's other GPUs.
+[ "${PD:-0}" == "1" ] && [ -n "${PREFILL_GPUS:-}" ] && POOL_GPUS=$((4 * JOB_NODES - PREFILL_GPUS))
 EP=${EP:-$((POOL_GPUS / ETP))}
 if (( POOL_GPUS % (EP * ETP) || POOL_GPUS % TP )); then
     echo "EP x ETP = $((EP * ETP)) and TP = ${TP} must divide the ${POOL_GPUS} (decode) GPUs"
@@ -220,7 +226,7 @@ fi
 SHARD_ARGS=(--tensor-model-parallel-size "${TP}" --expert-model-parallel-size "${EP}"
             --expert-tensor-parallel-size "${ETP}")
 if [ "${PD:-0}" == "1" ]; then
-    PREFILL_GPUS=$((4 * ${PREFILL_NODES:-1}))
+    PREFILL_GPUS=${PREFILL_GPUS:-$((4 * ${PREFILL_NODES:-1}))}
     PREFILL_TP=${PREFILL_TP:-${TP}}
     PREFILL_ETP=${PREFILL_ETP:-${ETP}}
     PREFILL_EP=${PREFILL_EP:-$((PREFILL_GPUS / PREFILL_ETP))}
