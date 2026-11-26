@@ -105,6 +105,13 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
+        # Mamba recency per slot (prefix-cache LRU clock), set when a state is stored and when
+        # it is restored. Eviction ranks slots by it, not by their KV block's timestamp: a
+        # prefix match re-stamps every matched KV block (attention reads them all), but
+        # restores only the deepest cached Mamba state, so the KV timestamp would keep a
+        # conversation's interior states as fresh as its live one.
+        self.slot_timestamps = torch.zeros(max_slots, dtype=torch.int64, device='cpu')
+
         # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
         # one slot per cached block boundary, reused across requests. Sized to
         # `max_slots`; the budget accounting in DynamicInferenceContext refers to
@@ -191,6 +198,7 @@ class MambaSlotAllocator:
         new_slot_tensor = torch.tensor(new_slots, dtype=torch.int64, device=device)
         self.block_to_slot[new_bid_tensor] = new_slot_tensor.to(torch.int32)
         self.slot_to_block[new_slot_tensor] = new_bid_tensor.to(torch.int32)
+        self.slot_timestamps[new_slot_tensor] = self.context.prefix_cache_lru_clock
 
         # Phase 5: Build result mapping
         # Map new block_ids to their allocated slots
@@ -229,7 +237,7 @@ class MambaSlotAllocator:
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if pc_state.is_lru:
-            timestamps = pc_state.block_timestamps[candidate_ids]
+            timestamps = self.slot_timestamps[self.block_to_slot[candidate_ids].long()]
             _, oldest_indices = torch.topk(timestamps, k=num_needed, largest=False, sorted=False)
             evict_ids = candidate_ids[oldest_indices]
         else:
@@ -389,6 +397,7 @@ class MambaSlotAllocator:
         mamba_idx = self.context.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
         self.context.mamba_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
         self.context.mamba_ssm_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
+        self.slot_timestamps[slot] = self.context.prefix_cache_lru_clock
         return True
 
     # =========================================================================
@@ -519,6 +528,7 @@ class MambaSlotAllocator:
         """Reset slot pool, cache state, the Mamba host registry, and the metadata's buffers."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
+        self.slot_timestamps.zero_()
         torch.arange(self.max_slots, out=self.free_slots)
         self.free_count = self.max_slots
         self.registry.clear_mamba()
