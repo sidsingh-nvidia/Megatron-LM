@@ -2250,6 +2250,11 @@ def _make_cpu_mamba_slot_allocator(
         ssm_chunk_alignment=128,
         gdp_num_householder=0,
         mamba_metadata=mamba_metadata,
+        # The prefix-cache LRU clock the allocator stamps slots with.
+        prefix_cache_lru_clock=0,
+        # Live per-request states that restore_to_live copies a cached state into.
+        mamba_conv_states=torch.zeros(1, 1, 1),
+        mamba_ssm_states=torch.zeros(1, 1, 1),
     )
     return MambaSlotAllocator(
         context=context,
@@ -2278,22 +2283,53 @@ def test_mamba_slot_allocation_failure_is_atomic(monkeypatch):
     assert torch.equal(allocator.slot_to_block, slot_to_block_before)
 
 
+def _store_mamba_states(allocator, block_ids, clocks):
+    """Store one cached Mamba state per block, each at its own LRU clock, and make the blocks
+    evictable (no live owner) with registered hashes."""
+    pc_state = allocator.context.kv_block_allocator.pc_state
+    for block_id, clock in zip(block_ids, clocks):
+        allocator.context.prefix_cache_lru_clock = clock
+        allocator.allocate_slots_batch([block_id])
+    block_ids_tensor = torch.tensor(block_ids)
+    pc_state.block_ref_counts[block_ids_tensor] = 0
+    hashes = [100 + block_id for block_id in block_ids]
+    pc_state.block_hashes[block_ids_tensor] = torch.tensor(hashes)
+    allocator.register_block_hashes_batch(list(block_ids), hashes)
+
+
 def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
-    allocator.allocate_slots_batch([0, 1, 2, 3])
-    allocator.context.kv_block_allocator.pc_state.block_ref_counts[:4] = 0
-    allocator.context.kv_block_allocator.pc_state.block_timestamps[:4] = torch.tensor(
-        [40, 10, 30, 20]
-    )
-    allocator.context.kv_block_allocator.pc_state.block_hashes[:4] = torch.tensor(
-        [100, 101, 102, 103]
-    )
-    allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
+    _store_mamba_states(allocator, [0, 1, 2, 3], clocks=[40, 10, 30, 20])
 
+    allocator.context.prefix_cache_lru_clock = 50
     allocator.allocate_slots_batch([4, 5])
 
     assert allocator.block_to_slot.tolist()[1] == -1
     assert allocator.block_to_slot.tolist()[3] == -1
+    assert all(allocator.block_to_slot.tolist()[block] >= 0 for block in (0, 2, 4, 5))
+
+
+def test_mamba_lru_eviction_ranks_by_mamba_use_not_kv_block_recency(monkeypatch):
+    """A prefix match re-stamps every matched KV block but restores only the deepest Mamba
+    state; eviction must keep another conversation's live state over the interior states."""
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
+    # Conversation A stores turn-end states at blocks 0, 1, 2; conversation B one at block 3.
+    _store_mamba_states(allocator, [0, 1, 2, 3], clocks=[1, 2, 3, 4])
+
+    # A's next turn matches its whole prefix: the KV side re-stamps blocks 0-2, and only the
+    # deepest Mamba state (block 2) is restored.
+    allocator.context.prefix_cache_lru_clock = 10
+    allocator.context.kv_block_allocator.pc_state.block_timestamps[:3] = 10
+    assert allocator.restore_to_live(request_idx=0, block_id=2)
+
+    allocator.context.prefix_cache_lru_clock = 11
+    allocator.allocate_slots_batch([4, 5])
+
+    block_to_slot = allocator.block_to_slot.tolist()
+    # A's interior states (blocks 0, 1) were never restored: they go first.
+    assert block_to_slot[0] == -1 and block_to_slot[1] == -1
+    # A's restored state and B's live state survive.
+    assert block_to_slot[2] >= 0 and block_to_slot[3] >= 0
 
 
 @pytest.mark.parametrize("max_slots", [0, 1])
